@@ -1,0 +1,121 @@
+# YOLO Training Platform - Docker Compose Configuration
+#
+# 开发模式:
+#   cd docker
+#   docker compose up -d backend frontend-dev
+#
+# 生产预览模式:
+#   cd docker
+#   docker compose up -d --build backend frontend
+
+services:
+  zlm-server:
+    image: zlmediakit/zlmediakit:master
+    container_name: zlm-server
+    restart: unless-stopped
+    ports:
+      - "8010:8010"
+      - "443:443"
+      - "1935:1935"
+      - "554:554"
+      - "3011:3011"
+      - "8011:8011"
+      - "8011:8011/udp"
+      - "3478:3478"
+      - "3478:3478/udp"
+      - "10000:10000"
+      - "10000:10000/udp"
+      - "9000:9000/udp"
+    volumes:
+      - ../docker/zlm/conf:/opt/media/conf
+      - ../docker/zlm/www:/opt/media/bin/www
+      - ../docker/zlm/log:/opt/media/bin/log
+      - ../docker/zlm/ffmpeg:/opt/media/bin/ffmpeg
+    networks:
+      - yolo-network
+
+  backend:
+    build:
+      context: ..
+      dockerfile: docker/backend/Dockerfile
+      # Before building backend, build the reusable base image once:
+      # docker build -f docker/backend/Dockerfile.base -t yolo-backend-base:torch-cu128 ..
+    container_name: yolo-backend
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      - ../backend/configs:/app/configs
+      - ../backend/data:/app/data
+      - ../backend/models:/app/models
+      - ../backend/src:/app/src
+    shm_size: "24gb"
+    networks:
+      - yolo-network
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - TZ=Asia/Shanghai
+      - METADATA_DB_ENABLED=true
+      - METADATA_DB_STRICT=false
+      # Default metadata DB is local SQLite: /app/data/metadata.db
+      # To use MySQL/PostgreSQL, set METADATA_DATABASE_URL externally.
+      - ZLM_API_BASE=http://zlm-server:8010
+      - ZLM_PLAY_BASE=http://localhost:8010
+      - ZLM_WEBRTC_BASE=webrtc://localhost:8010
+      - ZLM_SECRET=HC5elxV5pt8guwuvV8NmddzVhb4u1lyY
+    depends_on:
+      - zlm-server
+    command: ["uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  frontend:
+    build:
+      context: ..
+      dockerfile: docker/frontend/Dockerfile
+    container_name: yolo-frontend
+    restart: unless-stopped
+    profiles: ["prod"]
+    ports:
+      - "3000:80"
+    networks:
+      - yolo-network
+    depends_on:
+      - backend
+      - zlm-server
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:80/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  frontend-dev:
+    image: node:22-alpine
+    container_name: yolo-frontend-dev
+    restart: unless-stopped
+    working_dir: /app
+    ports:
+      - "3000:3000"
+    networks:
+      - yolo-network
+    depends_on:
+      - backend
+      - zlm-server
+    volumes:
+      - ../frontend:/app
+    environment:
+      - CHOKIDAR_USEPOLLING=true
+      - VITE_API_BASE=/dev-api
+      - VITE_API_TARGET=http://backend:8000
+    command: ["sh", "-c", "npm install && npm run dev -- --host 0.0.0.0 --port 3000"]
+
+networks:
+  yolo-network:
+    driver: bridge
+    name: yolo-network

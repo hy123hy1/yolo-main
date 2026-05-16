@@ -1,0 +1,47 @@
+# syntax=docker/dockerfile:1
+# YOLO Training Platform - Backend Base Image
+# Build once, reuse many times for fast backend rebuilds.
+
+FROM python:3.12-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+ENV PIP_DEFAULT_TIMEOUT=1200
+
+RUN sed -i 's/deb.debian.org/mirrors.ustc.edu.cn/g' /etc/apt/sources.list 2>/dev/null || true && \
+    sed -i 's@http://.*debian.org@http://mirrors.ustc.edu.cn@g' /etc/apt/sources.list 2>/dev/null || true && \
+    sed -i 's@http://security.debian.org@http://mirrors.ustc.edu.cn/debian-security@g' /etc/apt/sources.list 2>/dev/null || true && \
+    if [ -d /etc/apt/sources.list.d ]; then \
+        sed -i 's/deb.debian.org/mirrors.ustc.edu.cn/g' /etc/apt/sources.list.d/*.sources 2>/dev/null || true; \
+    fi
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libgl1 \
+    libglib2.0-0 \
+    libsm6 \
+    libxext6 \
+    libxrender-dev \
+    libgomp1 \
+    ffmpeg \
+    libjpeg-dev \
+    zlib1g-dev \
+    libtiff-dev \
+    libfreetype6-dev \
+    liblcms2-dev \
+    libwebp-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /opt/base
+
+COPY backend/requirements-ml.txt /opt/base/requirements-ml.txt
+
+# Keep the heaviest dependencies in the base image.
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --default-timeout=1200 --retries=10 \
+    --pre torch torchvision \
+    --index-url https://download.pytorch.org/whl/nightly/cu128
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --default-timeout=1200 --retries=10 \
+    -i https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple \
+    -r /opt/base/requirements-ml.txt

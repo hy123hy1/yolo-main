@@ -1,0 +1,15 @@
+__pycache__
+*.pyc
+node_modules
+dist
+.env
+*.log
+.DS_Store
+backend/data/
+backend/models/
+*.pt
+docker/backend/data/
+docker/backend/models/
+docker/frontend/dist/
+docker/zlm
+yolo-images.tar
