@@ -4,7 +4,7 @@
       <div class="panel-header">
         <div>
           <h2>通道</h2>
-          <p>把预览、通道管理和 AI 能力拆开，避免所有操作堆在同一屏里。</p>
+          <p>把预览、通道管理、AI 能力和电子围栏拆开，避免所有操作堆在同一屏里。</p>
         </div>
         <button class="ghost-btn" @click="load" :disabled="loading">
           {{ loading ? '刷新中...' : '刷新' }}
@@ -156,7 +156,7 @@
     <section v-if="activeTab === 'ai'" class="panel">
       <div class="section-head">
         <h3>AI 能力</h3>
-        <span>集中管理 AI 配置、区域配置和运行状态</span>
+        <span>集中管理模型配置、类别筛选、区域绑定和运行状态</span>
       </div>
 
       <div v-if="items.length === 0" class="empty-state">暂无通道可配置</div>
@@ -408,6 +408,110 @@
       </div>
     </section>
 
+    <section v-if="activeTab === 'fence'" class="panel">
+      <div class="section-head">
+        <h3>电子围栏</h3>
+        <span>集中管理区域流预览、播放和第三方拉流地址</span>
+      </div>
+
+      <div v-if="items.length === 0" class="empty-state">暂无通道可配置电子围栏</div>
+      <div v-else class="ai-list">
+        <article v-for="item in items" :key="`fence-${item.id}`" class="ai-card">
+          <div class="ai-card-head">
+            <div>
+              <h4>{{ item.name }}</h4>
+              <p>{{ item.id }}</p>
+            </div>
+            <div class="status-pills">
+              <span class="pill type">{{ String(item.type || '').toUpperCase() }}</span>
+              <span :class="['pill', zonePreviewStatuses[item.id]?.status === 'running' ? 'ok' : 'muted']">
+                {{ zonePreviewLabel(item.id) }}
+              </span>
+            </div>
+          </div>
+
+          <div class="zone-preview-headline">
+            <div><strong>区域数量：</strong>{{ channelZones(item.id).length }}</div>
+            <div><strong>区域流名：</strong>{{ zonePreviewStatuses[item.id]?.stream || `${item.stream}_zone` }}</div>
+          </div>
+
+          <div class="zone-preview-layout">
+            <div class="zone-preview-box">
+              <div class="zone-preview-head">
+                <div>
+                  <div class="section-title">区域预览</div>
+                  <div class="zone-preview-help">启动后会生成一条带区域框的新流，供第三方平台、大屏和当前页面直接预览。</div>
+                </div>
+              </div>
+
+              <div class="zone-preview-player-shell">
+                <video
+                  :ref="(el) => setZonePreviewVideoRef(item.id, el as HTMLVideoElement | null)"
+                  class="zone-preview-player"
+                  autoplay
+                  muted
+                  playsinline
+                  controls
+                />
+                <div
+                  v-if="zonePreviewStatuses[item.id]?.status !== 'running'"
+                  class="player-mask offline-mask"
+                >
+                  <span>启动区域流后，这里会自动显示带区域框的预览画面</span>
+                </div>
+                <div
+                  v-else-if="!isZonePreviewPlaying(item.id)"
+                  class="player-mask"
+                >
+                  <button class="play-circle" type="button" @click="startZonePreviewPlayer(item.id)">
+                    ▶
+                  </button>
+                </div>
+              </div>
+
+              <div class="zone-preview-actions">
+                <button class="ghost-btn" type="button" @click="startZonePreviewFlow(item.id)">启动区域流</button>
+                <button class="ghost-btn" type="button" @click="startZonePreviewPlayer(item.id)">播放预览</button>
+                <button class="ghost-btn" type="button" @click="openZonePreviewModal(item)">放大预览</button>
+                <button class="ghost-btn" type="button" @click="stopZonePreviewFlow(item.id)">停止区域流</button>
+              </div>
+            </div>
+
+            <div class="zone-preview-box">
+              <div class="zone-preview-head">
+                <div>
+                  <div class="section-title">流信息</div>
+                  <div class="zone-preview-help">可直接复制给第三方平台、播放器或大屏使用。</div>
+                </div>
+              </div>
+
+              <div class="zone-preview-meta">
+                <div><strong>推流目标：</strong>{{ zonePreviewStatuses[item.id]?.target || '-' }}</div>
+                <div><strong>错误信息：</strong>{{ zonePreviewStatuses[item.id]?.last_error || '-' }}</div>
+                <div><strong>RTMP：</strong>{{ zonePreviewPlayInfos[item.id]?.rtmp || '-' }}</div>
+                <div><strong>RTSP：</strong>{{ zonePreviewPlayInfos[item.id]?.rtsp || '-' }}</div>
+                <div><strong>HLS：</strong>{{ zonePreviewPlayInfos[item.id]?.hls || '-' }}</div>
+              </div>
+
+              <div class="zone-preview-actions">
+                <button class="ghost-btn" type="button" @click="copyZonePreviewUrl(item.id, 'hls')">复制 HLS</button>
+                <button class="ghost-btn" type="button" @click="copyZonePreviewUrl(item.id, 'rtmp')">复制 RTMP</button>
+                <button class="ghost-btn" type="button" @click="copyZonePreviewUrl(item.id, 'rtsp')">复制 RTSP</button>
+                <button class="ghost-btn" type="button" @click="openZoneEditor(item)">区域配置</button>
+              </div>
+            </div>
+          </div>
+
+          <div v-if="zonePreviewErrors[item.id]" class="error-text">
+            {{ zonePreviewErrors[item.id] }}
+          </div>
+          <div v-if="zonePreviewDebug[item.id]" class="debug-text">
+            {{ zonePreviewDebug[item.id] }}
+          </div>
+        </article>
+      </div>
+    </section>
+
     <div v-if="creatingChannel" class="modal-mask" @click.self="closeCreateModal">
       <div class="modal-dialog">
         <div class="modal-header">
@@ -531,12 +635,16 @@ import {
   deleteChannel,
   getChannelAIStatus,
   getChannelPlayUrl,
+  getChannelZonePreviewPlayUrl,
+  getChannelZonePreviewStatus,
   listChannels,
   listChannelZones,
   startChannelAI,
   startChannelPlay,
+  startChannelZonePreview,
   stopChannelAI,
   stopChannelPlay,
+  stopChannelZonePreview,
   updateChannel,
   updateChannelAIConfig,
 } from '@/api/channels'
@@ -588,6 +696,16 @@ type AIStatus = {
 
 type AIStatusMap = Record<string, AIStatus>
 
+type ZonePreviewStatus = {
+  enabled?: boolean
+  status?: string
+  stream?: string
+  target?: string
+  urls?: PlayUrlMap
+  last_error?: string | null
+  process_alive?: boolean
+}
+
 type ChannelEditState = {
   name: string
   type: string
@@ -601,6 +719,7 @@ const tabs = [
   { key: 'preview', label: '预览' },
   { key: 'manage', label: '通道管理' },
   { key: 'ai', label: 'AI 能力' },
+  { key: 'fence', label: '电子围栏' },
 ] as const
 
 const activeTab = ref<(typeof tabs)[number]['key']>('preview')
@@ -614,11 +733,16 @@ const models = ref<any[]>([])
 const playInfos = ref<Record<string, PlayUrlMap>>({})
 const browserPlayInfos = ref<Record<string, PlayUrlMap>>({})
 const previewPlaybackState = ref<Record<string, boolean>>({})
+const zonePreviewPlayInfos = ref<Record<string, PlayUrlMap>>({})
+const zonePreviewPlaybackState = ref<Record<string, boolean>>({})
 const aiStatuses = ref<AIStatusMap>({})
+const zonePreviewStatuses = ref<Record<string, ZonePreviewStatus>>({})
 const aiConfigs = ref<Record<string, ChannelAIConfigState>>({})
 const zonesMap = ref<Record<string, ZoneItem[]>>({})
 const debugResults = ref<Record<string, string>>({})
 const rtcErrors = ref<Record<string, string>>({})
+const zonePreviewDebug = ref<Record<string, string>>({})
+const zonePreviewErrors = ref<Record<string, string>>({})
 const message = ref('')
 const messageType = ref<'success' | 'error'>('success')
 const editingChannel = ref<any | null>(null)
@@ -651,8 +775,11 @@ const editForm = ref<ChannelEditState>({
 const videoRefs = new Map<string, HTMLVideoElement>()
 const peerConnections = new Map<string, RTCPeerConnection>()
 const playAttemptIds = new Map<string, number>()
+const zonePreviewVideoRefs = new Map<string, HTMLVideoElement>()
+const zonePreviewPeerConnections = new Map<string, RTCPeerConnection>()
+const zonePreviewAttemptIds = new Map<string, number>()
 const previewCardRefs = new Map<string, HTMLElement>()
-const expandedPreview = ref<{ channelId: string; name: string; sourceUrl: string } | null>(null)
+const expandedPreview = ref<{ channelId: string; name: string; sourceUrl: string; mode?: 'channel' | 'zone' } | null>(null)
 const expandedPreviewVideoRef = ref<HTMLVideoElement | null>(null)
 const expandedPreviewPlaying = ref(false)
 const expandedPreviewError = ref('')
@@ -687,6 +814,7 @@ const closeCreateModal = () => {
 }
 
 const isPreviewPlaying = (channelId: string) => Boolean(previewPlaybackState.value[channelId])
+const isZonePreviewPlaying = (channelId: string) => Boolean(zonePreviewPlaybackState.value[channelId])
 const makeLocalModelId = () => `local_${Date.now()}_${Math.random().toString(16).slice(2, 8)}`
 
 const createEmptyModelConfig = (): ChannelAIModelConfig => ({
@@ -867,6 +995,34 @@ const loadChannelZones = async (channelId: string) => {
   }
 }
 
+const zonePreviewLabel = (channelId: string) => {
+  const status = zonePreviewStatuses.value[channelId]
+  if (!status) return '未启动'
+  if (status.status === 'running') return '运行中'
+  if (status.status === 'starting') return '启动中'
+  if (status.status === 'error') return '异常'
+  return '未启动'
+}
+
+const loadZonePreviewStatus = async (channelId: string) => {
+  try {
+    const result = await getChannelZonePreviewStatus(channelId)
+    zonePreviewStatuses.value = {
+      ...zonePreviewStatuses.value,
+      [channelId]: result || {},
+    }
+  } catch {
+    zonePreviewStatuses.value = {
+      ...zonePreviewStatuses.value,
+      [channelId]: {},
+    }
+  }
+}
+
+const loadAllZonePreviewStatuses = async () => {
+  await Promise.all(items.value.map((item) => loadZonePreviewStatus(item.id)))
+}
+
 const loadAllZones = async () => {
   await Promise.all(items.value.map((item) => loadChannelZones(item.id)))
 }
@@ -909,6 +1065,234 @@ const syncAIConfigsFromItems = () => {
   aiConfigs.value = nextConfigs
 }
 
+const startZonePreviewFlow = async (channelId: string) => {
+  try {
+    const channel = items.value.find((entry) => entry.id === channelId)
+    const zoneCount = channelZones(channelId).length
+    if (!zoneCount) {
+      throw new Error('请先完成区域配置，再启动区域流')
+    }
+    const result = await startChannelZonePreview(channelId)
+    zonePreviewStatuses.value = {
+      ...zonePreviewStatuses.value,
+      [channelId]: result || {},
+    }
+    showMessage('success', `${channel?.name || channelId} 已启动区域流`)
+    debugResults.value[channelId] = `区域流：${result?.stream || `${channel?.stream || channelId}_zone`}`
+    await nextTick()
+    await startZonePreviewPlayer(channelId)
+  } catch (error: any) {
+    showMessage('error', error?.response?.data?.detail || error?.message || '启动区域流失败')
+  }
+}
+
+const stopZonePreviewFlow = async (channelId: string) => {
+  try {
+    const channel = items.value.find((entry) => entry.id === channelId)
+    const result = await stopChannelZonePreview(channelId)
+    await stopZonePreviewPlayer(channelId)
+    zonePreviewStatuses.value = {
+      ...zonePreviewStatuses.value,
+      [channelId]: result || {},
+    }
+    showMessage('success', `${channel?.name || channelId} 已停止区域流`)
+  } catch (error: any) {
+    showMessage('error', error?.response?.data?.detail || error?.message || '停止区域流失败')
+  }
+}
+
+const restoreZonePreviewPlaybackForFenceTab = async () => {
+  if (activeTab.value !== 'fence') return
+  await nextTick()
+  const runningItems = items.value.filter((item) => zonePreviewStatuses.value[item.id]?.status === 'running')
+  for (const item of runningItems) {
+    try {
+      await startZonePreviewPlayer(item.id)
+    } catch (error: any) {
+      zonePreviewDebug.value[item.id] = error?.message || '恢复区域预览失败'
+    }
+  }
+}
+
+const copyZonePreviewUrl = async (channelId: string, kind: keyof PlayUrlMap = 'hls') => {
+  try {
+    const result = await getChannelZonePreviewPlayUrl(channelId)
+    zonePreviewStatuses.value = {
+      ...zonePreviewStatuses.value,
+      [channelId]: {
+        ...(zonePreviewStatuses.value[channelId] || {}),
+        ...(result || {}),
+      },
+    }
+    const url = result?.urls?.[kind]
+    if (!url) {
+      throw new Error('当前没有可复制的区域流地址')
+    }
+    await navigator.clipboard.writeText(url)
+    showMessage('success', `已复制区域流${kind.toUpperCase()}地址`)
+  } catch (error: any) {
+    showMessage('error', error?.response?.data?.detail || error?.message || '复制区域流地址失败')
+  }
+}
+
+const ensureZonePreviewPlayInfo = async (channelId: string, forceRefresh = false) => {
+  if (!forceRefresh && zonePreviewPlayInfos.value[channelId]) {
+    return zonePreviewPlayInfos.value[channelId] || {}
+  }
+
+  const result = await getChannelZonePreviewPlayUrl(channelId)
+  const urls = result?.urls || {}
+  zonePreviewPlayInfos.value = {
+    ...zonePreviewPlayInfos.value,
+    [channelId]: urls,
+  }
+  zonePreviewStatuses.value = {
+    ...zonePreviewStatuses.value,
+    [channelId]: {
+      ...(zonePreviewStatuses.value[channelId] || {}),
+      ...(result || {}),
+    },
+  }
+  return urls
+}
+
+const stopZonePreviewPlayer = async (channelId: string, clearAttempt = true) => {
+  if (clearAttempt) {
+    nextZonePreviewAttempt(channelId)
+  }
+
+  const pc = zonePreviewPeerConnections.get(channelId)
+  if (pc) {
+    pc.getReceivers().forEach((receiver) => receiver.track?.stop())
+    pc.close()
+    zonePreviewPeerConnections.delete(channelId)
+  }
+
+  const video = zonePreviewVideoRefs.get(channelId)
+  if (video) {
+    video.pause()
+    video.srcObject = null
+    video.removeAttribute('src')
+    video.load()
+  }
+
+  zonePreviewPlaybackState.value = {
+    ...zonePreviewPlaybackState.value,
+    [channelId]: false,
+  }
+}
+
+const startZonePreviewPlayer = async (channelId: string) => {
+  const attemptId = nextZonePreviewAttempt(channelId)
+  let video: HTMLVideoElement | null = null
+
+  try {
+    zonePreviewErrors.value[channelId] = ''
+    await stopZonePreviewPlayer(channelId, false)
+    await nextTick()
+
+    const urls = await ensureZonePreviewPlayInfo(channelId, true)
+    const apiUrl = urls.browser_webrtc_api
+    if (!apiUrl) {
+      throw new Error('没有可用的区域流 WebRTC 地址')
+    }
+
+    video = await getZonePreviewVideoEl(channelId)
+    if (!isActiveZonePreviewAttempt(channelId, attemptId)) return
+
+    const pc = new RTCPeerConnection({ iceServers: [] })
+    zonePreviewPeerConnections.set(channelId, pc)
+
+    const remoteStream = new MediaStream()
+    video.srcObject = remoteStream
+
+    pc.addTransceiver('video', { direction: 'recvonly' })
+    pc.addTransceiver('audio', { direction: 'recvonly' })
+
+    pc.ontrack = (event) => {
+      if (!isActiveZonePreviewAttempt(channelId, attemptId)) return
+      if (event.streams?.length) {
+        event.streams[0].getTracks().forEach((track) => remoteStream.addTrack(track))
+      } else {
+        remoteStream.addTrack(event.track)
+      }
+    }
+
+    pc.onconnectionstatechange = () => {
+      if (
+        isActiveZonePreviewAttempt(channelId, attemptId) &&
+        ['failed', 'disconnected', 'closed'].includes(pc.connectionState)
+      ) {
+        zonePreviewErrors.value[channelId] = `区域预览连接异常：${pc.connectionState}`
+      }
+    }
+
+    const offer = await pc.createOffer()
+    await pc.setLocalDescription(offer)
+    await waitIceComplete(pc)
+
+    const response = await fetch(apiUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+      body: pc.localDescription?.sdp || offer.sdp || '',
+    })
+
+    if (!response.ok) throw new Error(await response.text())
+
+    const answer = await response.json()
+    if (answer.code !== 0 || !answer.sdp) {
+      throw new Error(answer.msg || '区域预览 WebRTC 应答 SDP 缺失')
+    }
+
+    if (!isActiveZonePreviewAttempt(channelId, attemptId)) return
+
+    await pc.setRemoteDescription({
+      type: answer.type || 'answer',
+      sdp: answer.sdp,
+    })
+
+    await safePlayWithCheck(video, channelId, attemptId, isActiveZonePreviewAttempt)
+    if (isActiveZonePreviewAttempt(channelId, attemptId)) {
+      zonePreviewPlaybackState.value = {
+        ...zonePreviewPlaybackState.value,
+        [channelId]: true,
+      }
+      zonePreviewDebug.value[channelId] = '区域流已通过 WebRTC 预览'
+      zonePreviewErrors.value[channelId] = ''
+    }
+  } catch (error: any) {
+    if (!isActiveZonePreviewAttempt(channelId, attemptId)) return
+    const currentMessage = error?.message || '区域预览播放失败'
+    zonePreviewErrors.value[channelId] = `WebRTC 自动播放失败：${currentMessage}`
+
+    try {
+      const urls = await ensureZonePreviewPlayInfo(channelId, true)
+      const videoEl = video || (await getZonePreviewVideoEl(channelId))
+      const hlsUrl = urls.browser_hls || urls.hls
+      if (!hlsUrl) {
+        throw new Error('没有可用的区域流 HLS 地址')
+      }
+      videoEl.srcObject = null
+      videoEl.src = hlsUrl
+      videoEl.load()
+      await safePlayWithCheck(videoEl, channelId, attemptId, isActiveZonePreviewAttempt)
+      if (isActiveZonePreviewAttempt(channelId, attemptId)) {
+        zonePreviewPlaybackState.value = {
+          ...zonePreviewPlaybackState.value,
+          [channelId]: true,
+        }
+        zonePreviewDebug.value[channelId] = '区域流 WebRTC 失败，已切换到 HLS 预览'
+        zonePreviewErrors.value[channelId] = `WebRTC 自动播放失败：${currentMessage}；已切换到 HLS`
+      }
+    } catch (fallbackError: any) {
+      if (isActiveZonePreviewAttempt(channelId, attemptId)) {
+        zonePreviewErrors.value[channelId] =
+          `WebRTC 自动播放失败：${currentMessage}；HLS 回退也失败：${fallbackError?.message || fallbackError}`
+      }
+    }
+  }
+}
+
 const load = async () => {
   loading.value = true
   try {
@@ -925,10 +1309,13 @@ const load = async () => {
     mediaNodes.value = mediaNodeResult.items || []
     models.value = modelResult.models || modelResult.items || []
     syncAIConfigsFromItems()
-    await Promise.all([loadAllZones(), loadAIStatuses()])
+    await Promise.all([loadAllZones(), loadAIStatuses(), loadAllZonePreviewStatuses()])
     if (activeTab.value === 'preview') {
       await nextTick()
       await restoreBrowserPlaybackForActiveChannels()
+    } else if (activeTab.value === 'fence') {
+      await nextTick()
+      await restoreZonePreviewPlaybackForFenceTab()
     }
   } catch (error: any) {
     showMessage('error', error?.response?.data?.detail || error?.message || '加载通道失败')
@@ -959,6 +1346,7 @@ const restoreBrowserPlaybackForActiveChannels = async () => {
 const initializePage = async () => {
   await load()
   await restoreBrowserPlaybackForActiveChannels()
+  await restoreZonePreviewPlaybackForFenceTab()
 }
 
 const aiStatusLabel = (channelId: string) => {
@@ -989,6 +1377,14 @@ const setVideoRef = (channelId: string, el: HTMLVideoElement | null) => {
   }
 }
 
+const setZonePreviewVideoRef = (channelId: string, el: HTMLVideoElement | null) => {
+  if (el) {
+    zonePreviewVideoRefs.set(channelId, el)
+  } else {
+    zonePreviewVideoRefs.delete(channelId)
+  }
+}
+
 const setPreviewCardRef = (channelId: string, el: HTMLElement | null) => {
   if (el) {
     previewCardRefs.set(channelId, el)
@@ -1004,6 +1400,15 @@ const nextPlayAttempt = (channelId: string) => {
 }
 
 const isActiveAttempt = (channelId: string, attemptId: number) => playAttemptIds.get(channelId) === attemptId
+
+const nextZonePreviewAttempt = (channelId: string) => {
+  const nextId = (zonePreviewAttemptIds.get(channelId) || 0) + 1
+  zonePreviewAttemptIds.set(channelId, nextId)
+  return nextId
+}
+
+const isActiveZonePreviewAttempt = (channelId: string, attemptId: number) =>
+  zonePreviewAttemptIds.get(channelId) === attemptId
 
 const sleep = (ms: number) => new Promise((resolve) => window.setTimeout(resolve, ms))
 
@@ -1138,13 +1543,30 @@ const getVideoEl = async (channelId: string) => {
   throw new Error('播放器尚未初始化')
 }
 
-const safePlay = async (video: HTMLVideoElement, channelId: string, attemptId: number) => {
+const getZonePreviewVideoEl = async (channelId: string) => {
+  for (let i = 0; i < 6; i += 1) {
+    const video = zonePreviewVideoRefs.get(channelId)
+    if (video) return video
+    await nextTick()
+    if (i < 5) {
+      await sleep(80)
+    }
+  }
+  throw new Error('区域预览播放器尚未初始化')
+}
+
+const safePlayWithCheck = async (
+  video: HTMLVideoElement,
+  channelId: string,
+  attemptId: number,
+  isActive: (channelId: string, attemptId: number) => boolean
+) => {
   try {
     await video.play()
   } catch (error: any) {
     const text = String(error?.message || '')
     if (
-      !isActiveAttempt(channelId, attemptId) ||
+      !isActive(channelId, attemptId) ||
       error?.name === 'AbortError' ||
       text.includes('interrupted by a call to pause') ||
       text.includes('interrupted by a new load request')
@@ -1154,6 +1576,9 @@ const safePlay = async (video: HTMLVideoElement, channelId: string, attemptId: n
     throw error
   }
 }
+
+const safePlay = async (video: HTMLVideoElement, channelId: string, attemptId: number) =>
+  safePlayWithCheck(video, channelId, attemptId, isActiveAttempt)
 
 const tryHlsFallback = async (
   channelId: string,
@@ -1221,17 +1646,43 @@ const stopExpandedPreviewPlayback = async (clearAttempt = true) => {
 const startExpandedPreviewPlayback = async (channelId: string) => {
   const attemptId = nextExpandedPreviewAttempt()
   let autoStartedProxy = false
+  const previewMode = expandedPreview.value?.mode || 'channel'
 
   try {
     expandedPreviewError.value = ''
     await stopExpandedPreviewPlayback(false)
     await nextTick()
 
-    const playInfo = await ensurePlayInfo(channelId)
-    const browserUrls = playInfo.browser_urls || {}
-    const normalUrls = playInfo.urls || {}
-    const selectedUrls = Object.keys(browserUrls).length > 0 ? browserUrls : normalUrls
-    const apiUrl = selectedUrls.browser_webrtc_api
+    const basePlayInfo = previewMode === 'channel' ? await ensurePlayInfo(channelId) : null
+    const selectedUrls =
+      previewMode === 'zone'
+        ? await ensureZonePreviewPlayInfo(channelId, true)
+        : (() => {
+            const playInfo = basePlayInfo?.urls || {}
+            const browserInfo = basePlayInfo?.browser_urls || {}
+            return Object.keys(browserInfo).length > 0
+              ? browserInfo
+              : Object.keys(playInfo).length > 0
+                ? playInfo
+                : null
+          })()
+    const fallbackSeed =
+      previewMode === 'zone'
+        ? selectedUrls || {}
+        : basePlayInfo || {}
+    const browserUrls =
+      previewMode === 'zone'
+        ? (selectedUrls || {})
+        : (fallbackSeed.browser_urls || {})
+    const normalUrls =
+      previewMode === 'zone'
+        ? (selectedUrls || {})
+        : (fallbackSeed.urls || {})
+    const playUrls =
+      previewMode === 'zone'
+        ? (selectedUrls || {})
+        : (Object.keys(browserUrls).length > 0 ? browserUrls : normalUrls)
+    const apiUrl = playUrls?.browser_webrtc_api
 
     if (!apiUrl) throw new Error('没有可用的 WebRTC API 地址')
 
@@ -1310,12 +1761,16 @@ const startExpandedPreviewPlayback = async (channelId: string) => {
   } catch (error: any) {
     if (!isActiveExpandedPreviewAttempt(attemptId)) return
     const currentMessage = error?.message || '放大预览播放失败'
-    const playInfo = await ensurePlayInfo(channelId, true)
-    const browserUrls = playInfo.browser_urls || {}
-    const normalUrls = playInfo.urls || {}
-    const fallbackUrls = Object.keys(browserUrls).length > 0 ? browserUrls : normalUrls
+    const fallbackUrls =
+      previewMode === 'zone'
+        ? await ensureZonePreviewPlayInfo(channelId, true)
+        : (() => {
+            const playInfo = playInfos.value[channelId] || {}
+            const browserInfo = browserPlayInfos.value[channelId] || {}
+            return Object.keys(browserInfo).length > 0 ? browserInfo : playInfo
+          })()
 
-    if (!autoStartedProxy && currentMessage.includes('stream not found')) {
+    if (!autoStartedProxy && previewMode === 'channel' && currentMessage.includes('stream not found')) {
       try {
         const result = await startChannelPlay(channelId)
         playInfos.value[channelId] = result.urls || {}
@@ -1327,7 +1782,11 @@ const startExpandedPreviewPlayback = async (channelId: string) => {
       }
     }
 
-    if (Object.keys(browserUrls).length > 0 && currentMessage.includes('stream not found')) {
+    if (
+      previewMode === 'channel' &&
+      Object.keys(browserPlayInfos.value[channelId] || {}).length > 0 &&
+      currentMessage.includes('stream not found')
+    ) {
       for (let i = 0; i < 6; i += 1) {
         if (!isActiveExpandedPreviewAttempt(attemptId)) return
         await sleep(500)
@@ -1392,7 +1851,7 @@ const startExpandedPreviewPlayback = async (channelId: string) => {
 
     try {
       const video = await getExpandedPreviewVideoEl()
-      const hlsUrl = fallbackUrls.browser_hls
+      const hlsUrl = fallbackUrls.browser_hls || fallbackUrls.hls
       if (!hlsUrl) throw new Error('没有可用的 HLS-fMP4 地址')
       video.srcObject = null
       video.src = hlsUrl
@@ -1748,6 +2207,20 @@ const openExpandedPreview = async (item: any) => {
     channelId: item.id,
     name: item.name,
     sourceUrl: item.source_url || '-',
+    mode: 'channel',
+  }
+  expandedPreviewError.value = ''
+  await nextTick()
+  await startExpandedPreviewPlayback(item.id)
+}
+
+const openZonePreviewModal = async (item: any) => {
+  const zoneUrls = await ensureZonePreviewPlayInfo(item.id, true)
+  expandedPreview.value = {
+    channelId: item.id,
+    name: `${item.name} - 区域预览`,
+    sourceUrl: zoneUrls.rtmp || zoneUrls.rtsp || zoneUrls.hls || '-',
+    mode: 'zone',
   }
   expandedPreviewError.value = ''
   await nextTick()
@@ -1797,6 +2270,9 @@ watch(activeTab, async (tab) => {
   if (tab === 'preview') {
     await restoreBrowserPlaybackForActiveChannels()
   }
+  if (tab === 'fence') {
+    await restoreZonePreviewPlaybackForFenceTab()
+  }
 })
 
 onBeforeUnmount(() => {
@@ -1810,8 +2286,12 @@ onBeforeUnmount(() => {
   Array.from(peerConnections.keys()).forEach((channelId) => {
     void stopBrowserPlay(channelId)
   })
+  Array.from(zonePreviewPeerConnections.keys()).forEach((channelId) => {
+    void stopZonePreviewPlayer(channelId)
+  })
   void stopExpandedPreviewPlayback()
   previewPlaybackState.value = {}
+  zonePreviewPlaybackState.value = {}
 })
 
 aiStatusPollTimer = window.setInterval(() => {
@@ -2072,6 +2552,27 @@ aiStatusPollTimer = window.setInterval(() => {
   gap: 1rem;
 }
 
+.zone-preview-headline {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem 1.25rem;
+  color: #334155;
+}
+
+.zone-preview-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1.2fr) minmax(320px, 0.8fr);
+  gap: 1rem;
+  align-items: start;
+}
+
+.ai-capability-grid {
+  display: grid;
+  grid-template-columns: minmax(360px, 420px) minmax(0, 1fr);
+  gap: 1rem;
+  align-items: start;
+}
+
 .ai-card-summary {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
@@ -2086,6 +2587,59 @@ aiStatusPollTimer = window.setInterval(() => {
   background: #f8fafc;
   border: 1px solid #dbe4ee;
   border-radius: 14px;
+}
+
+.zone-preview-box {
+  display: grid;
+  gap: 0.8rem;
+  padding: 0.95rem;
+  background: #fff;
+  border: 1px solid #dbe4ee;
+  border-radius: 14px;
+  position: sticky;
+  top: 1rem;
+}
+
+.zone-preview-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.75rem;
+  align-items: flex-start;
+}
+
+.zone-preview-help {
+  margin-top: 0.25rem;
+  color: #64748b;
+  font-size: 0.92rem;
+  line-height: 1.6;
+}
+
+.zone-preview-meta {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 0.55rem 1rem;
+  color: #334155;
+}
+
+.zone-preview-actions {
+  display: flex;
+  gap: 0.65rem;
+  flex-wrap: wrap;
+}
+
+.zone-preview-player-shell {
+  position: relative;
+  border-radius: 18px;
+  overflow: hidden;
+  background: #0f172a;
+  border: 1px solid #dbe4ee;
+}
+
+.zone-preview-player {
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  display: block;
+  background: #000;
 }
 
 /* .ai-debug-board {
@@ -2516,6 +3070,14 @@ aiStatusPollTimer = window.setInterval(() => {
 }
 
 @media (max-width: 900px) {
+  .zone-preview-layout {
+    grid-template-columns: 1fr;
+  }
+
+  .ai-capability-grid {
+    grid-template-columns: 1fr;
+  }
+
   .ai-config-grid {
     grid-template-columns: 1fr;
   }

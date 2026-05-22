@@ -43,6 +43,7 @@ def _load_config_toml_to_environment(base_dir: Path) -> None:
     _set_env_if_absent("ZLM_API_BASE", media.get("APIBase"))
     _set_env_if_absent("ZLM_PLAY_BASE", media.get("PlayBase"))
     _set_env_if_absent("ZLM_WEBRTC_BASE", media.get("WebRTCBase"))
+    _set_env_if_absent("FFMPEG_BIN", media.get("FFmpegBin"))
     _set_env_if_absent("ZLM_SECRET", media.get("Secret"))
     _set_env_if_absent("ZLM_PUBLIC_RTSP_HOST", media.get("PublicRTSPHost"))
     _set_env_if_absent("ZLM_PUBLIC_RTMP_HOST", media.get("PublicRTMPHost"))
@@ -82,6 +83,7 @@ class Settings(BaseSettings):
     HOST: str = "0.0.0.0"
     PORT: int = 8000
 
+    FFMPEG_BIN: str = "ffmpeg"
     ZLM_API_BASE: str = "http://host.docker.internal:8010"
     ZLM_PLAY_BASE: str = "http://localhost:8010"
     ZLM_WEBRTC_BASE: str = "webrtc://localhost:8010"

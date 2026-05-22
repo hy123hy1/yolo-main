@@ -14,6 +14,7 @@ from src.services.metadata_db_sync import delete_json_document
 from src.services.model_service import ModelService
 from src.services.platform_storage import generate_id, list_json_items, load_json, now_iso, save_json
 from src.services.zlm_adapter import ZLMAdapter
+from src.services.zone_preview_service import zone_preview_service
 
 
 class ChannelService:
@@ -133,6 +134,17 @@ class ChannelService:
         target_host = self._pick_transcode_publish_host(node)
         target = f"rtmp://{target_host}:{rtmp_port}/{app}/{browser_stream}"
         return browser_stream, target
+
+    def _build_zone_preview_target(self, node: dict | None, app: str, stream: str) -> tuple[str, str]:
+        zone_stream = f"{stream}_zone"
+        rtmp_port = node.get("rtmp_port", settings.ZLM_RTMP_PORT) if node else settings.ZLM_RTMP_PORT
+        target_host = "zlm-server"
+        target = f"rtmp://{target_host}:{rtmp_port}/{app}/{zone_stream}"
+        return zone_stream, target
+
+    def _build_zone_preview_source(self, node: dict | None, app: str, stream: str) -> str:
+        rtsp_port = node.get("rtsp_port", settings.ZLM_RTSP_PORT) if node else settings.ZLM_RTSP_PORT
+        return f"rtsp://zlm-server:{rtsp_port}/{app}/{stream}"
 
     def _start_browser_transcode(self, node: dict | None, item: dict) -> dict:
         ext = item.setdefault("ext", {})
@@ -453,6 +465,16 @@ class ChannelService:
                 item.setdefault("ext", {})["zlm_proxy"] = zlm_result
                 browser_transcode = self._start_browser_transcode(node, item)
                 item.setdefault("ext", {})["browser_transcode"] = browser_transcode
+                item.setdefault("ext", {}).setdefault("zone_preview", {
+                    "enabled": False,
+                    "status": "stopped",
+                    "stream": f"{item['stream']}_zone",
+                    "target": None,
+                    "urls": {},
+                    "last_error": None,
+                    "started_at": None,
+                    "stopped_at": None,
+                })
                 item["updated_at"] = now_iso()
                 save_json(path, item)
                 browser_urls = None
@@ -499,6 +521,10 @@ class ChannelService:
                 zlm_result = {"error": str(e)}
 
             browser_stop = self._stop_browser_transcode(node, item)
+            try:
+                asyncio.run(zone_preview_service.stop(channel_id))
+            except Exception:
+                pass
             item["is_playing"] = False
             item["is_online"] = False
             item.setdefault("ext", {})["zlm_proxy_stop"] = zlm_result
@@ -543,6 +569,18 @@ class ChannelService:
                     "rtmp": adapter.get_media_list(browser.get("app", channel["app"]), browser["stream"], "rtmp"),
                     "hls": adapter.get_media_list(browser.get("app", channel["app"]), browser["stream"], "hls"),
                 }
+            zone_preview = channel.get("ext", {}).get("zone_preview", {})
+            if zone_preview.get("stream"):
+                result["zone_preview_stream"] = {
+                    "stream": zone_preview.get("stream"),
+                    "enabled": zone_preview.get("enabled"),
+                    "status": zone_preview.get("status"),
+                    "error": zone_preview.get("last_error"),
+                    "target": zone_preview.get("target"),
+                    "raw": zone_preview,
+                    "rtmp": adapter.get_media_list(channel["app"], zone_preview["stream"], "rtmp"),
+                    "hls": adapter.get_media_list(channel["app"], zone_preview["stream"], "hls"),
+                }
             return result
 
         return await asyncio.to_thread(_inspect)
@@ -578,11 +616,21 @@ class ChannelService:
                 browser.get("stream"),
                 channel.get("media_node_id"),
             )
+        zone_preview = channel.get("ext", {}).get("zone_preview", {}) or {}
+        zone_preview_urls = None
+        zone_stream = zone_preview.get("stream")
+        if zone_stream:
+            zone_preview_urls = adapter.build_play_urls(
+                channel["app"],
+                zone_stream,
+                channel.get("media_node_id"),
+            )
         return {
             "channel_id": channel_id,
             "status": "online" if channel.get("is_online") else "offline",
             "urls": urls,
             "browser_urls": browser_urls,
+            "zone_preview_urls": zone_preview_urls,
         }
 
     async def latest_snapshot(self, channel_id: str):
@@ -743,6 +791,52 @@ class ChannelService:
 
     async def get_ai_status(self, channel_id: str):
         return await analysis_service.get_channel_analysis_status(channel_id)
+
+    async def start_zone_preview(self, channel_id: str):
+        channel = await self.get_channel(channel_id)
+        if not channel:
+            return None
+        if not (channel.get("ext", {}).get("zones") or []):
+            raise ValueError("当前通道还没有配置区域")
+
+        node = await self.media_node_service.get_node(channel.get("media_node_id")) if channel.get("media_node_id") else None
+        adapter = self._build_adapter(node)
+        source_url = self._build_zone_preview_source(node, channel["app"], channel["stream"])
+        zone_stream, target = self._build_zone_preview_target(node, channel["app"], channel["stream"])
+        urls = adapter.build_play_urls(channel["app"], zone_stream, channel.get("media_node_id"))
+        return await zone_preview_service.start(channel_id, source_url, zone_stream, target, urls)
+
+    async def stop_zone_preview(self, channel_id: str):
+        channel = await self.get_channel(channel_id)
+        if not channel:
+            return None
+        return await zone_preview_service.stop(channel_id)
+
+    async def get_zone_preview_status(self, channel_id: str):
+        channel = await self.get_channel(channel_id)
+        if not channel:
+            return None
+        return zone_preview_service.status(channel_id)
+
+    async def get_zone_preview_play_urls(self, channel_id: str):
+        channel = await self.get_channel(channel_id)
+        if not channel:
+            return None
+        node = await self.media_node_service.get_node(channel.get("media_node_id")) if channel.get("media_node_id") else None
+        adapter = self._build_adapter(node)
+        zone_preview = channel.get("ext", {}).get("zone_preview", {}) or {}
+        zone_stream = zone_preview.get("stream") or f"{channel['stream']}_zone"
+        urls = adapter.build_play_urls(channel["app"], zone_stream, channel.get("media_node_id"))
+        current = zone_preview_service.status(channel_id) or {}
+        return {
+            "channel_id": channel_id,
+            "stream": zone_stream,
+            "status": current.get("status") or zone_preview.get("status") or "stopped",
+            "enabled": bool(current.get("enabled")),
+            "urls": urls,
+            "target": current.get("target") or zone_preview.get("target"),
+            "last_error": current.get("last_error") or zone_preview.get("last_error"),
+        }
 
     async def debug_ai_once(self, channel_id: str):
         channel = await self.get_channel(channel_id)

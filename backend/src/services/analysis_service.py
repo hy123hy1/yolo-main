@@ -1,13 +1,17 @@
 import asyncio
 import json
+import subprocess
 import threading
 import time
+from collections import deque
+from datetime import datetime
 from pathlib import Path
 
 import cv2
 
 from src.core.settings import settings
 from src.services.event_service import EventService
+from src.services.recording_service import RecordingService
 from src.services.platform_storage import load_json, now_iso, save_json
 
 
@@ -15,6 +19,7 @@ class AnalysisService:
     def __init__(self):
         self.channels_dir: Path = settings.CHANNELS_DIR
         self.events_service = EventService()
+        self.recording_service = RecordingService()
         self._lock = threading.Lock()
         self._workers: dict[str, dict] = {}
         self._model_cache: dict[str, tuple[object, dict]] = {}
@@ -240,6 +245,68 @@ class AnalysisService:
         cv2.imwrite(str(output_path), frame)
         return str(output_path.resolve())
 
+    def _ts_to_iso(self, ts: float | None) -> str:
+        if ts is None:
+            return now_iso()
+        return datetime.fromtimestamp(ts).isoformat()
+
+    def _save_alarm_video(self, channel_id: str, event_id: str, frames: list[object], fps: float = 25.0) -> str | None:
+        if not frames:
+            return None
+
+        recordings_dir = settings.RECORDINGS_DIR
+        recordings_dir.mkdir(parents=True, exist_ok=True)
+        filename = f"{channel_id}_alarm_{int(time.time() * 1000)}_{event_id}.mp4"
+        output_path = recordings_dir / filename
+        temp_output_path = recordings_dir / f"{output_path.stem}_raw{output_path.suffix}"
+
+        first_frame = frames[0][1]
+        height, width = first_frame.shape[:2]
+        writer = cv2.VideoWriter(
+            str(temp_output_path),
+            cv2.VideoWriter_fourcc(*"mp4v"),
+            max(fps, 1.0),
+            (width, height),
+        )
+        try:
+            for _, frame in frames:
+                writer.write(frame)
+        finally:
+            writer.release()
+
+        try:
+            subprocess.run(
+                [
+                    "ffmpeg",
+                    "-y",
+                    "-i",
+                    str(temp_output_path),
+                    "-c:v",
+                    "libx264",
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-movflags",
+                    "+faststart",
+                    str(output_path),
+                ],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            try:
+                temp_output_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+        except Exception:
+            if temp_output_path.exists():
+                try:
+                    if output_path.exists():
+                        output_path.unlink()
+                except Exception:
+                    pass
+                temp_output_path.replace(output_path)
+        return str(output_path.resolve())
+
     def _event_cooldown_key(self, detection: dict) -> str:
         zone_id = detection.get("zone_id", "global")
         return f"{detection.get('class_name', 'unknown')}::{zone_id}"
@@ -248,6 +315,7 @@ class AnalysisService:
         frame_count = 0
         event_count = 0
         cooldown_cache: dict[str, float] = {}
+        pre_event_buffer: deque[tuple[float, object]] = deque(maxlen=75)
 
         try:
             channel = self._load_channel(channel_id)
@@ -290,6 +358,7 @@ class AnalysisService:
                         continue
 
                     frame_count += 1
+                    pre_event_buffer.append((time.time(), frame.copy()))
                     self._update_runtime(
                         channel_id,
                         last_analysis_at=now_iso(),
@@ -358,6 +427,17 @@ class AnalysisService:
                             cooldown_cache[cooldown_key] = now_ts
 
                             snapshot_path = self._save_event_snapshot(channel_id, frame) if save_snapshot else None
+                            before_frames = list(pre_event_buffer)
+                            after_frames: list[tuple[float, object]] = []
+                            end_capture_at = time.time() + 3.0
+                            while time.time() < end_capture_at and not stop_event.is_set():
+                                ok_after, after_frame = cap.read()
+                                if not ok_after:
+                                    time.sleep(0.05)
+                                    continue
+                                ts_after = time.time()
+                                after_frames.append((ts_after, after_frame.copy()))
+                                pre_event_buffer.append((ts_after, after_frame.copy()))
                             payload = {
                                 "channel_id": channel_id,
                                 "model_id": model_id,
@@ -371,7 +451,40 @@ class AnalysisService:
                                 }, ensure_ascii=False),
                                 "status": "new",
                             }
-                            asyncio.run(self.events_service.create_event(payload))
+                            event = asyncio.run(self.events_service.create_event(payload))
+                            video_frames = before_frames + after_frames
+                            video_path = self._save_alarm_video(channel_id, event["id"], video_frames)
+                            if video_path:
+                                asyncio.run(self.events_service.update_event(
+                                    event["id"],
+                                    type("Req", (), {
+                                        "event_type": None,
+                                        "class_name": None,
+                                        "conf": None,
+                                        "snapshot_path": None,
+                                        "video_path": video_path,
+                                        "remark": None,
+                                        "status": None,
+                                    })()
+                                ))
+                                asyncio.run(self.recording_service.create_recording({
+                                    "id": event["id"],
+                                    "channel_id": channel_id,
+                                    "started_at": self._ts_to_iso(video_frames[0][0] if video_frames else time.time()),
+                                    "ended_at": self._ts_to_iso(video_frames[-1][0] if video_frames else time.time()),
+                                    "duration": round(len(video_frames) / 25.0, 3),
+                                    "file_path": video_path,
+                                    "status": "ready",
+                                    "raw_json": {
+                                        "event_id": event["id"],
+                                        "channel_id": channel_id,
+                                        "model_id": model_id,
+                                        "event_type": "alarm_clip",
+                                        "snapshot_path": snapshot_path,
+                                        "video_path": video_path,
+                                        "event_type_label": "alarm_clip",
+                                    },
+                                }))
                             event_count += 1
                             # runtime_by_model[model_id]["event_emitted_detections"] += 1
                             # runtime_by_model[model_id]["debug_reason"] = "已触发事件"

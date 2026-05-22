@@ -154,6 +154,7 @@ def _sync_event(session: Session, payload: dict) -> None:
             class_name=payload.get("class_name"),
             conf=payload.get("conf"),
             snapshot_path=payload.get("snapshot_path"),
+            video_path=payload.get("video_path"),
             remark=payload.get("remark"),
             status=payload.get("status"),
             created_at=_parse_dt(payload.get("created_at")),

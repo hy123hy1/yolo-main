@@ -229,6 +229,41 @@ async def get_channel_ai_status(channel_id: str):
     return result
 
 
+@router.post("/{channel_id}/zone-preview/start")
+async def start_channel_zone_preview(channel_id: str):
+    try:
+        result = await channel_service.start_zone_preview(channel_id)
+        if result is None:
+            raise HTTPException(404, "Channel not found")
+        return result
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@router.post("/{channel_id}/zone-preview/stop")
+async def stop_channel_zone_preview(channel_id: str):
+    result = await channel_service.stop_zone_preview(channel_id)
+    if result is None:
+        raise HTTPException(404, "Channel not found")
+    return result
+
+
+@router.get("/{channel_id}/zone-preview/status")
+async def get_channel_zone_preview_status(channel_id: str):
+    result = await channel_service.get_zone_preview_status(channel_id)
+    if result is None:
+        raise HTTPException(404, "Channel not found")
+    return result
+
+
+@router.get("/{channel_id}/zone-preview/play-url")
+async def get_channel_zone_preview_play_url(channel_id: str):
+    result = await channel_service.get_zone_preview_play_urls(channel_id)
+    if result is None:
+        raise HTTPException(404, "Channel not found")
+    return result
+
+
 @router.post("/{channel_id}/ai/debug-once")
 async def debug_channel_ai_once(channel_id: str):
     try:

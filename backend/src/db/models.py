@@ -125,6 +125,7 @@ class EventMeta(Base):
     class_name: Mapped[str | None] = mapped_column(String(255), index=True)
     conf: Mapped[float | None] = mapped_column(Float)
     snapshot_path: Mapped[str | None] = mapped_column(Text)
+    video_path: Mapped[str | None] = mapped_column(Text)
     remark: Mapped[str | None] = mapped_column(Text)
     status: Mapped[str | None] = mapped_column(String(64), index=True)
     created_at: Mapped[DateTime | None] = mapped_column(DateTime(), index=True)

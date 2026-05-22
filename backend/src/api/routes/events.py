@@ -6,9 +6,38 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 from src.services.event_service import EventService
+from src.core.settings import settings
 
 router = APIRouter(prefix="/events", tags=["events"])
 event_service = EventService()
+
+
+def resolve_data_file(path_value: str | None) -> Path | None:
+    if not path_value:
+        return None
+
+    normalized = str(path_value).replace("\\", "/")
+    if normalized.startswith("/static/"):
+        candidate = settings.DATA_DIR / normalized.replace("/static/", "", 1)
+        return candidate if candidate.exists() else None
+
+    candidates = [Path(normalized)]
+    if normalized.startswith("/app/data/"):
+        relative = normalized.replace("/app/data/", "", 1)
+        candidates.insert(0, settings.DATA_DIR / relative)
+    else:
+        candidates.append(settings.DATA_DIR / normalized.lstrip("/"))
+        candidates.append(settings.DATA_DIR / "snapshots" / Path(normalized).name)
+        candidates.append(settings.DATA_DIR / "recordings" / Path(normalized).name)
+
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+            if resolved.exists():
+                return resolved
+        except Exception:
+            continue
+    return None
 
 
 class UpdateEventRequest(BaseModel):
@@ -16,6 +45,7 @@ class UpdateEventRequest(BaseModel):
     class_name: Optional[str] = None
     conf: Optional[float] = None
     snapshot_path: Optional[str] = None
+    video_path: Optional[str] = None
     remark: Optional[str] = None
     status: Optional[str] = None
 
@@ -69,8 +99,8 @@ async def get_event_snapshot(event_id: str):
     if not snapshot_path:
         raise HTTPException(404, "Event snapshot not found")
 
-    path = Path(snapshot_path)
-    if not path.exists():
+    path = resolve_data_file(snapshot_path)
+    if not path:
         raise HTTPException(404, "Event snapshot file not found")
 
     return FileResponse(

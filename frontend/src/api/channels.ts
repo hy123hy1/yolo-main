@@ -36,6 +36,26 @@ export const getChannelPlayUrl = async (channelId: string) => {
   return data
 }
 
+export const startChannelZonePreview = async (channelId: string) => {
+  const { data } = await api.post(`/channels/${channelId}/zone-preview/start`)
+  return data
+}
+
+export const stopChannelZonePreview = async (channelId: string) => {
+  const { data } = await api.post(`/channels/${channelId}/zone-preview/stop`)
+  return data
+}
+
+export const getChannelZonePreviewStatus = async (channelId: string) => {
+  const { data } = await api.get(`/channels/${channelId}/zone-preview/status`)
+  return data
+}
+
+export const getChannelZonePreviewPlayUrl = async (channelId: string) => {
+  const { data } = await api.get(`/channels/${channelId}/zone-preview/play-url`)
+  return data
+}
+
 export const debugChannelAIOnce = async (channelId: string) => {
   const { data } = await api.post(`/channels/${channelId}/ai/debug-once`)
   return data

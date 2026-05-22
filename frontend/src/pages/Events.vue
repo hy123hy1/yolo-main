@@ -609,7 +609,6 @@ const startOfToday = () => {
 
 const buildCalendarDays = (monthDate: Date): CalendarDay[] => {
   const firstDay = new Date(monthDate.getFullYear(), monthDate.getMonth(), 1)
-  const lastDay = new Date(monthDate.getFullYear(), monthDate.getMonth() + 1, 0)
   const startWeekday = firstDay.getDay()
   const cells: CalendarDay[] = []
   const visibleStart = new Date(firstDay)

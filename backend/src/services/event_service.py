@@ -58,6 +58,7 @@ class EventService:
                 "class_name": payload.get("class_name", "unknown"),
                 "conf": payload.get("conf", 0),
                 "snapshot_path": payload.get("snapshot_path"),
+                "video_path": payload.get("video_path"),
                 "remark": payload.get("remark"),
                 "status": payload.get("status", "new"),
                 "created_at": now_iso(),
@@ -75,7 +76,7 @@ class EventService:
 
         def _update():
             item = load_json(path)
-            for field in ["event_type", "class_name", "conf", "snapshot_path", "remark", "status"]:
+            for field in ["event_type", "class_name", "conf", "snapshot_path", "video_path", "remark", "status"]:
                 value = getattr(request, field, None)
                 if value is not None:
                     item[field] = value
