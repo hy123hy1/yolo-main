@@ -182,6 +182,18 @@
             <div><strong>最近分析：</strong>{{ aiStatuses[item.id]?.last_analysis_at || '-' }}</div>
           </div>
 
+          <div class="ai-setup-banner">
+            <div class="ai-setup-steps">
+              <span class="step-chip">1 选模型</span>
+              <span class="step-chip">2 选类别</span>
+              <span class="step-chip">3 选区域</span>
+              <span class="step-chip">4 保存并启动</span>
+            </div>
+            <div :class="['ai-readiness-pill', channelHasReadyAIConfig(item.id) ? 'ready' : 'pending']">
+              {{ aiReadinessLabel(item.id) }}
+            </div>
+          </div>
+
           <!--
           <div
             v-if="modelRuntimeEntries(item.id).length"
@@ -222,16 +234,18 @@
           </div>
           -->
 
-          <div class="ai-tool-row">
-            <button class="ghost-btn" @click="openZoneEditor(item)">区域配置</button>
-            <button class="ai-btn" @click="startAI(item.id)">启动 AI</button>
-            <button class="ai-stop-btn" @click="stopAI(item.id)">停止 AI</button>
-          </div>
-
           <div class="ai-config-box">
-            <div class="section-title">AI 配置</div>
+            <div class="ai-config-top">
+              <div>
+                <div class="section-title">AI 配置</div>
+                <div class="ai-config-help">
+                  先选择模型，再选择要关注的类别和区域，最后保存并启动 AI。
+                </div>
+              </div>
+              <button class="ghost-btn" @click="openZoneEditor(item)">区域配置</button>
+            </div>
             <div class="ai-config-help">
-              同一个通道可配置多个 AI 模型，每个模型单独设置类别、置信度、区域和抓拍策略。
+              一个通道可同时配置多个模型；每个模型都会独立触发事件，互不影响。
             </div>
 
             <div class="ai-config-form ai-config-grid">
@@ -245,7 +259,17 @@
                 class="config-row span-2 multi-model-card"
               >
                 <div class="multi-model-head">
-                  <strong>{{ getModelById(modelConfig.model_id)?.name || modelConfig.model_id || '未选择模型' }}</strong>
+                  <div class="multi-model-title">
+                    <strong>{{ getModelById(modelConfig.model_id)?.name || modelConfig.model_id || '未选择模型' }}</strong>
+                    <div class="multi-model-tags">
+                      <span class="mini-pill">
+                        类别 {{ modelConfig.labels.length }} / {{ modelLabelsForChannel(item.id, modelConfig.local_id).length }}
+                      </span>
+                      <span class="mini-pill">
+                        区域 {{ modelConfig.zone_ids.length }} / {{ channelZones(item.id).length }}
+                      </span>
+                    </div>
+                  </div>
                   <button class="danger-btn mini" type="button" @click="removeModelConfig(item.id, modelConfig.local_id)">
                     删除
                   </button>
@@ -255,7 +279,7 @@
                   <div class="config-row compact-field">
                     <div class="config-label">
                       <strong>模型</strong>
-                      <span>选择该条 AI 配置对应的模型。</span>
+                      <span>先选择模型，系统会自动带出这个模型可检测的类别。</span>
                     </div>
                     <div class="config-control">
                       <select v-model="modelConfig.model_id" @change="handleModelChange(item.id, modelConfig.local_id)">
@@ -270,7 +294,7 @@
                   <div class="config-row compact-field">
                     <div class="config-label">
                       <strong>置信度</strong>
-                      <span>低于该阈值的检测结果会被忽略。</span>
+                      <span>低于该阈值的检测结果会被忽略，建议从 0.25 开始调整。</span>
                     </div>
                     <div class="config-control">
                       <input
@@ -286,8 +310,8 @@
 
                   <div class="config-row compact-field">
                     <div class="config-label">
-                      <strong>帧数</strong>
-                      <span>每隔多少帧分析一次，值越小越实时。</span>
+                      <strong>分析间隔</strong>
+                      <span>每隔多少帧分析一次，值越小越实时，值越大越省算力。</span>
                     </div>
                     <div class="config-control">
                       <input
@@ -304,7 +328,7 @@
                     <div class="config-control">
                       <label class="checkbox-item ai-checkbox-item">
                         <input v-model="modelConfig.save_snapshot" type="checkbox" />
-                        <span>保存抓拍图（事件产生时保存图片，供事件中心查看）</span>
+                        <span>保存抓拍图，事件触发后可直接在事件中心查看图片。</span>
                       </label>
                     </div>
                   </div>
@@ -385,15 +409,17 @@
                         </div>
                       </div>
                       <div v-else class="inline-muted">
-                        还没有区域，请先点击上方“区域配置”创建多边形区域。
+                        还没有区域，请先点击右上角“区域配置”创建多边形区域。
                       </div>
                     </div>
                   </div>
                 </div>
               </div>
 
-              <div class="config-actions span-2">
-                <button class="save-ai-btn" @click="saveAIConfig(item.id)">保存 AI 配置</button>
+              <div class="config-actions span-2 ai-action-bar">
+                <button class="save-ai-btn" @click="saveAIConfig(item.id)">保存配置</button>
+                <button class="ai-btn" @click="saveAndApplyAI(item.id)">保存并应用</button>
+                <button class="ai-stop-btn" @click="stopAI(item.id)">停止 AI</button>
               </div>
             </div>
           </div>
@@ -411,7 +437,7 @@
     <section v-if="activeTab === 'fence'" class="panel">
       <div class="section-head">
         <h3>电子围栏</h3>
-        <span>集中管理区域流预览、播放和第三方拉流地址</span>
+        <span>生成带区域框的预览流，当前页可看，也可提供给第三方平台取流</span>
       </div>
 
       <div v-if="items.length === 0" class="empty-state">暂无通道可配置电子围栏</div>
@@ -435,71 +461,73 @@
             <div><strong>区域流名：</strong>{{ zonePreviewStatuses[item.id]?.stream || `${item.stream}_zone` }}</div>
           </div>
 
-          <div class="zone-preview-layout">
-            <div class="zone-preview-box">
-              <div class="zone-preview-head">
-                <div>
-                  <div class="section-title">区域预览</div>
-                  <div class="zone-preview-help">启动后会生成一条带区域框的新流，供第三方平台、大屏和当前页面直接预览。</div>
-                </div>
+          <div class="zone-preview-box">
+            <div class="zone-preview-head">
+              <div>
+                <div class="section-title">区域预览</div>
+                <div class="zone-preview-help">启动后会自动在当前页播放带区域框的画面；只有在对接第三方平台时，才需要展开下方的取流地址。</div>
               </div>
+            </div>
 
-              <div class="zone-preview-player-shell">
-                <video
-                  :ref="(el) => setZonePreviewVideoRef(item.id, el as HTMLVideoElement | null)"
-                  class="zone-preview-player"
-                  autoplay
-                  muted
-                  playsinline
-                  controls
-                />
-                <div
-                  v-if="zonePreviewStatuses[item.id]?.status !== 'running'"
-                  class="player-mask offline-mask"
-                >
-                  <span>启动区域流后，这里会自动显示带区域框的预览画面</span>
-                </div>
-                <div
-                  v-else-if="!isZonePreviewPlaying(item.id)"
-                  class="player-mask"
-                >
-                  <button class="play-circle" type="button" @click="startZonePreviewPlayer(item.id)">
-                    ▶
-                  </button>
-                </div>
+            <div class="zone-preview-player-shell">
+              <video
+                :ref="(el) => setZonePreviewVideoRef(item.id, el as HTMLVideoElement | null)"
+                class="zone-preview-player"
+                autoplay
+                muted
+                playsinline
+                controls
+              />
+              <div
+                v-if="zonePreviewStatuses[item.id]?.status !== 'running'"
+                class="player-mask offline-mask"
+              >
+                <span>启动区域流后，这里会自动显示带区域框的预览画面</span>
               </div>
+              <div
+                v-else-if="!isZonePreviewPlaying(item.id)"
+                class="player-mask"
+              >
+                <button class="play-circle" type="button" @click="startZonePreviewPlayer(item.id)">
+                  ▶
+                </button>
+              </div>
+            </div>
 
-              <div class="zone-preview-actions">
-                <button class="ghost-btn" type="button" @click="startZonePreviewFlow(item.id)">启动区域流</button>
-                <button class="ghost-btn" type="button" @click="startZonePreviewPlayer(item.id)">播放预览</button>
+            <div class="zone-preview-actions">
+              <button
+                v-if="zonePreviewStatuses[item.id]?.status !== 'running'"
+                class="ghost-btn"
+                type="button"
+                @click="startZonePreviewFlow(item.id)"
+              >
+                启动区域流
+              </button>
+              <template v-else>
                 <button class="ghost-btn" type="button" @click="openZonePreviewModal(item)">放大预览</button>
                 <button class="ghost-btn" type="button" @click="stopZonePreviewFlow(item.id)">停止区域流</button>
-              </div>
+              </template>
+              <button class="ghost-btn" type="button" @click="openZoneEditor(item)">区域配置</button>
             </div>
 
-            <div class="zone-preview-box">
-              <div class="zone-preview-head">
-                <div>
-                  <div class="section-title">流信息</div>
-                  <div class="zone-preview-help">可直接复制给第三方平台、播放器或大屏使用。</div>
+            <details class="zone-preview-advanced" @toggle="handleZonePreviewAdvancedToggle(item.id, $event)">
+              <summary>第三方取流地址</summary>
+              <div class="zone-preview-advanced-body">
+                <div class="zone-preview-meta">
+                  <div><strong>HLS：</strong>{{ zonePreviewPlayInfos[item.id]?.hls || '-' }}</div>
+                  <div><strong>RTMP：</strong>{{ zonePreviewPlayInfos[item.id]?.rtmp || '-' }}</div>
+                  <div><strong>RTSP：</strong>{{ zonePreviewPlayInfos[item.id]?.rtsp || '-' }}</div>
+                </div>
+                <div class="zone-preview-actions">
+                  <button class="ghost-btn" type="button" @click="copyZonePreviewUrl(item.id, 'hls')">复制 HLS</button>
+                  <button class="ghost-btn" type="button" @click="copyZonePreviewUrl(item.id, 'rtmp')">复制 RTMP</button>
+                  <button class="ghost-btn" type="button" @click="copyZonePreviewUrl(item.id, 'rtsp')">复制 RTSP</button>
+                </div>
+                <div v-if="zonePreviewStatuses[item.id]?.last_error" class="zone-preview-inline-error">
+                  最近错误：{{ zonePreviewStatuses[item.id]?.last_error }}
                 </div>
               </div>
-
-              <div class="zone-preview-meta">
-                <div><strong>推流目标：</strong>{{ zonePreviewStatuses[item.id]?.target || '-' }}</div>
-                <div><strong>错误信息：</strong>{{ zonePreviewStatuses[item.id]?.last_error || '-' }}</div>
-                <div><strong>RTMP：</strong>{{ zonePreviewPlayInfos[item.id]?.rtmp || '-' }}</div>
-                <div><strong>RTSP：</strong>{{ zonePreviewPlayInfos[item.id]?.rtsp || '-' }}</div>
-                <div><strong>HLS：</strong>{{ zonePreviewPlayInfos[item.id]?.hls || '-' }}</div>
-              </div>
-
-              <div class="zone-preview-actions">
-                <button class="ghost-btn" type="button" @click="copyZonePreviewUrl(item.id, 'hls')">复制 HLS</button>
-                <button class="ghost-btn" type="button" @click="copyZonePreviewUrl(item.id, 'rtmp')">复制 RTMP</button>
-                <button class="ghost-btn" type="button" @click="copyZonePreviewUrl(item.id, 'rtsp')">复制 RTSP</button>
-                <button class="ghost-btn" type="button" @click="openZoneEditor(item)">区域配置</button>
-              </div>
-            </div>
+            </details>
           </div>
 
           <div v-if="zonePreviewErrors[item.id]" class="error-text">
@@ -631,6 +659,7 @@
 import { nextTick, onActivated, onBeforeUnmount, onDeactivated, onMounted, ref, watch } from 'vue'
 import ZoneEditorModal from '@/components/channels/ZoneEditorModal.vue'
 import {
+  applyChannelAI,
   createChannel,
   deleteChannel,
   getChannelAIStatus,
@@ -639,7 +668,6 @@ import {
   getChannelZonePreviewStatus,
   listChannels,
   listChannelZones,
-  startChannelAI,
   startChannelPlay,
   startChannelZonePreview,
   stopChannelAI,
@@ -910,6 +938,17 @@ const modelLabelsForChannel = (channelId: string, localId: string) => {
 }
 
 const channelZones = (channelId: string) => zonesMap.value[channelId] || []
+const channelModelCount = (channelId: string) =>
+  (aiConfigs.value[channelId]?.models || []).filter((item) => item.model_id).length
+const channelHasReadyAIConfig = (channelId: string) =>
+  (aiConfigs.value[channelId]?.models || []).some((item) => item.model_id && item.labels.length > 0)
+
+const aiReadinessLabel = (channelId: string) => {
+  const modelCount = channelModelCount(channelId)
+  if (!modelCount) return '待选择模型'
+  if (!channelHasReadyAIConfig(channelId)) return '待选择类别'
+  return '可直接保存并启动'
+}
 
 const syncLabelsWithModel = (channelId: string, localId: string) => {
   const config = getChannelModelConfig(channelId, localId)
@@ -1111,6 +1150,16 @@ const restoreZonePreviewPlaybackForFenceTab = async () => {
     } catch (error: any) {
       zonePreviewDebug.value[item.id] = error?.message || '恢复区域预览失败'
     }
+  }
+}
+
+const handleZonePreviewAdvancedToggle = async (channelId: string, event: Event) => {
+  const target = event.target as HTMLDetailsElement | null
+  if (!target?.open) return
+  try {
+    await ensureZonePreviewPlayInfo(channelId)
+  } catch (error: any) {
+    showMessage('error', error?.response?.data?.detail || error?.message || '加载区域流地址失败')
   }
 }
 
@@ -2134,8 +2183,9 @@ const saveAIConfig = async (channelId: string) => {
   }
 }
 
-const startAI = async (channelId: string) => {
+const saveAndApplyAI = async (channelId: string) => {
   try {
+    await saveAIConfig(channelId)
     const channel = items.value.find((entry) => entry.id === channelId)
     const modelConfigs = normalizeChannelModelConfigs(channel?.ext?.ai_config || {}).filter((item) => item.model_id)
     if (!modelConfigs.length) {
@@ -2145,13 +2195,13 @@ const startAI = async (channelId: string) => {
     if (invalidModel) {
       throw new Error(`模型不存在：${invalidModel.model_id}，请重新保存正确模型`)
     }
-    const result = await startChannelAI(channelId)
+    const result = await applyChannelAI(channelId)
     aiConfigs.value[channelId].enabled = true
-    debugResults.value[channelId] = `AI 状态：${result.status || 'starting'}`
-    showMessage('success', `${channel?.name || channelId} 已启动 AI 能力`)
+    debugResults.value[channelId] = `AI 状态：${result.status || 'starting'}，新配置已应用`
+    showMessage('success', `${channel?.name || channelId} 已保存并应用 AI 配置`)
     await loadAIStatuses()
   } catch (error: any) {
-    debugResults.value[channelId] = error?.response?.data?.detail || error?.message || '启动 AI 失败'
+    debugResults.value[channelId] = error?.response?.data?.detail || error?.message || '保存并应用 AI 失败'
   }
 }
 
@@ -2559,13 +2609,6 @@ aiStatusPollTimer = window.setInterval(() => {
   color: #334155;
 }
 
-.zone-preview-layout {
-  display: grid;
-  grid-template-columns: minmax(0, 1.2fr) minmax(320px, 0.8fr);
-  gap: 1rem;
-  align-items: start;
-}
-
 .ai-capability-grid {
   display: grid;
   grid-template-columns: minmax(360px, 420px) minmax(0, 1fr);
@@ -2578,6 +2621,54 @@ aiStatusPollTimer = window.setInterval(() => {
   grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
   gap: 0.55rem;
   color: #334155;
+}
+
+.ai-experience-card {
+  gap: 0.9rem;
+}
+
+.ai-setup-banner {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.9rem;
+  align-items: center;
+  flex-wrap: wrap;
+  padding: 0.85rem 0.95rem;
+  border-radius: 14px;
+  background: linear-gradient(180deg, #ffffff 0%, #f8fbff 100%);
+  border: 1px solid #dbe4ee;
+}
+
+.ai-setup-steps {
+  display: flex;
+  gap: 0.45rem;
+  flex-wrap: wrap;
+}
+
+.step-chip {
+  padding: 0.35rem 0.7rem;
+  border-radius: 999px;
+  background: #eff6ff;
+  color: #1d4ed8;
+  font-size: 0.84rem;
+  font-weight: 600;
+}
+
+.ai-readiness-pill {
+  padding: 0.38rem 0.8rem;
+  border-radius: 999px;
+  font-size: 0.84rem;
+  font-weight: 700;
+}
+
+.ai-readiness-pill.ready {
+  background: #dcfce7;
+  color: #166534;
+}
+
+.ai-readiness-pill.pending {
+  background: #fef3c7;
+  color: #92400e;
 }
 
 .ai-config-box {
@@ -2619,12 +2710,60 @@ aiStatusPollTimer = window.setInterval(() => {
   grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
   gap: 0.55rem 1rem;
   color: #334155;
+  font-size: 0.94rem;
+  line-height: 1.65;
 }
 
 .zone-preview-actions {
   display: flex;
   gap: 0.65rem;
   flex-wrap: wrap;
+}
+
+.zone-preview-advanced {
+  border-top: 1px solid #e2e8f0;
+  padding-top: 0.9rem;
+}
+
+.zone-preview-advanced summary {
+  list-style: none;
+  cursor: pointer;
+  color: #0f172a;
+  font-weight: 700;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+}
+
+.zone-preview-advanced summary::-webkit-details-marker {
+  display: none;
+}
+
+.zone-preview-advanced summary::after {
+  content: '▾';
+  font-size: 0.82rem;
+  color: #64748b;
+  transition: transform 0.2s ease;
+}
+
+.zone-preview-advanced[open] summary::after {
+  transform: rotate(180deg);
+}
+
+.zone-preview-advanced-body {
+  display: grid;
+  gap: 0.8rem;
+  margin-top: 0.8rem;
+  padding: 0.9rem;
+  border-radius: 12px;
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+}
+
+.zone-preview-inline-error {
+  color: #b91c1c;
+  font-size: 0.92rem;
+  line-height: 1.6;
 }
 
 .zone-preview-player-shell {
@@ -2688,6 +2827,14 @@ aiStatusPollTimer = window.setInterval(() => {
 .section-title {
   font-weight: 700;
   color: #0f172a;
+}
+
+.ai-config-top {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.9rem;
+  align-items: start;
+  flex-wrap: wrap;
 }
 
 .ai-config-help {
@@ -2893,9 +3040,33 @@ aiStatusPollTimer = window.setInterval(() => {
   margin-bottom: 0.75rem;
 }
 
+.multi-model-title {
+  display: grid;
+  gap: 0.4rem;
+}
+
+.multi-model-tags {
+  display: flex;
+  gap: 0.45rem;
+  flex-wrap: wrap;
+}
+
+.mini-pill {
+  padding: 0.28rem 0.58rem;
+  border-radius: 999px;
+  background: #eef2ff;
+  color: #4338ca;
+  font-size: 0.8rem;
+  font-weight: 600;
+}
+
 .multi-model-grid {
   display: grid;
   gap: 0.75rem;
+}
+
+.ai-action-bar {
+  align-items: center;
 }
 
 .save-ai-btn {

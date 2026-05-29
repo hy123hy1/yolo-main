@@ -1,7 +1,7 @@
 <template>
   <div class="dashboard">
     <div class="card">
-      <h1>欢迎使用 YOLO 训练平台</h1>
+      <h1>欢迎使用AI视频分析平台</h1>
       <p>支持模型训练、推理，以及通道、事件、录像等视频 AI 能力管理。</p>
     </div>
 

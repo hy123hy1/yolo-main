@@ -1,7 +1,7 @@
 <template>
   <div id="app">
     <nav class="navbar">
-      <div class="nav-brand">YOLO 训练平台</div>
+      <div class="nav-brand">AI视频分析平台</div>
       <div class="nav-links">
         <router-link to="/">首页</router-link>
         <router-link to="/datasets">数据集</router-link>

@@ -213,6 +213,17 @@ async def start_channel_ai(channel_id: str):
     return result
 
 
+@router.post("/{channel_id}/ai/apply")
+async def apply_channel_ai(channel_id: str):
+    try:
+        result = await channel_service.apply_ai(channel_id)
+    except RuntimeError as exc:
+        raise HTTPException(409, str(exc))
+    if result is None:
+        raise HTTPException(404, "Channel not found")
+    return result
+
+
 @router.post("/{channel_id}/ai/stop")
 async def stop_channel_ai(channel_id: str):
     result = await channel_service.stop_ai(channel_id)

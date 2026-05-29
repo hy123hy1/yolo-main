@@ -572,6 +572,34 @@ class AnalysisService:
             "started_at": self._workers[channel_id]["started_at"],
         }
 
+    async def restart_channel_analysis(self, channel_id: str) -> dict | None:
+        channel = self._load_channel(channel_id)
+        if not channel:
+            return None
+
+        with self._lock:
+            existing = self._workers.get(channel_id)
+            if existing:
+                existing["stop_event"].set()
+
+        wait_deadline = time.time() + 5.0
+        while time.time() < wait_deadline:
+          with self._lock:
+              existing = self._workers.get(channel_id)
+              if not existing or not existing["thread"].is_alive():
+                  break
+          time.sleep(0.1)
+
+        with self._lock:
+            existing = self._workers.get(channel_id)
+            if existing and existing["thread"].is_alive():
+                raise RuntimeError("AI analysis worker did not stop in time")
+            if existing and not existing["thread"].is_alive():
+                self._workers.pop(channel_id, None)
+
+        self._update_runtime(channel_id, status="restarting", stopped_at=now_iso())
+        return await self.start_channel_analysis(channel_id)
+
     async def stop_channel_analysis(self, channel_id: str) -> dict | None:
         channel = self._load_channel(channel_id)
         if not channel:

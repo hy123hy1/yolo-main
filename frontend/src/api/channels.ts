@@ -138,6 +138,11 @@ export const startChannelAI = async (channelId: string) => {
   return data
 }
 
+export const applyChannelAI = async (channelId: string) => {
+  const { data } = await api.post(`/channels/${channelId}/ai/apply`)
+  return data
+}
+
 export const stopChannelAI = async (channelId: string) => {
   const { data } = await api.post(`/channels/${channelId}/ai/stop`)
   return data

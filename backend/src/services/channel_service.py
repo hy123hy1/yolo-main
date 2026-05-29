@@ -781,6 +781,14 @@ class ChannelService:
         await self.update_ai_config(channel_id, request)
         return await analysis_service.start_channel_analysis(channel_id)
 
+    async def apply_ai(self, channel_id: str):
+        config = await self.get_ai_config(channel_id)
+        if config is None:
+            return None
+        request = type("Req", (), {**config, "enabled": True})()
+        await self.update_ai_config(channel_id, request)
+        return await analysis_service.restart_channel_analysis(channel_id)
+
     async def stop_ai(self, channel_id: str):
         config = await self.get_ai_config(channel_id)
         if config is None:
