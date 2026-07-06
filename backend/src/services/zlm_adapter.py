@@ -42,6 +42,7 @@ class ZLMAdapter:
         hostname = self.public_http_host or play_parsed.hostname or "localhost"
         http_port = self.https_port if scheme == "https" else self.http_port
         http_host = f"{hostname}:{http_port}"
+        http_base = f"{scheme}://{http_host}"
         rtsp_host = f"{self.public_rtsp_host or hostname}:{self.rtsp_port}"
         rtmp_host = f"{self.public_rtmp_host or hostname}:{self.rtmp_port}"
 
@@ -61,15 +62,22 @@ class ZLMAdapter:
         })
         browser_suffix = f"?node_id={node_id}" if node_id else ""
 
+        browser_hls = f"/proxy/sms/{app}/{stream}/{self.hls_file}{browser_suffix}"
+        browser_httpflv = f"/proxy/sms/{app}/{stream}{self.httpflv_suffix}{browser_suffix}"
+        browser_webrtc_api = f"/proxy/sms{self.webrtc_path}?{browser_webrtc_query}"
+
         return {
             "rtsp": f"rtsp://{rtsp_host}/{app}/{stream}",
             "rtmp": f"rtmp://{rtmp_host}/{app}/{stream}",
-            "hls": f"{scheme}://{http_host}/{app}/{stream}/{self.hls_file}",
-            "httpflv": f"{scheme}://{http_host}/{app}/{stream}{self.httpflv_suffix}",
+            "hls": f"{http_base}/{app}/{stream}/{self.hls_file}",
+            "httpflv": f"{http_base}/{app}/{stream}{self.httpflv_suffix}",
             "webrtc": f"{webrtc_scheme}://{webrtc_host}{self.webrtc_path}?{webrtc_query}",
-            "browser_hls": f"/proxy/sms/{app}/{stream}/{self.hls_file}{browser_suffix}",
-            "browser_httpflv": f"/proxy/sms/{app}/{stream}{self.httpflv_suffix}{browser_suffix}",
-            "browser_webrtc_api": f"/proxy/sms{self.webrtc_path}?{browser_webrtc_query}",
+            "browser_hls": browser_hls,
+            "browser_httpflv": browser_httpflv,
+            "browser_webrtc_api": browser_webrtc_api,
+            "browser_hls_url": f"{http_base}{browser_hls}",
+            "browser_httpflv_url": f"{http_base}{browser_httpflv}",
+            "browser_webrtc_api_url": f"{http_base}{browser_webrtc_api}",
         }
 
     def add_stream_proxy(self, app: str, stream: str, source_url: str) -> dict:

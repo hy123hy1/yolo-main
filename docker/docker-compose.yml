@@ -49,24 +49,22 @@ services:
       - ../backend/data:/app/data
       - ../backend/models:/app/models
       - ../backend/src:/app/src
+    gpus: all
     shm_size: "24gb"
     networks:
       - yolo-network
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - AI_INFERENCE_DEVICE=cuda:0
       - TZ=Asia/Shanghai
       - METADATA_DB_ENABLED=true
       - METADATA_DB_STRICT=false
-      # Default metadata DB is local SQLite: /app/data/metadata.db
-      # To use MySQL/PostgreSQL, set METADATA_DATABASE_URL externally.
       - ZLM_API_BASE=http://zlm-server:8010
-      - ZLM_PLAY_BASE=http://localhost:8010
-      - ZLM_WEBRTC_BASE=webrtc://localhost:8010
       - ZLM_SECRET=HC5elxV5pt8guwuvV8NmddzVhb4u1lyY
     depends_on:
       - zlm-server
-    command: ["uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+    command: ["uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "8000"]
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
       interval: 30s

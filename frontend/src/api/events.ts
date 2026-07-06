@@ -7,6 +7,8 @@ export const listEvents = async () => {
 
 export interface ListEventsParams {
   channel_id?: string
+  task_id?: string
+  algorithm_id?: string
   class_name?: string
   page?: number
   page_size?: number

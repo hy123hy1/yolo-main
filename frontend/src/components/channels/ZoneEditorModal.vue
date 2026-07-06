@@ -157,6 +157,7 @@ import {
   addChannelZone,
   captureChannelSnapshot,
   deleteChannelZone,
+  getLatestChannelSnapshot,
   listChannelZones,
   updateChannelZone
 } from '@/api/channels'
@@ -251,6 +252,25 @@ const showMessage = (type: 'success' | 'error', text: string) => {
 }
 
 const toSnapshotSrc = (path: string) => `${apiBase}${path}`
+const sleep = (ms: number) => new Promise((resolve) => window.setTimeout(resolve, ms))
+
+const loadLatestSnapshot = async () => {
+  if (!props.channelId) return ''
+  const result = await getLatestChannelSnapshot(props.channelId)
+  return result.snapshot_url ? toSnapshotSrc(result.snapshot_url) : ''
+}
+
+const waitForLatestSnapshot = async (previousSnapshotUrl: string) => {
+  const deadline = Date.now() + 8000
+  while (Date.now() < deadline) {
+    const latestSnapshotUrl = await loadLatestSnapshot()
+    if (latestSnapshotUrl && (!previousSnapshotUrl || latestSnapshotUrl !== previousSnapshotUrl)) {
+      return latestSnapshotUrl
+    }
+    await sleep(350)
+  }
+  return ''
+}
 
 const normalizeZone = (zone: any): ZoneItem => ({
   id: zone.id,
@@ -281,8 +301,13 @@ const loadZones = async () => {
 const refreshSnapshot = async () => {
   loading.value = true
   try {
-    const result = await captureChannelSnapshot(props.channelId)
-    snapshotUrl.value = result.snapshot_url ? toSnapshotSrc(result.snapshot_url) : ''
+    const previousSnapshotUrl = snapshotUrl.value
+    await captureChannelSnapshot(props.channelId)
+    const latestSnapshotUrl = await waitForLatestSnapshot(previousSnapshotUrl)
+    if (!latestSnapshotUrl) {
+      throw new Error('底图刷新超时，请稍后再试')
+    }
+    snapshotUrl.value = latestSnapshotUrl
     showMessage('success', '底图已刷新，可以开始编辑区域。')
   } catch (error: any) {
     showMessage('error', error?.response?.data?.detail || error?.message || '抓取底图失败')
@@ -297,7 +322,12 @@ const initialize = async () => {
   message.value = ''
   try {
     await loadZones()
-    await refreshSnapshot()
+    const latestSnapshotUrl = await loadLatestSnapshot()
+    if (latestSnapshotUrl) {
+      snapshotUrl.value = latestSnapshotUrl
+    } else {
+      await refreshSnapshot()
+    }
     if (zones.value.length) {
       selectZone(zones.value[0])
     } else {

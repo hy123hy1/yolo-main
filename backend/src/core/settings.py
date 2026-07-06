@@ -31,6 +31,28 @@ def _load_config_toml_to_environment(base_dir: Path) -> None:
     _set_env_if_absent("HOST", server.get("Host"))
     _set_env_if_absent("PORT", server_http.get("Port", server.get("Port")))
     _set_env_if_absent("ENABLE_TRAINING", server.get("EnableTraining"))
+    server_web = server.get("Web", {}) if isinstance(server.get("Web"), dict) else {}
+    _set_env_if_absent("WEB_PUBLIC_BASE", server_web.get("PublicBase"))
+    monitor = server.get("Monitor", {}) if isinstance(server.get("Monitor"), dict) else {}
+    _set_env_if_absent("HOST_MONITOR_AGENT_URL", monitor.get("HostAgentURL"))
+    _set_env_if_absent("HOST_MONITOR_AGENT_TIMEOUT_SECONDS", monitor.get("HostAgentTimeoutSeconds"))
+    _set_env_if_absent("HOST_MONITOR_METRICS_FILE", monitor.get("HostMetricsFile"))
+    _set_env_if_absent("HOST_MONITOR_METRICS_MAX_AGE_SECONDS", monitor.get("HostMetricsMaxAgeSeconds"))
+    startup = server.get("Startup", {}) if isinstance(server.get("Startup"), dict) else {}
+    _set_env_if_absent("STARTUP_TASK_RESTORE_INITIAL_DELAY_SECONDS", startup.get("TaskRestoreInitialDelaySeconds"))
+    _set_env_if_absent("TASK_RESTORE_STARTUP_STAGGER_SECONDS", startup.get("TaskRestoreStaggerSeconds"))
+    _set_env_if_absent("TASK_PREVIEW_WARMUP_STARTUP_DELAY_SECONDS", startup.get("TaskPreviewWarmupStartupDelaySeconds"))
+    _set_env_if_absent("TASK_PREVIEW_WARMUP_MAX_CONCURRENCY", startup.get("TaskPreviewWarmupMaxConcurrency"))
+    _set_env_if_absent("TASK_ANALYSIS_STARTUP_WARMUP_SECONDS", startup.get("TaskAnalysisStartupWarmupSeconds"))
+    _set_env_if_absent("TASK_ANALYSIS_ALGORITHM_MAX_CONCURRENCY", startup.get("TaskAnalysisAlgorithmMaxConcurrency"))
+    _set_env_if_absent("ALARM_VIDEO_BEFORE_SECONDS", startup.get("AlarmVideoBeforeSeconds"))
+    _set_env_if_absent("ALARM_VIDEO_AFTER_SECONDS", startup.get("AlarmVideoAfterSeconds"))
+    _set_env_if_absent("ALARM_VIDEO_JOB_MAX_WORKERS", startup.get("AlarmVideoJobMaxWorkers"))
+    _set_env_if_absent("TASK_ALARM_VIDEO_CAPTURE_TIMEOUT_SECONDS", startup.get("TaskAlarmVideoCaptureTimeoutSeconds"))
+    _set_env_if_absent("TASK_ALARM_VIDEO_READ_FAIL_LIMIT", startup.get("TaskAlarmVideoReadFailLimit"))
+
+    ai_cfg = config.get("AI", {}) if isinstance(config.get("AI"), dict) else {}
+    _set_env_if_absent("AI_INFERENCE_DEVICE", ai_cfg.get("InferenceDevice"))
 
     data_cfg = config.get("Data", {})
     _set_env_if_absent("METADATA_DB_ENABLED", data_cfg.get("MetadataDBEnabled"))
@@ -56,6 +78,12 @@ def _load_config_toml_to_environment(base_dir: Path) -> None:
     _set_env_if_absent("ZLM_HTTPFLV_SUFFIX", media.get("HTTPFLVSuffix"))
     _set_env_if_absent("ZLM_WEBRTC_PATH", media.get("WebRTCPath"))
 
+    wvp = config.get("WVP", {})
+    _set_env_if_absent("WVP_ENABLED", wvp.get("Enabled"))
+    _set_env_if_absent("WVP_API_BASE", wvp.get("APIBase"))
+    _set_env_if_absent("WVP_CHANNEL_LIST_PATH", wvp.get("ChannelListPath"))
+    _set_env_if_absent("WVP_CHANNEL_PLAY_PATH", wvp.get("ChannelPlayPath"))
+
 
 class Settings(BaseSettings):
     BASE_DIR: Path = Path(__file__).resolve().parent.parent.parent
@@ -70,6 +98,7 @@ class Settings(BaseSettings):
     INFERENCE_RESULTS_DIR: Path = DATA_DIR / "inference_results"
     DEVICES_DIR: Path = DATA_DIR / "devices"
     CHANNELS_DIR: Path = DATA_DIR / "channels"
+    TASKS_DIR: Path = DATA_DIR / "tasks"
     MEDIA_NODES_DIR: Path = DATA_DIR / "media_nodes"
     EVENTS_DIR: Path = DATA_DIR / "events"
     RECORDINGS_DIR: Path = DATA_DIR / "recordings"
@@ -82,6 +111,17 @@ class Settings(BaseSettings):
     API_PREFIX: str = ""
     HOST: str = "0.0.0.0"
     PORT: int = 8000
+    WEB_PUBLIC_BASE: str = "http://localhost:3000"
+    HOST_MONITOR_AGENT_URL: str = ""
+    HOST_MONITOR_AGENT_TIMEOUT_SECONDS: float = 2
+    HOST_MONITOR_METRICS_FILE: Path = DATA_DIR / "host_monitor_resources.json"
+    HOST_MONITOR_METRICS_MAX_AGE_SECONDS: float = 10
+    STARTUP_TASK_RESTORE_INITIAL_DELAY_SECONDS: float = 2.0
+    TASK_RESTORE_STARTUP_STAGGER_SECONDS: float = 0.5
+    TASK_PREVIEW_WARMUP_STARTUP_DELAY_SECONDS: float = 2.0
+    TASK_PREVIEW_WARMUP_MAX_CONCURRENCY: int = 1
+    TASK_ANALYSIS_STARTUP_WARMUP_SECONDS: float = 5.0
+    TASK_ANALYSIS_ALGORITHM_MAX_CONCURRENCY: int = 2
 
     FFMPEG_BIN: str = "ffmpeg"
     ZLM_API_BASE: str = "http://host.docker.internal:8010"
@@ -98,6 +138,17 @@ class Settings(BaseSettings):
     ZLM_HLS_FILE: str = "hls.fmp4.m3u8"
     ZLM_HTTPFLV_SUFFIX: str = ".live.flv"
     ZLM_WEBRTC_PATH: str = "/index/api/webrtc"
+    ALARM_VIDEO_BEFORE_SECONDS: int = 10
+    ALARM_VIDEO_AFTER_SECONDS: int = 10
+    ALARM_VIDEO_JOB_MAX_WORKERS: int = 2
+    TASK_ALARM_VIDEO_CAPTURE_TIMEOUT_SECONDS: float = 0
+    TASK_ALARM_VIDEO_READ_FAIL_LIMIT: int = 20
+    AI_INFERENCE_DEVICE: str = "auto"
+
+    WVP_ENABLED: bool = False
+    WVP_API_BASE: str = ""
+    WVP_CHANNEL_LIST_PATH: str = "/api/common/channel/list"
+    WVP_CHANNEL_PLAY_PATH: str = "/api/common/channel/play"
 
     METADATA_DB_ENABLED: bool = True
     METADATA_DB_STRICT: bool = False
@@ -105,11 +156,11 @@ class Settings(BaseSettings):
     METADATA_DATABASE_URL: str = ""
     SQLITE_DB_PATH: Path = DATA_DIR / "metadata.db"
 
-    MYSQL_HOST: str = "mysql"
-    MYSQL_PORT: int = 3306
-    MYSQL_DATABASE: str = "yolo_meta"
-    MYSQL_USER: str = "yolo"
-    MYSQL_PASSWORD: str = "yolo123456"
+    MYSQL_HOST: str = "192.168.1.58"
+    MYSQL_PORT: int = 3006
+    MYSQL_DATABASE: str = "sp-ai-yolo"
+    MYSQL_USER: str = "root"
+    MYSQL_PASSWORD: str = "root"
     MYSQL_CHARSET: str = "utf8mb4"
 
     class Config:
@@ -130,6 +181,19 @@ class Settings(BaseSettings):
             sqlite_path = self.BASE_DIR / sqlite_path
         return f"sqlite:///{sqlite_path.resolve().as_posix()}"
 
+    @property
+    def resolved_host_monitor_metrics_file(self) -> Path:
+        metrics_path = Path(self.HOST_MONITOR_METRICS_FILE)
+        if not metrics_path.is_absolute():
+            metrics_path = self.BASE_DIR / metrics_path
+        return metrics_path
+
+    @property
+    def ALARM_VIDEO_SECONDS(self) -> int:
+        before_seconds = max(int(self.ALARM_VIDEO_BEFORE_SECONDS or 0), 0)
+        after_seconds = max(int(self.ALARM_VIDEO_AFTER_SECONDS or 0), 0)
+        return max(before_seconds + after_seconds, 0)
+
     def init_directories(self) -> None:
         for dir_path in [
             self.CONFIG_DIR,
@@ -140,6 +204,7 @@ class Settings(BaseSettings):
             self.JOBS_DIR,
             self.DEVICES_DIR,
             self.CHANNELS_DIR,
+            self.TASKS_DIR,
             self.MEDIA_NODES_DIR,
             self.EVENTS_DIR,
             self.RECORDINGS_DIR,

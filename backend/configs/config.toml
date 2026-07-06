@@ -5,6 +5,28 @@
   [Server.HTTP]
     Port = 8000
 
+  [Server.Web]
+    PublicBase = "http://192.168.60.61:3000"
+
+  [Server.Monitor]
+    HostAgentURL = ""
+    HostAgentTimeoutSeconds = 2
+    HostMetricsFile = "data/host_monitor_resources.json"
+    HostMetricsMaxAgeSeconds = 10
+
+  [Server.Startup]
+    TaskRestoreInitialDelaySeconds = 2
+    TaskRestoreStaggerSeconds = 0.5
+    TaskPreviewWarmupStartupDelaySeconds = 2
+    TaskPreviewWarmupMaxConcurrency = 1
+    TaskAnalysisStartupWarmupSeconds = 5
+    TaskAnalysisAlgorithmMaxConcurrency = 3
+    AlarmVideoBeforeSeconds = 10
+    AlarmVideoAfterSeconds = 10
+    AlarmVideoJobMaxWorkers = 2
+    TaskAlarmVideoCaptureTimeoutSeconds = 25
+    TaskAlarmVideoReadFailLimit = 20
+
 [Data]
   MetadataDBEnabled = true
   MetadataDBStrict = false
@@ -13,18 +35,23 @@
     # Default mode: SQLite file path
     # Examples:
     #   ./data/metadata.db
-    #   mysql+pymysql://yolo:yolo123456@127.0.0.1:3306/yolo_meta?charset=utf8mb4
-    #   postgresql+psycopg2://postgres:123456@127.0.0.1:5432/yolo_meta
-    Dsn = "./data/metadata.db"
+    #   mysql+pymysql://root:root@192.168.1.58:3006/sp-ai-yolo?charset=utf8mb4
+    #   postgresql+psycopg2://postgres:123456@127.0.0.1:5432/sp_ai_yolo
+    Dsn = "mysql+pymysql://root:root@192.168.1.58:3006/sp-ai-yolo?charset=utf8mb4"
+
+[AI]
+  # auto: use cuda:0 when CUDA is visible, otherwise CPU.
+  # cuda:0: prefer the first NVIDIA GPU and fall back to CPU if unavailable.
+  InferenceDevice = "cuda:0"
 
 [Media]
   APIBase = "http://host.docker.internal:8010"
-  PlayBase = "http://localhost:8010"
-  WebRTCBase = "webrtc://localhost:8010"
+  PlayBase = "http://192.168.60.61:8010"
+  WebRTCBase = "webrtc://192.168.60.61:8010"
   Secret = ""
-  PublicRTSPHost = "localhost"
-  PublicRTMPHost = "localhost"
-  PublicHTTPHost = "localhost"
+  PublicRTSPHost = "192.168.60.61"
+  PublicRTMPHost = "192.168.60.61"
+  PublicHTTPHost = "192.168.60.61"
   RTSPPort = 554
   RTMPPort = 1935
   HTTPPort = 8010
@@ -32,3 +59,9 @@
   HLSFile = "hls.fmp4.m3u8"
   HTTPFLVSuffix = ".live.flv"
   WebRTCPath = "/index/api/webrtc"
+
+[WVP]
+  Enabled = true
+  APIBase = "http://192.168.1.58:18080"
+  ChannelListPath = "/api/common/channel/list"
+  ChannelPlayPath = "/api/common/channel/play"

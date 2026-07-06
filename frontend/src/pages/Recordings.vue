@@ -148,7 +148,7 @@
         >
           <div class="thumb-wrap">
             <div class="thumb-top-left">
-              <span class="type-badge">{{ formatEventType(item.event_type) }}</span>
+              <span class="type-badge">{{ formatAlarmLabel(item) }}</span>
             </div>
             <div class="thumb-top-right">{{ durationLabel(item.duration) }}</div>
 
@@ -279,6 +279,10 @@
                 <strong>{{ formatEventType(currentPreview.event_type) }}</strong>
               </div>
               <div class="detail-row">
+                <span>报警类别</span>
+                <strong>{{ formatAlarmLabel(currentPreview) }}</strong>
+              </div>
+              <div class="detail-row">
                 <span>事件 ID</span>
                 <strong>{{ currentPreview.event_id || '-' }}</strong>
               </div>
@@ -320,6 +324,9 @@ type RecordingItem = {
   status?: string
   event_id?: string
   event_type?: string
+  event_type_label?: string
+  class_name?: string
+  conf?: number | string | null
   video_url?: string | null
   snapshot_url?: string | null
 }
@@ -473,6 +480,15 @@ const formatEventType = (value?: string) => {
   if (!value) return '报警视频'
   if (value === 'alarm_clip') return '报警视频'
   return value
+}
+
+const formatAlarmLabel = (item?: RecordingItem | null) => {
+  if (!item) return '-'
+  const className = item.class_name || ''
+  if (!className) return formatEventType(item.event_type)
+  const conf = typeof item.conf === 'number' ? item.conf : Number(item.conf)
+  if (!Number.isFinite(conf) || conf <= 0) return className
+  return `${className} ${(conf * 100).toFixed(0)}%`
 }
 
 const channelName = (channelId?: string) => {

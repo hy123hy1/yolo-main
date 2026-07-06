@@ -1,0 +1,13 @@
+[mysqldump]
+host=192.168.1.200
+port=3307
+user=root
+password=root
+default-character-set=utf8mb4
+no-tablespaces
+single-transaction
+routines
+events
+triggers
+set-gtid-purged=OFF
+database=wvp273数据库统合

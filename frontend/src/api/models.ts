@@ -2,8 +2,19 @@ import api from './axios'
 
 export interface UpdateModelRequest {
   name?: string
-  description?: string
-  tags?: string[]
+}
+
+export interface ModelSceneCandidate {
+  scene_key: string
+  scene_name: string
+  recommended_labels: string[]
+  rule_type: string
+  default_need_overlay: boolean
+  default_need_snapshot: boolean
+  default_need_video_clip: boolean
+  requires_region: boolean
+  priority: number
+  source?: string
 }
 
 export interface ModelDetails {
@@ -19,6 +30,9 @@ export interface ModelDetails {
   name?: string
   description?: string
   tags?: string[]
+  auto_label_strategy?: 'all' | 'recommended' | 'manual'
+  recommended_labels?: string[]
+  scene_candidates?: ModelSceneCandidate[]
   file_size?: number
   file_size_mb?: number
   training_metrics?: {

@@ -5,6 +5,7 @@ import subprocess
 import sys
 import threading
 import time
+from copy import deepcopy
 from pathlib import Path
 
 import cv2
@@ -14,7 +15,19 @@ from src.core.settings import settings
 from src.services.platform_storage import load_json, now_iso, save_json
 
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("uvicorn.error")
+
+ZONE_PREVIEW_PUSH_QUEUE_TIMEOUT_SECONDS = 0.1
+ZONE_PREVIEW_WORKER_MONITOR_INTERVAL_SECONDS = 0.1
+ZONE_PREVIEW_STOP_JOIN_TIMEOUT_SECONDS = 0.5
+ZONE_PREVIEW_EXPECTED_SHUTDOWN_ERROR_KEYWORDS = (
+    "broken pipe",
+    "error writing trailer",
+    "error closing file",
+    "failed to update header",
+    "error muxing a packet",
+    "task finished with error code: -32",
+)
 
 
 class FFmpegCapture:
@@ -24,11 +37,13 @@ class FFmpegCapture:
         self.height = height
         self.frame_size = width * height * 3
         self.process: subprocess.Popen | None = None
+        self._pending_frame_bytes = bytearray()
         self.start()
         if init_wait > 0:
             time.sleep(init_wait)
 
     def start(self):
+        self._pending_frame_bytes.clear()
         cmd = [
             settings.FFMPEG_BIN,
             "-loglevel",
@@ -79,17 +94,20 @@ class FFmpegCapture:
             if self.process is None or self.process.poll() is not None or self.process.stdout is None:
                 return False, None
             try:
-                raw = self.process.stdout.read(self.frame_size)
+                while len(self._pending_frame_bytes) < self.frame_size:
+                    raw = self.process.stdout.read(self.frame_size - len(self._pending_frame_bytes))
+                    if len(raw) == 0:
+                        break
+                    self._pending_frame_bytes.extend(raw)
             except Exception as exc:
                 logger.warning("FFmpegCapture read error: %s", exc)
                 return False, None
 
-            if len(raw) == self.frame_size:
+            if len(self._pending_frame_bytes) >= self.frame_size:
+                raw = bytes(self._pending_frame_bytes[: self.frame_size])
+                del self._pending_frame_bytes[: self.frame_size]
                 frame = np.frombuffer(raw, dtype=np.uint8).reshape((self.height, self.width, 3)).copy()
                 return True, frame
-            if len(raw) == 0:
-                time.sleep(0.05)
-                continue
             time.sleep(0.05)
         return False, None
 
@@ -103,6 +121,7 @@ class FFmpegCapture:
             pass
         finally:
             self.process = None
+            self._pending_frame_bytes.clear()
 
     def is_healthy(self) -> bool:
         return self.process is not None and self.process.poll() is None
@@ -151,13 +170,17 @@ class ZonePreviewService:
         last_error: str | None = None,
         started_at: str | None = None,
         stopped_at: str | None = None,
+        zones: list[dict] | None = None,
+        zone_source: str | None = None,
+        owner_task_id: str | None = None,
         clear_error: bool = False,
-    ) -> None:
+    ) -> bool:
         channel = self._load_channel(channel_id)
         if not channel:
-            return
+            return False
 
         runtime = channel.setdefault("ext", {}).setdefault("zone_preview", {})
+        original_runtime = deepcopy(runtime)
         if enabled is not None:
             runtime["enabled"] = enabled
         if status is not None:
@@ -170,6 +193,13 @@ class ZonePreviewService:
             runtime["target"] = target
         if urls is not None:
             runtime["urls"] = urls
+        if zones is not None:
+            runtime["zones"] = zones
+            runtime["zone_count"] = len(zones)
+        if zone_source is not None:
+            runtime["zone_source"] = zone_source
+        if owner_task_id is not None:
+            runtime["owner_task_id"] = owner_task_id
         if clear_error:
             runtime["last_error"] = None
         elif last_error is not None:
@@ -178,7 +208,91 @@ class ZonePreviewService:
             runtime["started_at"] = started_at
         if stopped_at is not None:
             runtime["stopped_at"] = stopped_at
+        if runtime == original_runtime:
+            return False
         self._save_channel(channel)
+        return True
+
+    @staticmethod
+    def _normalize_zones(zones: list[dict] | None) -> list[dict]:
+        normalized: list[dict] = []
+        for zone in list(zones or []):
+            if not isinstance(zone, dict):
+                continue
+            normalized.append(
+                {
+                    "id": zone.get("id"),
+                    "name": zone.get("name"),
+                    "type": zone.get("type"),
+                    "color": zone.get("color"),
+                    "full_frame": bool(zone.get("full_frame")),
+                    "coordinates": zone.get("coordinates") or [],
+                }
+            )
+        return normalized
+
+    def _can_reuse_running_worker(
+        self,
+        channel_id: str,
+        *,
+        source_url: str,
+        stream: str,
+        target: str,
+        zones: list[dict],
+        zone_source: str | None,
+        owner_task_id: str | None,
+    ) -> tuple[bool, dict]:
+        current = self.status(channel_id) or {}
+        if str(current.get("status") or "").lower() != "running":
+            return False, {"reason": "status_not_running", "current_status": current.get("status")}
+        if not current.get("process_alive"):
+            return False, {"reason": "process_not_alive"}
+
+        channel = self._load_channel(channel_id)
+        if not channel:
+            return False, {"reason": "channel_not_found"}
+        runtime = channel.get("ext", {}).get("zone_preview", {}) or {}
+        with self._lock:
+            worker = self._workers.get(channel_id) or {}
+
+        current_zone_source = runtime.get("zone_source") or worker.get("zone_source")
+        current_owner_task_id = runtime.get("owner_task_id") or worker.get("owner_task_id")
+        current_source = runtime.get("source") or worker.get("source")
+        current_stream = runtime.get("stream") or worker.get("stream")
+        current_target = runtime.get("target") or worker.get("target")
+        current_zones = runtime.get("zones") or worker.get("zones") or []
+
+        normalized_current_zones = self._normalize_zones(current_zones)
+        normalized_expected_zones = self._normalize_zones(zones)
+        comparisons = {
+            "source_match": str(current_source or "") == str(source_url or ""),
+            "stream_match": str(current_stream or "") == str(stream or ""),
+            "target_match": str(current_target or "") == str(target or ""),
+            "zone_source_match": str(current_zone_source or "") == str(zone_source or ""),
+            "owner_task_id_match": str(current_owner_task_id or "") == str(owner_task_id or ""),
+            "zones_match": normalized_current_zones == normalized_expected_zones,
+        }
+        reusable = all(comparisons.values())
+        return reusable, {
+            "reason": "matched" if reusable else "config_changed",
+            "comparisons": comparisons,
+            "current": {
+                "source": current_source,
+                "stream": current_stream,
+                "target": current_target,
+                "zone_source": current_zone_source,
+                "owner_task_id": current_owner_task_id,
+                "zones": normalized_current_zones,
+            },
+            "expected": {
+                "source": source_url,
+                "stream": stream,
+                "target": target,
+                "zone_source": zone_source,
+                "owner_task_id": owner_task_id,
+                "zones": normalized_expected_zones,
+            },
+        }
 
     def _probe_stream(self, source_url: str) -> tuple[int, int, int]:
         cap = cv2.VideoCapture(source_url)
@@ -201,7 +315,18 @@ class ZonePreviewService:
 
     def _draw_zones(self, frame: np.ndarray, zones: list[dict]) -> np.ndarray:
         output = frame.copy()
+        frame_height, frame_width = frame.shape[:2]
         for zone in zones:
+            if zone.get("type") == "fullscreen" or zone.get("full_frame"):
+                color_hex = (zone.get("color") or "#3b82f6").lstrip("#")
+                try:
+                    rgb = tuple(int(color_hex[i:i + 2], 16) for i in (0, 2, 4)) if len(color_hex) == 6 else (59, 130, 246)
+                except Exception:
+                    rgb = (59, 130, 246)
+                bgr = (rgb[2], rgb[1], rgb[0])
+                cv2.rectangle(output, (0, 0), (max(frame_width - 1, 0), max(frame_height - 1, 0)), bgr, 3)
+                continue
+
             coordinates = zone.get("coordinates") or []
             if len(coordinates) < 2:
                 continue
@@ -234,6 +359,7 @@ class ZonePreviewService:
         stderr_lines: "queue.Queue[str]",
         stderr_lock: threading.Lock,
         channel_id: str,
+        stop_event: threading.Event,
     ) -> None:
         def _stderr_reader():
             if proc.stderr is None:
@@ -250,6 +376,9 @@ class ZonePreviewService:
                             except queue.Empty:
                                 pass
                         stderr_lines.put_nowait(line)
+                    lowered = line.lower()
+                    if stop_event.is_set() and any(keyword in lowered for keyword in ZONE_PREVIEW_EXPECTED_SHUTDOWN_ERROR_KEYWORDS):
+                        continue
                     logger.warning("[ZonePreview][FFmpeg:%s] %s", channel_id, line)
             except Exception as exc:
                 logger.debug("[ZonePreview] stderr logger stopped for %s: %s", channel_id, exc)
@@ -276,6 +405,7 @@ class ZonePreviewService:
         stderr_lines: "queue.Queue[str]",
         stderr_lock: threading.Lock,
         channel_id: str,
+        stop_event: threading.Event,
     ) -> subprocess.Popen:
         cmd = [
             settings.FFMPEG_BIN,
@@ -326,15 +456,28 @@ class ZonePreviewService:
             bufsize=0,
             **kwargs,
         )
-        self._start_ffmpeg_stderr_logger(proc, stderr_lines, stderr_lock, channel_id)
+        self._start_ffmpeg_stderr_logger(proc, stderr_lines, stderr_lock, channel_id, stop_event)
         return proc
 
     def _stop_pusher(self, proc: subprocess.Popen | None) -> None:
         if proc is None:
             return
         try:
-            if proc.stdin:
+            if proc.stdin and not proc.stdin.closed:
                 proc.stdin.close()
+        except Exception:
+            pass
+        try:
+            proc.wait(timeout=1)
+            return
+        except subprocess.TimeoutExpired:
+            pass
+        except Exception:
+            pass
+        try:
+            proc.terminate()
+            proc.wait(timeout=1)
+            return
         except Exception:
             pass
         try:
@@ -343,6 +486,24 @@ class ZonePreviewService:
         except Exception:
             pass
 
+    async def _wait_until_started(
+        self,
+        channel_id: str,
+        timeout_seconds: float = 0.8,
+        interval_seconds: float = 0.05,
+    ) -> dict | None:
+        deadline = time.perf_counter() + max(timeout_seconds, 0)
+        last_status = self.status(channel_id)
+        while time.perf_counter() < deadline:
+            if not last_status:
+                return None
+            normalized = str(last_status.get("status") or "").lower()
+            if normalized in {"running", "error"}:
+                return last_status
+            await asyncio.sleep(interval_seconds)
+            last_status = self.status(channel_id)
+        return last_status
+
     def _run_worker(
         self,
         channel_id: str,
@@ -350,6 +511,7 @@ class ZonePreviewService:
         stream: str,
         target: str,
         stop_event: threading.Event,
+        zones: list[dict] | None = None,
     ) -> None:
         frame_queue: "queue.Queue[np.ndarray]" = queue.Queue(maxsize=8)
         stderr_lines: "queue.Queue[str]" = queue.Queue(maxsize=20)
@@ -372,6 +534,8 @@ class ZonePreviewService:
 
         def restart_pusher():
             nonlocal push_proc
+            if stop_event.is_set():
+                return
             now = time.time()
             ffmpeg_restart_times.append(now)
             ffmpeg_restart_times[:] = [ts for ts in ffmpeg_restart_times if now - ts <= 10]
@@ -381,13 +545,15 @@ class ZonePreviewService:
                 )
             self._stop_pusher(push_proc)
             time.sleep(1.5)
-            push_proc = self._start_pusher(width, height, fps, target, stderr_lines, stderr_lock, channel_id)
+            push_proc = self._start_pusher(width, height, fps, target, stderr_lines, stderr_lock, channel_id, stop_event)
 
         def read_loop():
             nonlocal capture
             bad_count = 0
             reconnect_count = 0
-            cached_zones = (self._load_channel(channel_id) or {}).get("ext", {}).get("zones", []) or []
+            explicit_runtime_zones = zones is not None
+            runtime_zones = list(zones or [])
+            cached_zones = runtime_zones if explicit_runtime_zones else ((self._load_channel(channel_id) or {}).get("ext", {}).get("zones", []) or [])
 
             while not stop_event.is_set():
                 if capture is None or not capture.is_healthy():
@@ -417,9 +583,13 @@ class ZonePreviewService:
                 reconnect_count = 0
                 bad_count = 0
                 current_channel = self._load_channel(channel_id) or {}
-                current_zones = current_channel.get("ext", {}).get("zones", []) or []
-                if current_zones:
-                    cached_zones = current_zones
+                runtime = current_channel.get("ext", {}).get("zone_preview", {}) or {}
+                if "zones" in runtime:
+                    cached_zones = list(runtime.get("zones") or [])
+                elif explicit_runtime_zones:
+                    cached_zones = runtime_zones
+                else:
+                    cached_zones = list(current_channel.get("ext", {}).get("zones", []) or [])
                 rendered = self._draw_zones(frame, cached_zones)
 
                 if frame_queue.full():
@@ -436,23 +606,29 @@ class ZonePreviewService:
             nonlocal push_proc
             while not stop_event.is_set():
                 try:
-                    frame = frame_queue.get(timeout=0.5)
+                    frame = frame_queue.get(timeout=ZONE_PREVIEW_PUSH_QUEUE_TIMEOUT_SECONDS)
                 except queue.Empty:
                     continue
 
                 try:
                     if push_proc is None or push_proc.poll() is not None:
+                        if stop_event.is_set():
+                            break
                         logger.warning(
                             "[ZonePreview] %s 推流进程已退出，准备重启。最近错误: %s",
                             channel_id,
                             self._get_ffmpeg_error_summary(stderr_lines, stderr_lock),
                         )
                         restart_pusher()
+                        if stop_event.is_set():
+                            break
 
                     if push_proc is None or push_proc.stdin is None:
                         raise RuntimeError("区域流推流进程不可用")
                     push_proc.stdin.write(frame.tobytes())
                 except BrokenPipeError:
+                    if stop_event.is_set():
+                        break
                     logger.warning(
                         "[ZonePreview] %s 推流 BrokenPipe，准备重启。最近错误: %s",
                         channel_id,
@@ -460,6 +636,8 @@ class ZonePreviewService:
                     )
                     restart_pusher()
                 except Exception as exc:
+                    if stop_event.is_set():
+                        break
                     logger.error(
                         "[ZonePreview] %s 推流异常: %s，最近错误: %s",
                         channel_id,
@@ -471,7 +649,7 @@ class ZonePreviewService:
         try:
             width, height, fps = self._probe_stream(source_url)
             capture = FFmpegCapture(source_url, width, height, init_wait=0.5)
-            push_proc = self._start_pusher(width, height, fps, target, stderr_lines, stderr_lock, channel_id)
+            push_proc = self._start_pusher(width, height, fps, target, stderr_lines, stderr_lock, channel_id, stop_event)
 
             self._update_runtime(
                 channel_id,
@@ -500,9 +678,14 @@ class ZonePreviewService:
                     raise RuntimeError(
                         f"区域流推流线程异常退出，最近推流错误: {self._get_ffmpeg_error_summary(stderr_lines, stderr_lock)}"
                     )
-                time.sleep(1)
+                time.sleep(ZONE_PREVIEW_WORKER_MONITOR_INTERVAL_SECONDS)
 
         except Exception as exc:
+            logger.warning(
+                "[ZonePreviewExit] channel_id=%s reason=worker_exception error=%s",
+                channel_id,
+                str(exc),
+            )
             self._update_runtime(
                 channel_id,
                 enabled=False,
@@ -517,19 +700,82 @@ class ZonePreviewService:
             with self._lock:
                 self._workers.pop(channel_id, None)
 
-    async def start(self, channel_id: str, source_url: str, stream: str, target: str, urls: dict | None = None):
+    async def start(
+        self,
+        channel_id: str,
+        source_url: str,
+        stream: str,
+        target: str,
+        urls: dict | None = None,
+        zones: list[dict] | None = None,
+        zone_source: str | None = None,
+        owner_task_id: str | None = None,
+    ):
+        started_at = time.perf_counter()
         channel = self._load_channel(channel_id)
         if not channel:
             return None
-        if not (channel.get("ext", {}).get("zones") or []):
-            raise ValueError("当前通道还没有配置区域")
+        explicit_zones = zones is not None
+        effective_zones = list(zones or [])
+        if not explicit_zones and not effective_zones:
+            effective_zones = list(channel.get("ext", {}).get("zones", []) or [])
 
+        effective_zone_source = zone_source or ("task" if explicit_zones else "channel")
+        can_reuse, reuse_detail = self._can_reuse_running_worker(
+            channel_id,
+            source_url=source_url,
+            stream=stream,
+            target=target,
+            zones=effective_zones,
+            zone_source=effective_zone_source,
+            owner_task_id=owner_task_id,
+        )
+        logger.info(
+            "[ZonePreviewReuse] channel_id=%s reuse_hit=%s reason=%s",
+            channel_id,
+            can_reuse,
+            reuse_detail.get("reason"),
+        )
+        if can_reuse:
+            self._update_runtime(
+                channel_id,
+                enabled=True,
+                status="running",
+                stream=stream,
+                source=source_url,
+                target=target,
+                urls=urls or {},
+                zones=effective_zones,
+                zone_source=effective_zone_source,
+                owner_task_id=owner_task_id,
+                clear_error=True,
+            )
+            result = self.status(channel_id)
+            logger.debug(
+                "[ZonePreviewWorker] reuse channel_id=%s zone_count=%s zone_source=%s owner_task_id=%s elapsed_ms=%s status=%s",
+                channel_id,
+                len(effective_zones),
+                effective_zone_source,
+                owner_task_id,
+                round((time.perf_counter() - started_at) * 1000, 2),
+                (result or {}).get("status"),
+            )
+            return result
+        logger.debug(
+            "[ZonePreviewWorker] reuse-skip channel_id=%s reason=%s comparisons=%s",
+            channel_id,
+            reuse_detail.get("reason"),
+            reuse_detail.get("comparisons"),
+        )
+
+        stop_started_at = time.perf_counter()
         await self.stop(channel_id)
+        stop_elapsed_ms = round((time.perf_counter() - stop_started_at) * 1000, 2)
 
         stop_event = threading.Event()
         worker = threading.Thread(
             target=self._run_worker,
-            args=(channel_id, source_url, stream, target, stop_event),
+            args=(channel_id, source_url, stream, target, stop_event, effective_zones),
             daemon=True,
         )
 
@@ -540,6 +786,9 @@ class ZonePreviewService:
                 "stream": stream,
                 "source": source_url,
                 "target": target,
+                "zones": effective_zones,
+                "zone_source": effective_zone_source,
+                "owner_task_id": owner_task_id,
             }
 
         self._update_runtime(
@@ -550,12 +799,32 @@ class ZonePreviewService:
             source=source_url,
             target=target,
             urls=urls or {},
+            zones=effective_zones,
+            zone_source=effective_zone_source,
+            owner_task_id=owner_task_id,
             started_at=now_iso(),
             clear_error=True,
         )
+        worker_started_at = time.perf_counter()
         worker.start()
-        await asyncio.sleep(2)
-        return self.status(channel_id)
+        worker_launch_elapsed_ms = round((time.perf_counter() - worker_started_at) * 1000, 2)
+        wait_started_at = time.perf_counter()
+        result = await self._wait_until_started(channel_id)
+        wait_elapsed_ms = round((time.perf_counter() - wait_started_at) * 1000, 2)
+        total_elapsed_ms = round((time.perf_counter() - started_at) * 1000, 2)
+        logger.debug(
+            "[ZonePreviewWorker] start channel_id=%s zone_count=%s zone_source=%s owner_task_id=%s stop_elapsed_ms=%s worker_launch_elapsed_ms=%s wait_elapsed_ms=%s elapsed_ms=%s status=%s",
+            channel_id,
+            len(effective_zones),
+            effective_zone_source,
+            owner_task_id,
+            stop_elapsed_ms,
+            worker_launch_elapsed_ms,
+            wait_elapsed_ms,
+            total_elapsed_ms,
+            (result or {}).get("status"),
+        )
+        return result
 
     async def stop(self, channel_id: str):
         with self._lock:
@@ -564,7 +833,7 @@ class ZonePreviewService:
             worker["stop_event"].set()
             thread = worker.get("thread")
             if thread and thread.is_alive():
-                thread.join(timeout=4)
+                thread.join(timeout=ZONE_PREVIEW_STOP_JOIN_TIMEOUT_SECONDS)
 
         channel = self._load_channel(channel_id)
         if not channel:
@@ -577,6 +846,15 @@ class ZonePreviewService:
         self._save_channel(channel)
         return self.status(channel_id)
 
+    async def stop_all(self):
+        with self._lock:
+            channel_ids = list(self._workers.keys())
+        for channel_id in channel_ids:
+            try:
+                await self.stop(channel_id)
+            except Exception as exc:
+                logger.warning("[ZonePreviewShutdown] channel_id=%s stop_all_error=%s", channel_id, exc)
+
     def status(self, channel_id: str):
         channel = self._load_channel(channel_id)
         if not channel:
@@ -584,10 +862,28 @@ class ZonePreviewService:
         runtime = channel.get("ext", {}).get("zone_preview", {}) or {}
         with self._lock:
             worker = self._workers.get(channel_id)
+        process_alive = bool(worker and worker.get("thread") and worker["thread"].is_alive())
+        runtime_status = runtime.get("status")
+        if runtime_status == "running" and not process_alive:
+            logger.warning(
+                "[ZonePreviewOrphaned] channel_id=%s reason=runtime_running_but_worker_missing owner_task_id=%s stream=%s",
+                channel_id,
+                runtime.get("owner_task_id"),
+                runtime.get("stream"),
+            )
+            self._update_runtime(
+                channel_id,
+                enabled=False,
+                status="stopped",
+                stopped_at=runtime.get("stopped_at") or now_iso(),
+            )
+            channel = self._load_channel(channel_id) or channel
+            runtime = channel.get("ext", {}).get("zone_preview", {}) or {}
+            runtime_status = "stopped"
         return {
             "channel_id": channel_id,
-            "enabled": bool(runtime.get("enabled")),
-            "status": runtime.get("status") or ("running" if worker else "stopped"),
+            "enabled": bool(runtime.get("enabled")) and process_alive,
+            "status": runtime_status or ("running" if process_alive else "stopped"),
             "stream": runtime.get("stream"),
             "source": runtime.get("source"),
             "target": runtime.get("target"),
@@ -595,7 +891,10 @@ class ZonePreviewService:
             "last_error": runtime.get("last_error"),
             "started_at": runtime.get("started_at"),
             "stopped_at": runtime.get("stopped_at"),
-            "process_alive": bool(worker and worker.get("thread") and worker["thread"].is_alive()),
+            "process_alive": process_alive,
+            "zone_count": int(runtime.get("zone_count") or len(runtime.get("zones") or [])),
+            "zone_source": runtime.get("zone_source"),
+            "owner_task_id": runtime.get("owner_task_id"),
         }
 
 

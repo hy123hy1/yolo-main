@@ -10,22 +10,209 @@ from pathlib import Path
 from datetime import datetime
 from fastapi import UploadFile
 from src.core.settings import settings
+from src.db.database import SessionLocal
+from src.db.models import ModelMetaRecord, TaskAlgorithmMeta
+from src.services.metadata_db_sync import delete_json_document
+from src.services.platform_storage import format_datetime, generate_id, normalize_datetime_fields, now_iso, save_json as persist_json
 import matplotlib
 matplotlib.use('Agg')  # 使用非交互式后端
 import matplotlib.pyplot as plt
 import matplotlib.font_manager as fm
 
 
+SCENE_MAPPINGS = [
+    {
+        "scene_key": "person_intrusion",
+        "scene_name": "人员闯入",
+        "keywords": ["人员检测", "人员闯入", "闯入", "intrusion", "person"],
+        "labels": ["person"],
+        "rule_type": "detection",
+        "default_need_overlay": True,
+        "default_need_snapshot": True,
+        "default_need_video_clip": True,
+        "requires_region": True,
+        "priority": 100,
+    },
+    {
+        "scene_key": "person_gathering",
+        "scene_name": "人员聚集",
+        "keywords": ["人员聚集", "聚集", "gather", "crowd"],
+        "labels": ["person"],
+        "rule_type": "gathering",
+        "default_need_overlay": True,
+        "default_need_snapshot": True,
+        "default_need_video_clip": True,
+        "requires_region": True,
+        "priority": 95,
+    },
+    {
+        "scene_key": "person_absence",
+        "scene_name": "人员离岗",
+        "keywords": ["人员离岗", "离岗", "absence", "sleep on duty"],
+        "labels": ["person"],
+        "rule_type": "absence",
+        "default_need_overlay": True,
+        "default_need_snapshot": True,
+        "default_need_video_clip": True,
+        "requires_region": True,
+        "priority": 94,
+    },
+    {
+        "scene_key": "person_count",
+        "scene_name": "人员计数",
+        "keywords": ["人员计数", "人数统计", "person count"],
+        "labels": ["person"],
+        "rule_type": "count",
+        "default_need_overlay": False,
+        "default_need_snapshot": True,
+        "default_need_video_clip": True,
+        "requires_region": False,
+        "priority": 92,
+    },
+    {
+        "scene_key": "person_fall",
+        "scene_name": "人员倒地",
+        "keywords": ["人员倒地", "倒地", "fall"],
+        "labels": ["person"],
+        "rule_type": "fall_like",
+        "default_need_overlay": True,
+        "default_need_snapshot": True,
+        "default_need_video_clip": True,
+        "requires_region": False,
+        "priority": 90,
+    },
+    {
+        "scene_key": "vehicle_count",
+        "scene_name": "车辆计数",
+        "keywords": ["车辆检测", "车辆计数", "vehicle count", "car count"],
+        "labels": ["car", "bus", "truck", "motorcycle", "bicycle"],
+        "rule_type": "count",
+        "default_need_overlay": False,
+        "default_need_snapshot": True,
+        "default_need_video_clip": True,
+        "requires_region": False,
+        "priority": 88,
+    },
+    {
+        "scene_key": "vehicle_congestion",
+        "scene_name": "车辆拥堵识别",
+        "keywords": ["车辆拥堵", "拥堵", "congestion", "traffic jam"],
+        "labels": ["car", "bus", "truck"],
+        "rule_type": "congestion",
+        "default_need_overlay": True,
+        "default_need_snapshot": True,
+        "default_need_video_clip": True,
+        "requires_region": True,
+        "priority": 87,
+    },
+    {
+        "scene_key": "vehicle_loitering",
+        "scene_name": "车辆滞留识别",
+        "keywords": ["车辆滞留", "滞留", "loiter", "parking"],
+        "labels": ["car", "bus", "truck"],
+        "rule_type": "loitering",
+        "default_need_overlay": True,
+        "default_need_snapshot": True,
+        "default_need_video_clip": True,
+        "requires_region": True,
+        "priority": 86,
+    },
+    {
+        "scene_key": "mining_truck_detect",
+        "scene_name": "矿车识别",
+        "keywords": ["矿车", "矿卡", "mining truck"],
+        "labels": ["truck"],
+        "rule_type": "detection",
+        "default_need_overlay": True,
+        "default_need_snapshot": True,
+        "default_need_video_clip": True,
+        "requires_region": False,
+        "priority": 85,
+    },
+    {
+        "scene_key": "helmet_detection",
+        "scene_name": "安全帽检测",
+        "keywords": ["安全帽", "helmet"],
+        "labels": ["helmet", "person"],
+        "rule_type": "detection",
+        "default_need_overlay": True,
+        "default_need_snapshot": True,
+        "default_need_video_clip": True,
+        "requires_region": False,
+        "priority": 100,
+    },
+    {
+        "scene_key": "sleep_on_duty",
+        "scene_name": "睡岗检测",
+        "keywords": ["睡岗", "睡岗检测", "sleep"],
+        "labels": ["person", "sleep"],
+        "rule_type": "detection",
+        "default_need_overlay": True,
+        "default_need_snapshot": True,
+        "default_need_video_clip": True,
+        "requires_region": True,
+        "priority": 96,
+    },
+    {
+        "scene_key": "smoke_alarm",
+        "scene_name": "烟雾报警",
+        "keywords": ["烟雾", "smoke"],
+        "labels": ["smoke"],
+        "rule_type": "detection",
+        "default_need_overlay": True,
+        "default_need_snapshot": True,
+        "default_need_video_clip": True,
+        "requires_region": False,
+        "priority": 97,
+    },
+    {
+        "scene_key": "fire_alarm",
+        "scene_name": "火情检测",
+        "keywords": ["火情", "火焰", "火灾", "明火", "fire", "flame"],
+        "labels": ["fire"],
+        "rule_type": "detection",
+        "default_need_overlay": True,
+        "default_need_snapshot": True,
+        "default_need_video_clip": True,
+        "requires_region": False,
+        "priority": 98,
+    },
+    {
+        "scene_key": "puddle_detection",
+        "scene_name": "路面积水识别",
+        "keywords": ["路面积水", "积水", "puddle", "waterlogging"],
+        "labels": ["puddle"],
+        "rule_type": "detection",
+        "default_need_overlay": True,
+        "default_need_snapshot": True,
+        "default_need_video_clip": True,
+        "requires_region": False,
+        "priority": 93,
+    },
+    {
+        "scene_key": "reflective_vest_detection",
+        "scene_name": "反光背心识别",
+        "keywords": ["反光背心", "背心", "vest", "reflective vest"],
+        "labels": ["vest"],
+        "rule_type": "detection",
+        "default_need_overlay": True,
+        "default_need_snapshot": True,
+        "default_need_video_clip": True,
+        "requires_region": False,
+        "priority": 93,
+    },
+]
+
+
 def _load_json(path: Path):
     """同步加载 JSON 文件"""
     with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+        return normalize_datetime_fields(json.load(f))
 
 
 def _save_json(path: Path, data: dict):
     """同步保存 JSON 文件"""
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
+    persist_json(path, normalize_datetime_fields(data))
 
 
 def _delete_directory(path: Path):
@@ -37,6 +224,96 @@ class ModelService:
     def __init__(self):
         self.registry_dir = settings.REGISTRY_DIR
         self.jobs_dir = settings.JOBS_DIR
+
+    @staticmethod
+    def _default_model_confidence() -> float:
+        return 0.25
+
+    @staticmethod
+    def _default_model_alert_interval() -> int:
+        return 60
+
+    def _apply_default_runtime_thresholds(self, model_meta: dict) -> dict:
+        normalized = dict(model_meta or {})
+        normalized["confidence"] = float(
+            normalized.get("confidence", self._default_model_confidence())
+            or self._default_model_confidence()
+        )
+        normalized["alert_interval"] = int(
+            normalized.get("alert_interval", self._default_model_alert_interval())
+            or self._default_model_alert_interval()
+        )
+        return normalized
+
+    def _normalize_labels(self, labels: list[str], classes: list[str]) -> list[str]:
+        class_lookup = {str(item).strip() for item in classes if str(item).strip()}
+        result: list[str] = []
+        for label in labels:
+            normalized = str(label).strip()
+            if normalized and normalized in class_lookup and normalized not in result:
+                result.append(normalized)
+        return result
+
+    def _build_scene_candidates(self, model_name: str, classes: list[str]) -> list[dict]:
+        normalized_name = str(model_name or "").strip().lower()
+        candidates: list[dict] = []
+        seen_keys: set[str] = set()
+        for mapping in SCENE_MAPPINGS:
+            keywords = [str(keyword).strip().lower() for keyword in mapping.get("keywords", [])]
+            if not any(keyword and keyword in normalized_name for keyword in keywords):
+                continue
+            labels = self._normalize_labels(mapping.get("labels", []), classes)
+            if not labels:
+                continue
+            scene_key = mapping["scene_key"]
+            if scene_key in seen_keys:
+                continue
+            seen_keys.add(scene_key)
+            candidates.append(
+                {
+                    "scene_key": scene_key,
+                    "scene_name": mapping["scene_name"],
+                    "recommended_labels": labels,
+                    "rule_type": mapping["rule_type"],
+                    "default_need_overlay": bool(mapping["default_need_overlay"]),
+                    "default_need_snapshot": bool(mapping["default_need_snapshot"]),
+                    "default_need_video_clip": bool(mapping["default_need_video_clip"]),
+                    "requires_region": bool(mapping["requires_region"]),
+                    "priority": int(mapping["priority"]),
+                    "source": "model_name_mapping",
+                }
+            )
+        candidates.sort(key=lambda item: item["priority"], reverse=True)
+        return candidates
+
+    def _apply_label_recommendation(self, model_meta: dict) -> dict:
+        normalized = dict(model_meta or {})
+        classes = [str(item).strip() for item in list(normalized.get("classes") or []) if str(item).strip()]
+        normalized["classes"] = classes
+        candidates = self._build_scene_candidates(str(normalized.get("name") or ""), classes)
+
+        if len(classes) <= 5:
+            normalized["auto_label_strategy"] = "all"
+            normalized["recommended_labels"] = classes
+            normalized["scene_candidates"] = candidates
+            if candidates:
+                normalized["scene_key"] = candidates[0]["scene_key"]
+                normalized["scene_name"] = candidates[0]["scene_name"]
+                normalized["rule_type"] = candidates[0]["rule_type"]
+            return normalized
+
+        if candidates:
+            normalized["auto_label_strategy"] = "recommended"
+            normalized["recommended_labels"] = list(candidates[0]["recommended_labels"])
+            normalized["scene_candidates"] = candidates
+            normalized["scene_key"] = candidates[0]["scene_key"]
+            normalized["scene_name"] = candidates[0]["scene_name"]
+            normalized["rule_type"] = candidates[0]["rule_type"]
+        else:
+            normalized["auto_label_strategy"] = "manual"
+            normalized["recommended_labels"] = []
+            normalized["scene_candidates"] = []
+        return normalized
 
     def _extract_classes_from_yolo_weights(self, weights_path: str) -> list[str]:
         try:
@@ -51,9 +328,66 @@ class ModelService:
         except Exception as e:
             print(f"Error extracting classes from weights: {e}")
         return []
+
+    def _build_model_from_metadata_row(self, row: ModelMetaRecord) -> dict:
+        payload = dict(row.raw_json or {})
+        payload["model_id"] = row.id
+        payload["name"] = row.name
+        payload["version"] = row.version
+        payload["source"] = row.source
+        payload["description"] = row.description
+        payload["tags"] = list(row.tags_json or [])
+        payload["classes"] = list(row.classes_json or [])
+        payload["weights_path"] = row.weights_path
+        payload["file_size"] = row.file_size
+        payload["file_size_mb"] = row.file_size_mb
+        payload["job_id"] = row.job_id
+        payload["confidence"] = float(row.confidence or self._default_model_confidence())
+        payload["alert_interval"] = int(row.alert_interval or self._default_model_alert_interval())
+        payload["created_at"] = format_datetime(row.created_at)
+        payload["updated_at"] = format_datetime(row.updated_at)
+        return payload
+
+    def _refresh_runtime_file_size(self, model_meta: dict) -> dict:
+        weights_path = model_meta.get("weights_path")
+        if weights_path and Path(weights_path).exists():
+            model_meta["file_size"] = os.path.getsize(weights_path)
+            model_meta["file_size_mb"] = round(model_meta["file_size"] / (1024 * 1024), 2)
+        return model_meta
+
+    def _update_model_row_from_payload(self, row: ModelMetaRecord, payload: dict) -> None:
+        row.name = payload.get("name")
+        row.version = payload.get("version")
+        row.source = payload.get("source")
+        row.description = payload.get("description")
+        row.tags_json = list(payload.get("tags") or [])
+        row.classes_json = list(payload.get("classes") or [])
+        row.weights_path = payload.get("weights_path")
+        row.file_size = payload.get("file_size")
+        row.file_size_mb = payload.get("file_size_mb")
+        row.job_id = payload.get("job_id")
+        row.confidence = float(payload.get("confidence", self._default_model_confidence()) or self._default_model_confidence())
+        row.alert_interval = int(payload.get("alert_interval", self._default_model_alert_interval()) or self._default_model_alert_interval())
+        row.raw_json = dict(payload)
     
     async def list_models(self):
         """列出所有模型"""
+        with SessionLocal() as session:
+            rows = (
+                session.query(ModelMetaRecord)
+                .order_by(ModelMetaRecord.created_at.desc(), ModelMetaRecord.id.desc())
+                .all()
+            )
+
+        if settings.METADATA_DB_ENABLED or rows:
+            metadata_models = []
+            for row in rows:
+                model_meta = self._apply_label_recommendation(
+                    self._apply_default_runtime_thresholds(self._build_model_from_metadata_row(row))
+                )
+                metadata_models.append(model_meta)
+            return {"models": metadata_models}
+
         def _list_models_sync():
             models = []
             
@@ -66,6 +400,8 @@ class ModelService:
                     if model_file.exists():
                         try:
                             model_meta = _load_json(model_file)
+                            model_meta = self._apply_default_runtime_thresholds(model_meta)
+                            model_meta = self._apply_label_recommendation(model_meta)
                             # 添加模型文件大小
                             weights_path = model_meta.get("weights_path")
                             if weights_path and Path(weights_path).exists():
@@ -79,28 +415,54 @@ class ModelService:
         
         models = await asyncio.to_thread(_list_models_sync)
         return {"models": sorted(models, key=lambda x: x.get("created_at", ""), reverse=True)}
-    
+
+    async def get_model_summary(self, model_id: str):
+        """鑾峰彇妯″瀷鐨勮交閲忔憳瑕侊紝涓嶅姞杞借缁冩寚鏍囧拰 YOLO 鍙傛暟淇℃伅"""
+        model_dir = self.registry_dir / model_id
+        model_file = model_dir / "model.json"
+
+        with SessionLocal() as session:
+            row = session.query(ModelMetaRecord).filter(ModelMetaRecord.id == model_id).one_or_none()
+
+        if row:
+            return self._apply_label_recommendation(
+                self._apply_default_runtime_thresholds(self._build_model_from_metadata_row(row))
+            )
+
+        if settings.METADATA_DB_ENABLED:
+            return None
+
+        if not await asyncio.to_thread(lambda: model_file.exists()):
+            return None
+
+        model_meta = await asyncio.to_thread(_load_json, model_file)
+        model_meta = self._apply_default_runtime_thresholds(model_meta)
+        return self._apply_label_recommendation(model_meta)
+
     async def get_model(self, model_id: str):
         """获取模型详情（包含训练指标）"""
         model_dir = self.registry_dir / model_id
         model_file = model_dir / "model.json"
         
-        if not await asyncio.to_thread(lambda: model_file.exists()):
-            return None
-        
-        model_meta = await asyncio.to_thread(_load_json, model_file)
+        model_meta = None
+        with SessionLocal() as session:
+            row = session.query(ModelMetaRecord).filter(ModelMetaRecord.id == model_id).one_or_none()
+        if row:
+            model_meta = self._apply_label_recommendation(
+                self._apply_default_runtime_thresholds(self._build_model_from_metadata_row(row))
+            )
+
+        if model_meta is None:
+            if settings.METADATA_DB_ENABLED:
+                return None
+            if not await asyncio.to_thread(lambda: model_file.exists()):
+                return None
+            model_meta = await asyncio.to_thread(_load_json, model_file)
+            model_meta = self._apply_default_runtime_thresholds(model_meta)
+            model_meta = self._apply_label_recommendation(model_meta)
         
         # 添加模型文件大小
-        def _get_file_size():
-            weights_path = model_meta.get("weights_path")
-            if weights_path and Path(weights_path).exists():
-                return os.path.getsize(weights_path)
-            return None
-        
-        file_size = await asyncio.to_thread(_get_file_size)
-        if file_size:
-            model_meta["file_size"] = file_size
-            model_meta["file_size_mb"] = round(file_size / (1024 * 1024), 2)
+        model_meta = await asyncio.to_thread(self._refresh_runtime_file_size, model_meta)
         
         # 尝试加载训练指标
         job_id = model_meta.get("job_id")
@@ -268,21 +630,44 @@ class ModelService:
         model_dir = self.registry_dir / model_id
         model_file = model_dir / "model.json"
         
-        if not await asyncio.to_thread(lambda: model_file.exists()):
-            return None
-        
         def _update_model_sync():
+            with SessionLocal() as session:
+                row = session.query(ModelMetaRecord).filter(ModelMetaRecord.id == model_id).one_or_none()
+                if row:
+                    model_meta = self._apply_default_runtime_thresholds(self._build_model_from_metadata_row(row))
+                    if request.name is not None:
+                        model_meta["name"] = request.name
+                    if getattr(request, "confidence", None) is not None:
+                        model_meta["confidence"] = float(request.confidence)
+                    if getattr(request, "alert_interval", None) is not None:
+                        model_meta["alert_interval"] = int(request.alert_interval)
+                    model_meta["updated_at"] = now_iso()
+                    model_meta = self._apply_label_recommendation(model_meta)
+                    self._update_model_row_from_payload(row, model_meta)
+                    session.commit()
+                    session.refresh(row)
+                    updated = self._apply_label_recommendation(
+                        self._apply_default_runtime_thresholds(self._build_model_from_metadata_row(row))
+                    )
+                    if model_file.exists():
+                        _save_json(model_file, updated)
+                    return updated
+
+            if settings.METADATA_DB_ENABLED or not model_file.exists():
+                return None
+
             model_meta = _load_json(model_file)
+            model_meta = self._apply_default_runtime_thresholds(model_meta)
             
             # 更新字段
             if request.name is not None:
                 model_meta["name"] = request.name
-            if request.description is not None:
-                model_meta["description"] = request.description
-            if request.tags is not None:
-                model_meta["tags"] = request.tags
-            
-            model_meta["updated_at"] = datetime.now().isoformat()
+            if getattr(request, "confidence", None) is not None:
+                model_meta["confidence"] = float(request.confidence)
+            if getattr(request, "alert_interval", None) is not None:
+                model_meta["alert_interval"] = int(request.alert_interval)
+            model_meta["updated_at"] = now_iso()
+            model_meta = self._apply_label_recommendation(model_meta)
             
             _save_json(model_file, model_meta)
             
@@ -293,9 +678,34 @@ class ModelService:
     async def delete_model(self, model_id: str):
         """删除模型"""
         model_dir = self.registry_dir / model_id
+        model_file = model_dir / "model.json"
         
+        def _delete_model_metadata_sync() -> bool | None:
+            with SessionLocal() as session:
+                row = session.query(ModelMetaRecord).filter(ModelMetaRecord.id == model_id).one_or_none()
+                if not row:
+                    return None
+                used_count = session.query(TaskAlgorithmMeta).filter(TaskAlgorithmMeta.model_id == model_id).count()
+                if used_count:
+                    raise ValueError("Model is used by task algorithms")
+                session.delete(row)
+                session.commit()
+                return True
+
+        deleted_from_db = await asyncio.to_thread(_delete_model_metadata_sync)
+        if deleted_from_db:
+            if await asyncio.to_thread(lambda: model_dir.exists()):
+                await asyncio.to_thread(_delete_directory, model_dir)
+            return {"ok": True, "message": f"Model {model_id} deleted"}
+
+        if settings.METADATA_DB_ENABLED:
+            return None
+
         if not await asyncio.to_thread(lambda: model_dir.exists()):
             return None
+
+        if await asyncio.to_thread(lambda: model_file.exists()):
+            delete_json_document(model_file, model_id)
         
         # 删除模型目录
         await asyncio.to_thread(_delete_directory, model_dir)
@@ -374,18 +784,18 @@ class ModelService:
                         existing_model_dir = self.registry_dir / original_model_id
                         if existing_model_dir.exists():
                             # 生成新的model_id
-                            model_id = f"model_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                            model_id = generate_id("model")
                         else:
                             model_id = original_model_id
                     else:
-                        model_id = f"model_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                        model_id = generate_id("model")
                 else:
                     # 创建新的model.json
-                    model_id = f"model_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                    model_id = generate_id("model")
                     model_meta = {
                         "model_id": model_id,
                         "name": zip_filename.replace('.zip', ''),
-                        "created_at": datetime.now().isoformat(),
+                        "created_at": now_iso(),
                         "source": "uploaded",
                         "classes": [],
                         "description": f"Uploaded model from {zip_filename}",
@@ -412,13 +822,23 @@ class ModelService:
                 model_meta["weights_path"] = str((target_weights_dir / pt_files[0].name).resolve())
                 model_meta["file_size"] = total_size
                 model_meta["file_size_mb"] = round(total_size / (1024 * 1024), 2)
-                model_meta["created_at"] = datetime.now().isoformat()
-                model_meta["updated_at"] = datetime.now().isoformat()
+                model_meta["confidence"] = float(
+                    model_meta.get("confidence", self._default_model_confidence())
+                    or self._default_model_confidence()
+                )
+                model_meta["alert_interval"] = int(
+                    model_meta.get("alert_interval", self._default_model_alert_interval())
+                    or self._default_model_alert_interval()
+                )
+                model_meta["created_at"] = now_iso()
+                model_meta["updated_at"] = now_iso()
 
                 if not model_meta.get("classes"):
                     extracted_classes = self._extract_classes_from_yolo_weights(model_meta["weights_path"])
                     if extracted_classes:
                         model_meta["classes"] = extracted_classes
+                model_meta = self._apply_default_runtime_thresholds(model_meta)
+                model_meta = self._apply_label_recommendation(model_meta)
                 
                 # 如果ZIP中有其他文件，也复制（除了model.json和weights）
                 for item in temp_path.rglob("*"):

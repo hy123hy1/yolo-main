@@ -1,6 +1,14 @@
 import api from './axios'
 
-export const listRecordings = async (params?: { channel_id?: string }) => {
+export interface ListRecordingsParams {
+  channel_id?: string
+  task_id?: string
+  algorithm_id?: string
+  page?: number
+  page_size?: number
+}
+
+export const listRecordings = async (params?: ListRecordingsParams) => {
   const { data } = await api.get('/recordings', { params })
   return data
 }

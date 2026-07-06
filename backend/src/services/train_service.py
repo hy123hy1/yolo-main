@@ -7,18 +7,19 @@ import asyncio
 from pathlib import Path
 from datetime import datetime
 from src.core.settings import settings
+from src.services.platform_storage import normalize_datetime_fields, now_iso
 
 
 def _load_json(path: Path):
     """同步加载 JSON 文件"""
     with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+        return normalize_datetime_fields(json.load(f))
 
 
 def _save_json(path: Path, data: dict):
     """同步保存 JSON 文件"""
     with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
+        json.dump(normalize_datetime_fields(data), f, indent=2, ensure_ascii=False)
 
 
 def _delete_file(path: Path):
@@ -81,7 +82,7 @@ class TrainService:
             "imgsz": imgsz,
             "batch": batch,
             "status": "running",
-            "created_at": datetime.now().isoformat(),
+            "created_at": now_iso(),
             "log_file": str(self.jobs_dir / f"{job_id}.log")
         }
         
@@ -167,7 +168,7 @@ class TrainService:
                         if process.poll() is not None:
                             # 进程已死，但状态还是 running，标记为崩溃
                             job_meta["status"] = "crashed"
-                            job_meta["crashed_at"] = datetime.now().isoformat()
+                            job_meta["crashed_at"] = now_iso()
                             # 清理进程记录
                             del self.running_processes[job_id]
                             # 保存更新后的状态
@@ -179,7 +180,7 @@ class TrainService:
                         checkpoint = train_dir / "weights" / "last.pt"
                         if checkpoint.exists():
                             job_meta["status"] = "crashed"
-                            job_meta["crashed_at"] = datetime.now().isoformat()
+                            job_meta["crashed_at"] = now_iso()
                             _save_json(job_file, job_meta)
                 
                 # 检查是否有 checkpoint 但状态不是可恢复状态
@@ -229,7 +230,7 @@ class TrainService:
                 if job_file.exists():
                     job_meta = _load_json(job_file)
                     job_meta["status"] = "stopped"
-                    job_meta["stopped_at"] = datetime.now().isoformat()
+                    job_meta["stopped_at"] = now_iso()
                     _save_json(job_file, job_meta)
             
             await asyncio.to_thread(_update_status)
@@ -394,14 +395,14 @@ class TrainService:
         
         # 更新任务状态
         job_meta["status"] = "running"
-        job_meta["resumed_at"] = datetime.now().isoformat()
+        job_meta["resumed_at"] = now_iso()
         job_meta["resume_count"] = job_meta.get("resume_count", 0) + 1
         
         # 如果之前是崩溃（状态为 running 但进程已死），记录崩溃恢复
         if was_crashed:
             job_meta["crashed"] = True
             if "crashed_at" not in job_meta:
-                job_meta["crashed_at"] = datetime.now().isoformat()
+                job_meta["crashed_at"] = now_iso()
         
         await asyncio.to_thread(_save_json, job_file, job_meta)
         

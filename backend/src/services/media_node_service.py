@@ -116,6 +116,27 @@ class MediaNodeService:
             item["webrtc_base"] = settings.ZLM_WEBRTC_BASE.rstrip("/")
             changed = True
 
+        # Keep the bundled default node aligned with the current external play IP/host config.
+        if str(item.get("id") or "").strip() == "mn_default":
+            forced_defaults = {
+                "play_base": settings.ZLM_PLAY_BASE.rstrip("/"),
+                "webrtc_base": settings.ZLM_WEBRTC_BASE.rstrip("/"),
+                "public_rtsp_host": settings.ZLM_PUBLIC_RTSP_HOST,
+                "public_rtmp_host": settings.ZLM_PUBLIC_RTMP_HOST,
+                "public_http_host": settings.ZLM_PUBLIC_HTTP_HOST,
+                "rtsp_port": settings.ZLM_RTSP_PORT,
+                "rtmp_port": settings.ZLM_RTMP_PORT,
+                "http_port": settings.ZLM_HTTP_PORT,
+                "https_port": settings.ZLM_HTTPS_PORT,
+                "hls_file": settings.ZLM_HLS_FILE,
+                "httpflv_suffix": settings.ZLM_HTTPFLV_SUFFIX,
+                "webrtc_path": settings.ZLM_WEBRTC_PATH,
+            }
+            for field, default_value in forced_defaults.items():
+                if item.get(field) != default_value:
+                    item[field] = default_value
+                    changed = True
+
         defaults = {
             "webrtc_base": settings.ZLM_WEBRTC_BASE.rstrip("/"),
             "public_rtsp_host": settings.ZLM_PUBLIC_RTSP_HOST,

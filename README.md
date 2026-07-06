@@ -137,7 +137,7 @@ yolo-main/
 
 当前默认 SQLite 文件：
 
-- `backend/data/metadata.db`
+- `backend/data/metadata_v2.db`
 
 当前元数据模式：
 
@@ -153,7 +153,7 @@ yolo-main/
   MetadataDBStrict = false
 
   [Data.Database]
-    Dsn = "./data/metadata.db"
+    Dsn = "./data/metadata_v2.db"
 ```
 
 说明：
@@ -334,4 +334,3 @@ docker logs yolo-backend
 - `README.md`
 - `API_DOCUMENTATION.md`
 - `docs/architecture.md`（建议后续补一份）
-
