@@ -56,6 +56,7 @@ class TaskEventUpdatesTest(unittest.IsolatedAsyncioTestCase):
         self.original_channels_dir = settings.CHANNELS_DIR
         self.original_snapshots_dir = settings.SNAPSHOTS_DIR
         self.original_metadata_db_enabled = settings.METADATA_DB_ENABLED
+        self.original_metadata_db_strict = settings.METADATA_DB_STRICT
         self.original_task_analysis_startup_warmup_seconds = getattr(
             settings,
             "TASK_ANALYSIS_STARTUP_WARMUP_SECONDS",
@@ -69,6 +70,7 @@ class TaskEventUpdatesTest(unittest.IsolatedAsyncioTestCase):
         settings.CHANNELS_DIR = self.channels_dir
         settings.SNAPSHOTS_DIR = self.snapshots_dir
         settings.METADATA_DB_ENABLED = True
+        settings.METADATA_DB_STRICT = False
 
         self.original_engine = metadata_db_sync.engine
         self.original_session_local = metadata_db_sync.SessionLocal
@@ -140,6 +142,7 @@ class TaskEventUpdatesTest(unittest.IsolatedAsyncioTestCase):
         settings.CHANNELS_DIR = self.original_channels_dir
         settings.SNAPSHOTS_DIR = self.original_snapshots_dir
         settings.METADATA_DB_ENABLED = self.original_metadata_db_enabled
+        settings.METADATA_DB_STRICT = self.original_metadata_db_strict
         settings.TASK_ANALYSIS_STARTUP_WARMUP_SECONDS = self.original_task_analysis_startup_warmup_seconds
         settings.ALARM_VIDEO_BEFORE_SECONDS = self.original_alarm_video_before_seconds
         settings.ALARM_VIDEO_AFTER_SECONDS = self.original_alarm_video_after_seconds
@@ -175,7 +178,6 @@ class TaskEventUpdatesTest(unittest.IsolatedAsyncioTestCase):
                     stream=payload["stream"],
                     is_online=payload["is_online"],
                     is_playing=payload["is_playing"],
-                    ai_enabled=False,
                     record_mode="none",
                     snapshot_url=None,
                     snapshot_path=None,
@@ -490,6 +492,77 @@ class TaskEventUpdatesTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(submit_video_job_mock.call_count, 1)
 
+    async def test_task_worker_passes_consecutive_after_frames_to_alarm_video_job(self):
+        self._insert_channel("ch_continuous_video", "连续报警视频通道")
+        task = await self.task_service.create_task(
+            {
+                "name": "连续报警视频任务",
+                "channel_id": "ch_continuous_video",
+                "frame_interval": 1,
+                "algorithms": [
+                    {
+                        "id": "algo_continuous_video",
+                        "model_id": "model_continuous_video",
+                        "labels": ["person"],
+                        "enabled": True,
+                        "need_video_clip": True,
+                    }
+                ],
+            }
+        )
+
+        stop_event = threading.Event()
+        capture = object()
+        detection = {
+            "class_name": "person",
+            "conf": 0.95,
+            "x1": 1,
+            "y1": 1,
+            "x2": 10,
+            "y2": 10,
+        }
+        source_frames = [
+            np.full((16, 16, 3), 10, dtype=np.uint8),
+            np.full((16, 16, 3), 20, dtype=np.uint8),
+            np.full((16, 16, 3), 30, dtype=np.uint8),
+        ]
+        frame_index = 0
+
+        def _fake_read(_capture):
+            nonlocal frame_index
+            if frame_index >= len(source_frames):
+                stop_event.set()
+                return False, None
+            frame = source_frames[frame_index]
+            frame_index += 1
+            if frame_index == len(source_frames):
+                stop_event.set()
+            return True, frame
+
+        with (
+            patch.object(self.analysis_service, "_build_task_capture", return_value=capture),
+            patch.object(self.analysis_service, "_read_task_frame", side_effect=_fake_read),
+            patch.object(self.analysis_service, "_release_task_capture"),
+            patch.object(self.analysis_service, "_load_model", return_value=(object(), {"classes": ["person"]})),
+            patch.object(self.analysis_service, "_detect_frame", return_value=[detection]),
+            patch.object(self.analysis_service, "_apply_algorithm_scoped_filters", return_value=[detection]),
+            patch.object(self.analysis_service, "_build_rule_events", return_value=[detection]),
+            patch.object(self.analysis_service, "_save_event_snapshot", return_value="/tmp/continuous_snapshot.jpg"),
+            patch.object(self.analysis_service, "_submit_task_alarm_video_job") as submit_video_job_mock,
+            patch.object(self.analysis_service, "_save_alarm_video", side_effect=AssertionError("task worker should not encode video inline")),
+            patch.object(self.analysis_service.events_service, "create_event", AsyncMock(return_value={"id": "evt_continuous_video", "event_type": "detection"})),
+            patch.object(self.analysis_service, "_task_analysis_startup_warmup_seconds", return_value=0.0, create=True),
+            patch.object(self.analysis_service, "_alarm_video_before_seconds", return_value=0),
+            patch("src.services.analysis_service.time.sleep", lambda *_args, **_kwargs: None),
+        ):
+            await asyncio.to_thread(self.analysis_service._run_task_worker, task["id"], stop_event)
+
+        self.assertEqual(submit_video_job_mock.call_count, 1)
+        after_frames = submit_video_job_mock.call_args.kwargs["after_frames"]
+        self.assertEqual(len(after_frames), 2)
+        decoded_after = [self.analysis_service._decode_alarm_video_frame(frame) for _, frame in after_frames]
+        self.assertLess(float(np.mean(decoded_after[0])), float(np.mean(decoded_after[1])))
+
     async def test_analysis_service_loads_alert_interval_from_model_metadata(self):
         self._insert_channel("ch_model_interval", "模型间隔通道")
         with self.session_local() as session:
@@ -560,6 +633,71 @@ class TaskEventUpdatesTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsNotNone(recording)
         self.assertEqual(recording["file_path"], "/app/data/recordings/rec_db_only.mp4")
+
+    async def test_event_service_falls_back_to_json_when_metadata_write_fails(self):
+        class _BrokenSession:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def add(self, *_args, **_kwargs):
+                return None
+
+            def commit(self):
+                raise RuntimeError("metadata unavailable")
+
+        with patch("src.services.event_service.SessionLocal", return_value=_BrokenSession()):
+            event = await self.event_service.create_event(
+                {
+                    "channel_id": "ch_fallback",
+                    "task_id": "task_fallback",
+                    "algorithm_id": "algo_fallback",
+                    "model_id": "model_fallback",
+                    "class_name": "person",
+                    "conf": 0.9,
+                }
+            )
+
+        event_path = self.events_dir / f"{event['id']}.json"
+        self.assertTrue(event_path.exists())
+        stored = json.loads(event_path.read_text(encoding="utf-8"))
+        self.assertEqual(stored["task_id"], "task_fallback")
+        self.assertEqual(stored["class_name"], "person")
+        with self.session_local() as session:
+            self.assertEqual(session.query(EventMeta).count(), 0)
+
+    async def test_analysis_service_runtime_update_falls_back_to_json_when_metadata_write_fails(self):
+        self._insert_channel("ch_runtime_fallback", "运行态回退通道")
+        task = await self.task_service.create_task(
+            {
+                "name": "运行态回退任务",
+                "channel_id": "ch_runtime_fallback",
+                "frame_interval": 5,
+            }
+        )
+
+        class _BrokenSession:
+            def __enter__(self):
+                raise RuntimeError("metadata unavailable")
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        with patch("src.services.analysis_service.SessionLocal", return_value=_BrokenSession()):
+            self.analysis_service._update_task_runtime(
+                task["id"],
+                status="running",
+                last_analysis_at="2026-07-15 10:50:00",
+                frame_count=42,
+            )
+
+        cached_task = json.loads((self.tasks_dir / f"{task['id']}.json").read_text(encoding="utf-8"))
+        self.assertEqual(cached_task["status"], "running")
+        self.assertEqual(cached_task["runtime"]["status"], "running")
+        self.assertEqual(cached_task["runtime"]["frame_count"], 42)
+        self.assertEqual(cached_task["runtime"]["last_analysis_at"], "2026-07-15 10:50:00")
 
     async def test_task_service_normalizes_alarm_video_window_to_ten_seconds_each_side(self):
         self._insert_channel("ch_video_window", "皮带口")

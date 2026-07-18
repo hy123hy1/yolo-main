@@ -80,8 +80,10 @@ class WVPServiceTest(unittest.TestCase):
         )
 
     @patch("src.services.wvp_service.urlopen")
-    def test_sync_channels_uses_upstream_id_and_does_not_fetch_play_info(self, mock_urlopen):
+    def test_sync_channels_hydrates_missing_online_channel_play_info(self, mock_urlopen):
         from src.services.wvp_service import WVPService
+
+        stream_id = "34020000001110000121_34020000001320000002"
 
         def fake_urlopen(request, timeout=0):
             url = request.full_url
@@ -104,7 +106,20 @@ class WVPServiceTest(unittest.TestCase):
                     }
                 )
             if "channel/play" in url:
-                raise AssertionError("sync_channels should not fetch play info")
+                return _FakeHTTPResponse(
+                    {
+                        "code": 0,
+                        "msg": "success",
+                        "data": {
+                            "app": "rtp",
+                            "stream": stream_id,
+                            "rtsp": f"rtsp://192.168.1.36:554/rtp/{stream_id}",
+                            "mediaInfo": {
+                                "stream": stream_id,
+                            },
+                        },
+                    }
+                )
             raise AssertionError(f"Unexpected URL: {url}")
 
         mock_urlopen.side_effect = fake_urlopen
@@ -113,20 +128,401 @@ class WVPServiceTest(unittest.TestCase):
         result = service.sync_channels(page=1, count=20)
 
         self.assertEqual(result["synced"], 1)
-        self.assertEqual(result["items"][0]["id"], "1")
-        self.assertIsNone(result["items"][0]["source_url"])
-        self.assertEqual(result["items"][0]["stream"], "")
+        self.assertEqual(result["items"][0]["id"], stream_id)
+        self.assertEqual(result["items"][0]["source_url"], f"rtsp://192.168.1.36:554/rtp/{stream_id}")
+        self.assertEqual(result["items"][0]["stream"], stream_id)
 
-        channel_file = self.channels_dir / "1.json"
+        channel_file = self.channels_dir / f"{stream_id}.json"
         self.assertTrue(channel_file.exists())
 
         payload = json.loads(channel_file.read_text(encoding="utf-8"))
-        self.assertEqual(payload["id"], "1")
-        self.assertEqual(payload["stream"], "")
+        self.assertEqual(payload["id"], stream_id)
+        self.assertEqual(payload["stream"], stream_id)
         self.assertEqual(payload["name"], "Gate")
         self.assertEqual(payload["type"], "wvp")
         self.assertEqual(payload["ext"]["upstream"]["channel_db_id"], "1")
-        self.assertEqual(payload["ext"]["upstream"]["play_info"], {})
+        self.assertEqual(payload["ext"]["upstream"]["play_info"]["stream"], stream_id)
+
+    @patch("src.services.wvp_service.urlopen")
+    def test_sync_channels_does_not_refetch_play_info_when_online_channel_already_has_source(self, mock_urlopen):
+        from src.services.wvp_service import WVPService
+
+        stream_id = "34020000001110000121_34020000001320000002"
+        (self.channels_dir / f"{stream_id}.json").write_text(
+            json.dumps(
+                {
+                    "id": stream_id,
+                    "device_id": "34020000001320000002",
+                    "name": "Gate",
+                    "type": "wvp",
+                    "source_url": f"rtsp://192.168.1.36:554/rtp/{stream_id}",
+                    "app": "rtp",
+                    "stream": stream_id,
+                    "media_node_id": None,
+                    "is_online": True,
+                    "is_playing": False,
+                    "ai_enabled": False,
+                    "record_mode": "none",
+                    "snapshot_url": None,
+                    "created_at": "2026-07-03T10:00:00",
+                    "updated_at": "2026-07-03T10:00:00",
+                    "ext": {
+                        "zones": [],
+                        "ai_config": {"enabled": False, "models": []},
+                        "upstream": {
+                            "platform": "wvp",
+                            "channel_db_id": "1",
+                            "source_type": "rtsp",
+                            "online": True,
+                            "name": "Gate",
+                            "device_id": "34020000001320000002",
+                        },
+                    },
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
+        def fake_urlopen(request, timeout=0):
+            url = request.full_url
+            if "channel/list" in url:
+                return _FakeHTTPResponse(
+                    {
+                        "code": 0,
+                        "msg": "success",
+                        "data": {
+                            "total": 1,
+                            "list": [
+                                {
+                                    "gbId": 1,
+                                    "gbName": "Gate",
+                                    "gbDeviceId": "34020000001320000002",
+                                    "gbStatus": "ON",
+                                }
+                            ],
+                        },
+                    }
+                )
+            if "channel/play" in url:
+                raise AssertionError("sync_channels should not refetch play info for cached online channel")
+            raise AssertionError(f"Unexpected URL: {url}")
+
+        mock_urlopen.side_effect = fake_urlopen
+
+        service = WVPService()
+        result = service.sync_channels(page=1, count=20)
+
+        self.assertEqual(result["synced"], 1)
+        self.assertEqual(result["items"][0]["id"], stream_id)
+        self.assertEqual(result["items"][0]["source_url"], f"rtsp://192.168.1.36:554/rtp/{stream_id}")
+
+    @patch("src.services.wvp_service.urlopen")
+    def test_sync_channels_treats_explicit_offline_as_offline_even_with_play_info_source(self, mock_urlopen):
+        from src.services.wvp_service import WVPService
+
+        stream_id = "34020000001110000001_34020000001320000022"
+
+        def fake_urlopen(request, timeout=0):
+            url = request.full_url
+            if "channel/list" in url:
+                return _FakeHTTPResponse(
+                    {
+                        "code": 0,
+                        "msg": "success",
+                        "data": {
+                            "total": 1,
+                            "list": [
+                                {
+                                    "gbId": 8191,
+                                    "gbName": "office-ball-2",
+                                    "gbDeviceId": "34020000001320000022",
+                                    "gbStatus": "OFF",
+                                }
+                            ],
+                        },
+                    }
+                )
+            if "channel/play" in url:
+                return _FakeHTTPResponse(
+                    {
+                        "code": 0,
+                        "msg": "success",
+                        "data": {
+                            "app": "rtp",
+                            "stream": stream_id,
+                            "rtsp": f"rtsp://192.168.60.160:554/rtp/{stream_id}",
+                            "mediaInfo": {
+                                "stream": stream_id,
+                            },
+                        },
+                    }
+                )
+            raise AssertionError(f"Unexpected URL: {url}")
+
+        mock_urlopen.side_effect = fake_urlopen
+
+        service = WVPService()
+        result = service.sync_channels(page=1, count=20)
+
+        self.assertEqual(result["synced"], 1)
+        self.assertEqual(result["items"][0]["id"], "8191")
+        self.assertFalse(result["items"][0]["is_online"])
+        self.assertFalse(result["items"][0]["is_playing"])
+        self.assertEqual(result["items"][0]["stream"], "")
+        self.assertIsNone(result["items"][0]["source_url"])
+        self.assertFalse(result["items"][0]["ext"]["upstream"]["online"])
+        self.assertEqual(result["items"][0]["ext"]["upstream"]["play_info"], {})
+
+    @patch("src.services.wvp_service.urlopen")
+    def test_refresh_channel_source_clears_stale_online_state_when_wvp_status_is_off(self, mock_urlopen):
+        from src.services.wvp_service import WVPService
+
+        stream_id = "34020000001110000121_34020000001320008888"
+        channel = {
+            "id": stream_id,
+            "device_id": "34020000001320008888",
+            "name": "refresh-offline",
+            "type": "wvp",
+            "source_url": f"rtsp://192.168.1.36:554/rtp/{stream_id}",
+            "app": "rtp",
+            "stream": stream_id,
+            "is_online": True,
+            "is_playing": True,
+            "ext": {
+                "upstream": {
+                    "platform": "wvp",
+                    "channel_db_id": "8801",
+                    "online": True,
+                    "channel_info": {"gbStatus": "OFF"},
+                    "play_info": {
+                        "app": "rtp",
+                        "stream": stream_id,
+                        "rtsp": f"rtsp://192.168.1.36:554/rtp/{stream_id}",
+                        "mediaInfo": {"online": True},
+                    },
+                }
+            },
+        }
+
+        def fake_urlopen(request, timeout=0):
+            if "channel/play" in request.full_url:
+                return _FakeHTTPResponse(
+                    {
+                        "code": 0,
+                        "data": {
+                            "app": "rtp",
+                            "stream": stream_id,
+                            "rtsp": f"rtsp://192.168.1.36:554/rtp/{stream_id}",
+                            "mediaInfo": {"online": True, "stream": stream_id},
+                        },
+                    }
+                )
+            raise AssertionError(f"Unexpected URL: {request.full_url}")
+
+        mock_urlopen.side_effect = fake_urlopen
+
+        refreshed = WVPService().refresh_channel_source(channel)
+
+        self.assertFalse(refreshed["is_online"])
+        self.assertFalse(refreshed["is_playing"])
+        self.assertIsNone(refreshed["source_url"])
+        self.assertEqual(refreshed["stream"], "")
+        self.assertEqual(refreshed["ext"]["upstream"]["play_info"], {})
+        self.assertFalse(refreshed["ext"]["upstream"]["online"])
+
+    @patch("src.services.wvp_service.urlopen")
+    def test_refresh_channel_source_treats_offline_play_info_as_offline_even_with_stale_source(self, mock_urlopen):
+        from src.services.wvp_service import WVPService
+
+        stream_id = "34020000001110000121_34020000001320007777"
+        channel = {
+            "id": stream_id,
+            "device_id": "34020000001320007777",
+            "name": "play-info-offline",
+            "type": "wvp",
+            "source_url": f"rtsp://192.168.1.36:554/rtp/{stream_id}",
+            "app": "rtp",
+            "stream": stream_id,
+            "is_online": True,
+            "is_playing": True,
+            "ext": {
+                "upstream": {
+                    "platform": "wvp",
+                    "channel_db_id": "7701",
+                    "online": True,
+                    "channel_info": {"gbStatus": "ON"},
+                }
+            },
+        }
+
+        def fake_urlopen(request, timeout=0):
+            if "channel/play" in request.full_url:
+                return _FakeHTTPResponse(
+                    {
+                        "code": 0,
+                        "data": {
+                            "app": "rtp",
+                            "stream": stream_id,
+                            "rtsp": f"rtsp://192.168.1.36:554/rtp/{stream_id}",
+                            "mediaInfo": {"online": False, "stream": stream_id},
+                        },
+                    }
+                )
+            raise AssertionError(f"Unexpected URL: {request.full_url}")
+
+        mock_urlopen.side_effect = fake_urlopen
+
+        refreshed = WVPService().refresh_channel_source(channel)
+
+        self.assertFalse(refreshed["is_online"])
+        self.assertFalse(refreshed["is_playing"])
+        self.assertIsNone(refreshed["source_url"])
+        self.assertEqual(refreshed["stream"], "")
+        self.assertEqual(refreshed["ext"]["upstream"]["play_info"], {})
+        self.assertFalse(refreshed["ext"]["upstream"]["online"])
+
+    @patch("src.services.wvp_service.urlopen")
+    def test_refresh_channel_source_clears_stale_state_when_play_info_is_empty(self, mock_urlopen):
+        from src.services.wvp_service import WVPService
+
+        stream_id = "34020000001110000121_34020000001320006666"
+        channel = {
+            "id": stream_id,
+            "device_id": "34020000001320006666",
+            "name": "empty-play-info",
+            "type": "wvp",
+            "source_url": f"rtsp://192.168.1.36:554/rtp/{stream_id}",
+            "app": "rtp",
+            "stream": stream_id,
+            "is_online": True,
+            "is_playing": True,
+            "ext": {
+                "upstream": {
+                    "platform": "wvp",
+                    "channel_db_id": "6601",
+                    "online": True,
+                    "channel_info": {"gbStatus": "ON"},
+                }
+            },
+        }
+
+        def fake_urlopen(request, timeout=0):
+            if "channel/play" in request.full_url:
+                return _FakeHTTPResponse({"code": 0, "data": {}})
+            raise AssertionError(f"Unexpected URL: {request.full_url}")
+
+        mock_urlopen.side_effect = fake_urlopen
+
+        refreshed = WVPService().refresh_channel_source(channel)
+
+        self.assertFalse(refreshed["is_online"])
+        self.assertFalse(refreshed["is_playing"])
+        self.assertIsNone(refreshed["source_url"])
+        self.assertEqual(refreshed["stream"], "")
+        self.assertEqual(refreshed["ext"]["upstream"]["play_info"], {})
+        self.assertFalse(refreshed["ext"]["upstream"]["online"])
+
+    @patch("src.services.wvp_service.urlopen")
+    def test_sync_channels_deletes_missing_unbound_channel_and_marks_missing_bound_channel_offline(self, mock_urlopen):
+        from src.services.wvp_service import WVPService
+
+        present_id = "present_wvp"
+        missing_unbound_id = "missing_unbound"
+        missing_bound_id = "missing_bound"
+
+        for channel_id, name in [
+            (missing_unbound_id, "missing-unbound"),
+            (missing_bound_id, "missing-bound"),
+        ]:
+            (self.channels_dir / f"{channel_id}.json").write_text(
+                json.dumps(
+                    {
+                        "id": channel_id,
+                        "device_id": f"device-{channel_id}",
+                        "name": name,
+                        "type": "wvp",
+                        "source_url": f"rtsp://example.com/{channel_id}",
+                        "app": "rtp",
+                        "stream": channel_id,
+                        "media_node_id": None,
+                        "is_online": True,
+                        "is_playing": True,
+                        "ai_enabled": False,
+                        "record_mode": "none",
+                        "snapshot_url": None,
+                        "created_at": "2026-07-03T10:00:00",
+                        "updated_at": "2026-07-03T10:00:00",
+                        "ext": {
+                            "zones": [],
+                            "ai_config": {"enabled": False, "models": []},
+                            "upstream": {
+                                "platform": "wvp",
+                                "channel_db_id": channel_id,
+                                "source_type": "rtsp",
+                                "online": True,
+                                "name": name,
+                            },
+                        },
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+
+        (self.tasks_dir / "task_missing_bound.json").write_text(
+            json.dumps(
+                {
+                    "id": "task_missing_bound",
+                    "name": "task-missing-bound",
+                    "channel_id": missing_bound_id,
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
+        def fake_urlopen(request, timeout=0):
+            url = request.full_url
+            if "channel/list" in url:
+                return _FakeHTTPResponse(
+                    {
+                        "code": 0,
+                        "msg": "success",
+                        "data": {
+                            "total": 1,
+                            "list": [
+                                {
+                                    "gbId": present_id,
+                                    "gbName": "present",
+                                    "gbDeviceId": "device-present",
+                                    "gbStatus": "ON",
+                                }
+                            ],
+                        },
+                    }
+                )
+            if "channel/play" in url:
+                raise AssertionError("ON channel should not fetch play info during sync")
+            raise AssertionError(f"Unexpected URL: {url}")
+
+        mock_urlopen.side_effect = fake_urlopen
+
+        service = WVPService()
+        result = service.sync_channels(page=1, count=20)
+
+        self.assertEqual(result["synced"], 1)
+        self.assertFalse((self.channels_dir / f"{missing_unbound_id}.json").exists())
+        self.assertTrue((self.channels_dir / f"{missing_bound_id}.json").exists())
+
+        bound_payload = json.loads((self.channels_dir / f"{missing_bound_id}.json").read_text(encoding="utf-8"))
+        self.assertFalse(bound_payload["is_online"])
+        self.assertFalse(bound_payload["is_playing"])
+        self.assertFalse(bound_payload["ext"]["upstream"]["online"])
+        self.assertEqual(bound_payload["ext"]["upstream"]["missing_from_wvp"], True)
 
     @patch("src.services.wvp_service.urlopen")
     def test_sync_channels_reuses_existing_channel_with_same_stream_id(self, mock_urlopen):
@@ -218,7 +614,8 @@ class WVPServiceTest(unittest.TestCase):
         self.assertEqual(payload["id"], stream_id)
         self.assertEqual(payload["media_node_id"], "default-node")
         self.assertTrue(payload["is_playing"])
-        self.assertTrue(payload["ai_enabled"])
+        self.assertNotIn("ai_enabled", payload)
+        self.assertNotIn("ai_config", payload.get("ext", {}))
         self.assertEqual(payload["ext"]["zones"][0]["id"], "zone_1")
         self.assertEqual(payload["ext"]["upstream"]["channel_db_id"], "1")
 

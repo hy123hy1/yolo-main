@@ -109,7 +109,6 @@ class FastReadPathsTest(unittest.IsolatedAsyncioTestCase):
                     stream=payload.get("stream"),
                     is_online=payload.get("is_online"),
                     is_playing=payload.get("is_playing"),
-                    ai_enabled=payload.get("ai_enabled"),
                     record_mode=payload.get("record_mode"),
                     snapshot_url=payload.get("snapshot_url"),
                     snapshot_path=payload.get("snapshot_path"),

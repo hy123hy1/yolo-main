@@ -1,3 +1,4 @@
+import asyncio
 import sys
 import tempfile
 import threading
@@ -20,6 +21,108 @@ from src.services.analysis_service import AnalysisService
 
 
 class AnalysisServiceTest(unittest.TestCase):
+    def test_build_task_capture_uses_ffmpeg_probe_and_capture_for_rtsp(self):
+        service = AnalysisService()
+        ffprobe_result = type(
+            "FFprobeResult",
+            (),
+            {
+                "returncode": 0,
+                "stdout": '{"streams":[{"codec_type":"video","width":1920,"height":1080}]}',
+                "stderr": "",
+            },
+        )()
+        fake_capture = object()
+
+        with (
+            patch("src.services.analysis_service.cv2.VideoCapture", side_effect=AssertionError("OpenCV must not open streams")),
+            patch("src.services.analysis_service.subprocess.run", return_value=ffprobe_result) as run_mock,
+            patch("src.services.analysis_service.FFmpegCapture", return_value=fake_capture) as capture_mock,
+        ):
+            capture = service._build_task_capture("rtsp://example/live/test")
+
+        self.assertIs(capture, fake_capture)
+        run_mock.assert_called_once()
+        capture_mock.assert_called_once_with("rtsp://example/live/test", 1920, 1080, init_wait=0.3)
+
+    def test_build_task_execution_snapshot_uses_task_source_and_enabled_algorithms(self):
+        service = AnalysisService()
+        task = {
+            "id": "task_demo",
+            "channel_id": "channel_demo",
+            "source_url": "rtsp://example/live/task_demo",
+            "runtime": {
+                "models": {
+                    "algo_prev": {"last_event_at": "2026-07-11T10:00:00"},
+                }
+            },
+            "algorithms": [
+                {"id": "algo_enabled", "model_id": "model_a", "enabled": True},
+                {"id": "algo_disabled", "model_id": "model_b", "enabled": False},
+                {"id": "algo_missing_model", "enabled": True},
+            ],
+        }
+
+        snapshot = service._build_task_execution_snapshot(task)
+
+        self.assertEqual(snapshot["task_id"], "task_demo")
+        self.assertEqual(snapshot["channel_id"], "channel_demo")
+        self.assertEqual(snapshot["source_url"], "rtsp://example/live/task_demo")
+        self.assertEqual([item["id"] for item in snapshot["algorithms"]], ["algo_enabled"])
+        self.assertEqual(snapshot["runtime_models"], {"algo_prev": {"last_event_at": "2026-07-11T10:00:00"}})
+
+    def test_merge_task_runtime_models_overlays_latest_runtime_entries(self):
+        service = AnalysisService()
+
+        merged = service._merge_task_runtime_models(
+            {
+                "algo_prev": {"last_event_at": "2026-07-11T10:00:00", "detections": 1},
+                "algo_keep": {"detections": 2},
+            },
+            {
+                "algo_prev": {"last_analysis_at": "2026-07-11T10:01:00", "detections": 3},
+                "algo_new": {"detections": 4},
+            },
+        )
+
+        self.assertEqual(
+            merged["algo_prev"],
+            {
+                "last_event_at": "2026-07-11T10:00:00",
+                "last_analysis_at": "2026-07-11T10:01:00",
+                "detections": 3,
+            },
+        )
+        self.assertEqual(merged["algo_keep"], {"detections": 2})
+        self.assertEqual(merged["algo_new"], {"detections": 4})
+
+    def test_sync_task_runtime_state_prunes_removed_algorithms(self):
+        service = AnalysisService()
+        cooldown_cache = {
+            "algo_keep::detection": 10.0,
+            "algo_drop::detection": 20.0,
+        }
+        rule_state = {
+            "algo_keep::intrusion::zone_a": {"armed_at": 1.0},
+            "algo_drop::intrusion::zone_b": {"armed_at": 2.0},
+        }
+
+        synced = service._sync_task_runtime_state(
+            algorithms=[
+                {"id": "algo_keep", "model_id": "model_keep"},
+            ],
+            runtime_models={
+                "algo_keep": {"detections": 2},
+                "algo_drop": {"detections": 5},
+            },
+            cooldown_cache=cooldown_cache,
+            rule_state=rule_state,
+        )
+
+        self.assertEqual(synced, {"algo_keep": {"detections": 2}})
+        self.assertEqual(cooldown_cache, {"algo_keep::detection": 10.0})
+        self.assertEqual(rule_state, {"algo_keep::intrusion::zone_a": {"armed_at": 1.0}})
+
     def test_annotate_frame_draws_red_box_and_label(self):
         service = AnalysisService()
         frame = np.zeros((120, 160, 3), dtype=np.uint8)
@@ -77,7 +180,7 @@ class AnalysisServiceTest(unittest.TestCase):
 
         self.assertEqual(payload["event_type"], "count")
 
-    def test_alarm_video_frames_are_not_annotated(self):
+    def test_alarm_video_keeps_detection_overlay_on_every_alarm_frame(self):
         service = AnalysisService()
         frame = np.zeros((120, 160, 3), dtype=np.uint8)
         detections = [
@@ -91,10 +194,175 @@ class AnalysisServiceTest(unittest.TestCase):
             }
         ]
 
-        encoded = service._prepare_alarm_video_frame(frame, detections)
+        written_frames = []
 
-        self.assertEqual(tuple(encoded[30, 20]), (0, 0, 0))
-        self.assertEqual(int(encoded.sum()), 0)
+        class _Writer:
+            def write(self, value):
+                written_frames.append(value.copy())
+
+            def release(self):
+                return None
+
+        original_recordings_dir = settings.RECORDINGS_DIR
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings.RECORDINGS_DIR = Path(temp_dir)
+            try:
+                with (
+                    patch("src.services.analysis_service.cv2.VideoWriter", return_value=_Writer()),
+                    patch("src.services.analysis_service.subprocess.run"),
+                ):
+                    service._save_alarm_video(
+                        "ch_demo",
+                        "evt_demo",
+                        [
+                            (1.0, service._pack_alarm_video_frame(frame)),
+                            (2.0, service._pack_alarm_video_frame(frame)),
+                        ],
+                        detections,
+                        fps=1.0,
+                        event_timestamp=2.0,
+                    )
+            finally:
+                settings.RECORDINGS_DIR = original_recordings_dir
+
+        self.assertEqual(len(written_frames), 2)
+        self.assertEqual(tuple(written_frames[0][30, 20]), (0, 0, 255))
+        self.assertEqual(tuple(written_frames[1][30, 20]), (0, 0, 255))
+        self.assertGreater(int(written_frames[0].sum()), 0)
+        self.assertGreater(int(written_frames[1].sum()), 0)
+
+    def test_alarm_video_redetects_each_frame_before_drawing_overlay(self):
+        service = AnalysisService()
+        frame = np.zeros((120, 160, 3), dtype=np.uint8)
+        cv2.rectangle(frame, (2, 2), (12, 12), (255, 255, 255), -1)
+        first_detection = {
+            "class_name": "person",
+            "conf": 0.91,
+            "x1": 20,
+            "y1": 30,
+            "x2": 60,
+            "y2": 90,
+        }
+        second_detection = {
+            "class_name": "person",
+            "conf": 0.88,
+            "x1": 90,
+            "y1": 30,
+            "x2": 130,
+            "y2": 90,
+        }
+        written_frames = []
+
+        class _Writer:
+            def write(self, value):
+                written_frames.append(value.copy())
+
+            def release(self):
+                return None
+
+        original_recordings_dir = settings.RECORDINGS_DIR
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings.RECORDINGS_DIR = Path(temp_dir)
+            try:
+                with (
+                    patch("src.services.analysis_service.cv2.VideoWriter", return_value=_Writer()),
+                    patch("src.services.analysis_service.subprocess.run"),
+                    patch.object(service, "_load_model", return_value=(object(), {"classes": ["person"]})),
+                    patch.object(service, "_detect_frame", side_effect=[[], [second_detection]]),
+                    patch.object(
+                        service,
+                        "_apply_algorithm_scoped_filters",
+                        side_effect=lambda detections, *_args: detections,
+                    ),
+                ):
+                    service._save_alarm_video(
+                        "task_demo",
+                        "evt_demo",
+                        [
+                            (1.0, service._pack_alarm_video_frame(frame)),
+                            (2.0, service._pack_alarm_video_frame(frame)),
+                        ],
+                        [first_detection],
+                        fps=1.0,
+                        task_id="task_demo",
+                        algorithm={
+                            "model_id": "model_demo",
+                            "labels": ["person"],
+                            "detect_all_classes": False,
+                            "regions": [],
+                        },
+                        model_id="model_demo",
+                    )
+            finally:
+                settings.RECORDINGS_DIR = original_recordings_dir
+
+        self.assertEqual(len(written_frames), 2)
+        self.assertEqual(tuple(written_frames[0][30, 20]), (0, 0, 0))
+        self.assertEqual(tuple(written_frames[0][30, 60]), (0, 0, 0))
+        self.assertEqual(tuple(written_frames[1][30, 90]), (0, 0, 255))
+        self.assertEqual(tuple(written_frames[1][30, 20]), (0, 0, 0))
+
+    def test_submit_alarm_video_job_forwards_event_timestamp(self):
+        service = AnalysisService()
+        with (
+            patch.object(service._alarm_video_executor, "submit") as submit_mock,
+            patch.object(service, "_track_alarm_video_future"),
+        ):
+            service._submit_task_alarm_video_job(
+                task_id="task_demo",
+                task_channel_id="channel_demo",
+                source_url="rtsp://example/live/demo",
+                event={"id": "evt_demo"},
+                algorithm={"id": "algo_demo"},
+                model_id="model_demo",
+                detection={"class_name": "person", "conf": 0.91},
+                snapshot_path=None,
+                before_frames=[],
+                fps=25.0,
+                before_seconds=10,
+                after_seconds=10,
+                event_timestamp=12.5,
+            )
+
+        self.assertEqual(submit_mock.call_args.kwargs["event_timestamp"], 12.5)
+
+    def test_finalize_alarm_video_uses_supplied_after_frames_without_reopening_stream(self):
+        service = AnalysisService()
+        before_frame = np.zeros((16, 16, 3), dtype=np.uint8)
+        after_frame = np.full((16, 16, 3), 64, dtype=np.uint8)
+
+        with (
+            patch.object(
+                service,
+                "_collect_task_alarm_after_frames",
+                side_effect=AssertionError("alarm video must reuse task frames"),
+            ),
+            patch.object(
+                service,
+                "_build_alarm_video_frames",
+                return_value=[(1.0, before_frame), (2.0, after_frame)],
+            ),
+            patch.object(service, "_save_alarm_video", return_value="/tmp/alarm.mp4") as save_video_mock,
+            patch.object(service.events_service, "update_event_sync"),
+            patch.object(service.recording_service, "create_recording_sync"),
+        ):
+            service._finalize_task_alarm_video_job(
+                task_id="task_demo",
+                task_channel_id="channel_demo",
+                source_url="rtsp://example/live/demo",
+                event={"id": "evt_demo"},
+                algorithm={"id": "algo_demo", "model_id": "model_demo"},
+                model_id="model_demo",
+                detection={"class_name": "person", "conf": 0.91},
+                snapshot_path=None,
+                before_frames=[(1.0, before_frame)],
+                after_frames=[(2.0, after_frame)],
+                fps=25.0,
+                before_seconds=10,
+                after_seconds=10,
+            )
+
+        self.assertEqual(save_video_mock.call_args.kwargs["task_id"], "task_demo")
 
     def test_alarm_video_buffer_frame_is_compressed_and_decodable(self):
         service = AnalysisService()
@@ -106,6 +374,15 @@ class AnalysisServiceTest(unittest.TestCase):
         self.assertIsInstance(packed, bytes)
         self.assertLess(len(packed), frame.nbytes)
         self.assertEqual(decoded.shape, frame.shape)
+
+    def test_is_frame_usable_rejects_uniform_frame_with_sparse_artifacts(self):
+        service = AnalysisService()
+        frame = np.full((120, 160, 3), 125, dtype=np.uint8)
+        frame[10, 10] = (0, 0, 0)
+        frame[30, 40] = (255, 255, 255)
+        frame[80, 120] = (0, 0, 0)
+
+        self.assertFalse(service._is_frame_usable(frame))
 
     def test_save_alarm_video_accepts_compressed_buffer_frames(self):
         service = AnalysisService()
@@ -346,64 +623,49 @@ class AnalysisServiceTest(unittest.TestCase):
         self.assertEqual(read_frame_mock.call_count, 3)
         release_capture_mock.assert_called_once_with(capture)
 
-    def test_channel_worker_submits_alarm_video_job_without_inline_video_encoding(self):
+    def test_collect_channel_alarm_after_frames_uses_ffmpeg_task_capture(self):
         service = AnalysisService()
-        stop_event = threading.Event()
-        frame = np.zeros((16, 16, 3), dtype=np.uint8)
-        detection = {
-            "class_name": "person",
-            "conf": 0.91,
-            "x1": 1,
-            "y1": 1,
-            "x2": 10,
-            "y2": 10,
-        }
-
-        class FakeCapture:
-            def isOpened(self):
-                return True
-
-            def read(self):
-                stop_event.set()
-                return True, frame
-
-            def release(self):
-                pass
-
-        channel = {
-            "id": "ch_async_worker",
-            "source_url": "rtsp://example/live/ch_async_worker",
-            "ext": {
-                "ai_config": {
-                    "enabled": True,
-                    "models": [
-                        {
-                            "model_id": "model_async_worker",
-                            "enabled": True,
-                            "frame_interval": 1,
-                            "save_snapshot": True,
-                        }
-                    ],
-                }
-            },
-        }
+        capture = object()
+        frame = np.zeros((8, 8, 3), dtype=np.uint8)
 
         with (
-            patch.object(service, "_load_channel", return_value=channel),
-            patch.object(service, "_save_channel"),
-            patch("src.services.analysis_service.cv2.VideoCapture", return_value=FakeCapture()),
-            patch.object(service, "_load_model", return_value=(object(), {"classes": ["person"]})),
-            patch.object(service, "_detect_frame", return_value=[detection]),
-            patch.object(service, "_apply_model_scoped_filters", return_value=[detection]),
-            patch.object(service, "_save_event_snapshot", return_value="/tmp/channel_snapshot.jpg"),
-            patch.object(service.events_service, "create_event", AsyncMock(return_value={"id": "evt_channel_async", "event_type": "detection"})),
-            patch.object(service, "_submit_channel_alarm_video_job") as submit_video_job_mock,
-            patch.object(service, "_save_alarm_video", side_effect=AssertionError("channel worker should not encode video inline")),
-            patch("src.services.analysis_service.time.sleep", lambda *_args, **_kwargs: None),
+            patch.object(service, "_build_task_capture", return_value=capture) as build_capture_mock,
+            patch.object(service, "_release_task_capture") as release_capture_mock,
+            patch.object(service, "_read_task_frame", return_value=(True, frame)),
+            patch.object(service, "_task_alarm_video_capture_timeout_seconds", return_value=30.0),
+            patch("src.services.analysis_service.cv2.VideoCapture", side_effect=AssertionError("OpenCV must not open streams")),
         ):
-            service._run_worker("ch_async_worker", stop_event)
+            frames = service._collect_channel_alarm_after_frames(
+                source_url="rtsp://example/live/test",
+                after_frame_limit=1,
+                after_seconds=1,
+            )
 
-        self.assertEqual(submit_video_job_mock.call_count, 1)
+        self.assertEqual(len(frames), 1)
+        build_capture_mock.assert_called_once_with("rtsp://example/live/test")
+        release_capture_mock.assert_called_once_with(capture)
+
+    def test_start_channel_analysis_raises_when_legacy_path_is_disabled(self):
+        service = AnalysisService()
+
+        with self.assertRaisesRegex(RuntimeError, "Channel-level analysis is disabled"):
+            asyncio.run(service.start_channel_analysis("ch_disabled"))
+
+    def test_get_channel_analysis_status_returns_disabled_placeholder(self):
+        service = AnalysisService()
+        channel = {
+            "id": "ch_disabled",
+            "ext": {},
+        }
+
+        with patch.object(service, "_load_channel", return_value=channel):
+            status = asyncio.run(service.get_channel_analysis_status("ch_disabled"))
+
+        self.assertEqual(status["channel_id"], "ch_disabled")
+        self.assertFalse(status["enabled"])
+        self.assertFalse(status["is_running"])
+        self.assertEqual(status["status"], "stopped")
+        self.assertIn("disabled", status["last_error"])
 
     def test_apply_rule_type_detection_returns_every_detection(self):
         service = AnalysisService()
@@ -474,7 +736,7 @@ class AnalysisServiceTest(unittest.TestCase):
         ]
         channel = {
             "ext": {
-                "ai_config": {
+                "detection_scope": {
                     "zone_ids": ["zone_1"],
                 },
                 "zones": [
@@ -498,7 +760,7 @@ class AnalysisServiceTest(unittest.TestCase):
         ]
         channel = {
             "ext": {
-                "ai_config": {
+                "detection_scope": {
                     "zone_ids": ["zone_1"],
                 },
                 "zones": [
@@ -566,9 +828,13 @@ class AnalysisServiceTest(unittest.TestCase):
             {"class_name": "person", "conf": 0.86, "zone_id": "zone_a", "x1": 80, "y1": 32, "x2": 100, "y2": 92},
         ]
 
-        first = service._build_rule_events(task={}, algorithm=algorithm, detections=detections, now_ts=100.0, state=state)
-        second = service._build_rule_events(task={}, algorithm=algorithm, detections=detections, now_ts=101.0, state=state)
-        third = service._build_rule_events(task={}, algorithm=algorithm, detections=detections, now_ts=102.0, state=state)
+        with patch(
+            "src.services.analysis_service.get_algorithm_rule_config",
+            return_value={"count_threshold": 3, "hold_seconds": 2},
+        ):
+            first = service._build_rule_events(task={}, algorithm=algorithm, detections=detections, now_ts=100.0, state=state)
+            second = service._build_rule_events(task={}, algorithm=algorithm, detections=detections, now_ts=101.0, state=state)
+            third = service._build_rule_events(task={}, algorithm=algorithm, detections=detections, now_ts=102.0, state=state)
 
         self.assertEqual(first, [])
         self.assertEqual(second, [])
@@ -576,7 +842,11 @@ class AnalysisServiceTest(unittest.TestCase):
         self.assertEqual(third[0]["zone_id"], "zone_a")
         self.assertEqual(third[0]["zone_name"], "区域A")
         self.assertEqual(third[0]["object_count"], 3)
-        self.assertEqual(third[0]["annotation_label"], "人员聚集 3")
+        self.assertEqual(third[0]["annotation_label"], "Person gathering 3")
+        self.assertEqual(
+            third[0]["snapshot_detections"][0]["annotation_label"],
+            "Person gathering 3",
+        )
 
     def test_apply_rule_type_congestion_resets_after_count_drops_below_threshold(self):
         service = AnalysisService()
@@ -803,6 +1073,13 @@ class AnalysisServiceTest(unittest.TestCase):
             return_value={"absence_seconds": 30},
             create=True,
         ):
+            service._build_rule_events(
+                task={},
+                algorithm=algorithm,
+                detections=[{"class_name": "person", "conf": 0.9}],
+                now_ts=99.0,
+                state=state,
+            )
             service._build_rule_events(task={}, algorithm=algorithm, detections=[], now_ts=100.0, state=state)
             before_backend_threshold = service._build_rule_events(
                 task={}, algorithm=algorithm, detections=[], now_ts=106.0, state=state
@@ -923,7 +1200,11 @@ class AnalysisServiceTest(unittest.TestCase):
         self.assertEqual(first, [])
         self.assertEqual(second, [])
 
-    def test_apply_rule_type_absence_emits_only_after_threshold(self):
+    @patch(
+        "src.services.analysis_service.get_algorithm_rule_config",
+        return_value={"absence_seconds": 5},
+    )
+    def test_apply_rule_type_absence_requires_prior_presence_before_threshold(self, _rule_config_mock):
         service = AnalysisService()
         state: dict = {}
         algorithm = {
@@ -932,35 +1213,63 @@ class AnalysisServiceTest(unittest.TestCase):
             "labels": ["person"],
         }
 
-        first = service._build_rule_events(
+        initial_empty = service._build_rule_events(
             task={},
             algorithm=algorithm,
             detections=[],
             now_ts=100.0,
             state=state,
         )
-        second = service._build_rule_events(
+        still_empty = service._build_rule_events(
             task={},
             algorithm=algorithm,
             detections=[],
             now_ts=103.0,
             state=state,
         )
-        third = service._build_rule_events(
+        service._build_rule_events(
+            task={},
+            algorithm=algorithm,
+            detections=[{"class_name": "person", "conf": 0.9}],
+            now_ts=107.0,
+            state=state,
+        )
+        first_missing = service._build_rule_events(
             task={},
             algorithm=algorithm,
             detections=[],
-            now_ts=106.0,
+            now_ts=108.0,
+            state=state,
+        )
+        before_threshold = service._build_rule_events(
+            task={},
+            algorithm=algorithm,
+            detections=[],
+            now_ts=112.0,
+            state=state,
+        )
+        after_threshold = service._build_rule_events(
+            task={},
+            algorithm=algorithm,
+            detections=[],
+            now_ts=113.0,
             state=state,
         )
 
-        self.assertEqual(first, [])
-        self.assertEqual(second, [])
-        self.assertEqual(len(third), 1)
-        self.assertEqual(third[0]["class_name"], "person")
-        self.assertEqual(third[0]["absence_seconds"], 6)
+        self.assertEqual(initial_empty, [])
+        self.assertEqual(still_empty, [])
+        self.assertEqual(first_missing, [])
+        self.assertEqual(before_threshold, [])
+        self.assertEqual(len(after_threshold), 1)
+        self.assertEqual(after_threshold[0]["class_name"], "person")
+        self.assertEqual(after_threshold[0]["absence_seconds"], 5)
+        self.assertEqual(after_threshold[0]["annotation_label"], "Person absent 5s")
 
-    def test_apply_rule_type_absence_tracks_each_region_independently(self):
+    @patch(
+        "src.services.analysis_service.get_algorithm_rule_config",
+        return_value={"absence_seconds": 5},
+    )
+    def test_apply_rule_type_absence_tracks_each_region_independently(self, _rule_config_mock):
         service = AnalysisService()
         state: dict = {}
         algorithm = {
@@ -986,7 +1295,10 @@ class AnalysisServiceTest(unittest.TestCase):
         service._build_rule_events(
             task={},
             algorithm=algorithm,
-            detections=[{"class_name": "person", "conf": 0.9, "zone_id": "zone_a"}],
+            detections=[
+                {"class_name": "person", "conf": 0.9, "zone_id": "zone_a"},
+                {"class_name": "person", "conf": 0.9, "zone_id": "zone_b"},
+            ],
             now_ts=100.0,
             state=state,
         )
@@ -1001,7 +1313,7 @@ class AnalysisServiceTest(unittest.TestCase):
             task={},
             algorithm=algorithm,
             detections=[{"class_name": "person", "conf": 0.9, "zone_id": "zone_a"}],
-            now_ts=106.0,
+            now_ts=109.0,
             state=state,
         )
 
@@ -1009,7 +1321,7 @@ class AnalysisServiceTest(unittest.TestCase):
         self.assertEqual(third[0]["zone_id"], "zone_b")
         self.assertEqual(third[0]["zone_name"], "B区")
         self.assertEqual(third[0]["absence_seconds"], 6)
-        self.assertEqual(third[0]["annotation_label"], "离岗检测 6s")
+        self.assertEqual(third[0]["annotation_label"], "Person absent 6s")
 
     def test_apply_rule_type_absence_resets_after_person_reappears(self):
         service = AnalysisService()
@@ -1020,7 +1332,14 @@ class AnalysisServiceTest(unittest.TestCase):
             "labels": ["person"],
         }
 
-        service._build_rule_events(task={}, algorithm=algorithm, detections=[], now_ts=100.0, state=state)
+        service._build_rule_events(
+            task={},
+            algorithm=algorithm,
+            detections=[{"class_name": "person", "conf": 0.9}],
+            now_ts=100.0,
+            state=state,
+        )
+        service._build_rule_events(task={}, algorithm=algorithm, detections=[], now_ts=101.0, state=state)
         service._build_rule_events(
             task={},
             algorithm=algorithm,
@@ -1048,7 +1367,7 @@ class AnalysisServiceTest(unittest.TestCase):
                 "zone_id": "zone_absence",
                 "zone_name": "离岗区",
                 "absence_seconds": 30,
-                "annotation_label": "离岗检测 30s",
+                "annotation_label": "Person absent 30s",
                 "label_anchor": [24, 24],
             }
         ]

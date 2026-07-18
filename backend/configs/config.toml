@@ -6,7 +6,7 @@
     Port = 8000
 
   [Server.Web]
-    PublicBase = "http://192.168.60.61:3000"
+    PublicBase = "http://192.168.1.61:3000"
 
   [Server.Monitor]
     HostAgentURL = ""
@@ -46,12 +46,12 @@
 
 [Media]
   APIBase = "http://host.docker.internal:8010"
-  PlayBase = "http://192.168.60.61:8010"
-  WebRTCBase = "webrtc://192.168.60.61:8010"
+  PlayBase = "http://192.168.1.61:8010"
+  WebRTCBase = "webrtc://192.168.1.61:8010"
   Secret = ""
-  PublicRTSPHost = "192.168.60.61"
-  PublicRTMPHost = "192.168.60.61"
-  PublicHTTPHost = "192.168.60.61"
+  PublicRTSPHost = "192.168.1.61"
+  PublicRTMPHost = "192.168.1.61"
+  PublicHTTPHost = "192.168.1.61"
   RTSPPort = 554
   RTMPPort = 1935
   HTTPPort = 8010

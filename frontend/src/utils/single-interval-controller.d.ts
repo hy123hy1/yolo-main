@@ -13,4 +13,4 @@ export function createSingleIntervalController<TTimer>(
   scheduler: SingleIntervalScheduler<TTimer>
 ): SingleIntervalController<TTimer>
 
-export function shouldPollChannelAiStatus(tabKey: string): boolean
+export function shouldPollTaskStatus(tabKey: string): boolean

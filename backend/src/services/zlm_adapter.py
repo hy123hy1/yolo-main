@@ -40,7 +40,7 @@ class ZLMAdapter:
         play_parsed = urlparse(self.play_base)
         scheme = play_parsed.scheme or "http"
         hostname = self.public_http_host or play_parsed.hostname or "localhost"
-        http_port = self.https_port if scheme == "https" else self.http_port
+        http_port = play_parsed.port or (self.https_port if scheme == "https" else self.http_port)
         http_host = f"{hostname}:{http_port}"
         http_base = f"{scheme}://{http_host}"
         rtsp_host = f"{self.public_rtsp_host or hostname}:{self.rtsp_port}"
@@ -49,35 +49,35 @@ class ZLMAdapter:
         webrtc_parsed = urlparse(self.webrtc_base)
         webrtc_scheme = webrtc_parsed.scheme or scheme
         webrtc_host = webrtc_parsed.netloc or f"{hostname}:{http_port}"
+        if self.public_http_host and webrtc_parsed.hostname in {"localhost", "127.0.0.1"}:
+            webrtc_port = webrtc_parsed.port or http_port
+            webrtc_host = f"{self.public_http_host}:{webrtc_port}"
         if webrtc_scheme in {"http", "https"}:
             webrtc_scheme = "webrtc" if webrtc_scheme == "http" else "webrtcs"
         if not webrtc_host:
             webrtc_host = f"{hostname}:{http_port}"
         webrtc_query = urlencode({"app": app, "stream": stream, "type": "play"})
-        browser_webrtc_query = urlencode({
-            "app": app,
-            "stream": stream,
-            "type": "play",
-            **({"node_id": node_id} if node_id else {}),
-        })
-        browser_suffix = f"?node_id={node_id}" if node_id else ""
+        webrtc_api_url = f"{http_base}{self.webrtc_path}?{webrtc_query}"
+        hls_url = f"{http_base}/{app}/{stream}/{self.hls_file}"
+        httpflv_url = f"{http_base}/{app}/{stream}{self.httpflv_suffix}"
 
-        browser_hls = f"/proxy/sms/{app}/{stream}/{self.hls_file}{browser_suffix}"
-        browser_httpflv = f"/proxy/sms/{app}/{stream}{self.httpflv_suffix}{browser_suffix}"
-        browser_webrtc_api = f"/proxy/sms{self.webrtc_path}?{browser_webrtc_query}"
+        browser_hls = hls_url
+        browser_httpflv = httpflv_url
+        browser_webrtc_api = webrtc_api_url
 
         return {
             "rtsp": f"rtsp://{rtsp_host}/{app}/{stream}",
             "rtmp": f"rtmp://{rtmp_host}/{app}/{stream}",
-            "hls": f"{http_base}/{app}/{stream}/{self.hls_file}",
-            "httpflv": f"{http_base}/{app}/{stream}{self.httpflv_suffix}",
+            "hls": hls_url,
+            "httpflv": httpflv_url,
             "webrtc": f"{webrtc_scheme}://{webrtc_host}{self.webrtc_path}?{webrtc_query}",
+            "webrtc_api": webrtc_api_url,
             "browser_hls": browser_hls,
             "browser_httpflv": browser_httpflv,
             "browser_webrtc_api": browser_webrtc_api,
-            "browser_hls_url": f"{http_base}{browser_hls}",
-            "browser_httpflv_url": f"{http_base}{browser_httpflv}",
-            "browser_webrtc_api_url": f"{http_base}{browser_webrtc_api}",
+            "browser_hls_url": browser_hls,
+            "browser_httpflv_url": browser_httpflv,
+            "browser_webrtc_api_url": browser_webrtc_api,
         }
 
     def add_stream_proxy(self, app: str, stream: str, source_url: str) -> dict:

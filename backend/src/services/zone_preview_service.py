@@ -54,15 +54,15 @@ class FFmpegCapture:
                 "-rtsp_transport",
                 "tcp",
                 "-fflags",
-                "nobuffer+discardcorrupt",
+                "+genpts+discardcorrupt",
                 "-flags",
                 "low_delay",
                 "-max_delay",
                 "500000",
                 "-probesize",
-                "32",
+                "5M",
                 "-analyzeduration",
-                "0",
+                "1M",
             ])
         cmd.extend([
             "-i",

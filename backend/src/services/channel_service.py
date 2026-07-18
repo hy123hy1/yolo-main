@@ -113,8 +113,24 @@ class ChannelService:
             suffix = f"{suffix}#{parsed.fragment}"
 
         if parsed.scheme in {"http", "https"}:
+            known_media_hosts = {
+                "localhost",
+                "127.0.0.1",
+                "host.docker.internal",
+                "zlm-server",
+                urlparse(settings.ZLM_PLAY_BASE or "").hostname,
+                urlparse(settings.ZLM_API_BASE or "").hostname,
+                settings.ZLM_PUBLIC_HTTP_HOST,
+            }
+            if parsed.hostname not in {host for host in known_media_hosts if host}:
+                return value
             host = settings.ZLM_PUBLIC_HTTP_HOST or parsed.hostname or "localhost"
-            port = settings.ZLM_HTTPS_PORT if parsed.scheme == "https" else settings.ZLM_HTTP_PORT
+            configured_play = urlparse(settings.ZLM_PLAY_BASE or "")
+            port = (
+                configured_play.port
+                if configured_play.scheme == parsed.scheme and configured_play.port
+                else settings.ZLM_HTTPS_PORT if parsed.scheme == "https" else settings.ZLM_HTTP_PORT
+            )
             return f"{parsed.scheme}://{host}:{port}{suffix}"
         if parsed.scheme in {"webrtc", "webrtcs"}:
             host = settings.ZLM_PUBLIC_HTTP_HOST or parsed.hostname or "localhost"
@@ -149,20 +165,21 @@ class ChannelService:
     def _build_browser_play_url_map(self, urls: dict[str, str | None] | None) -> dict[str, str | None]:
         urls = urls or {}
         httpflv_url = (
-            self._normalize_public_browser_url(urls.get("browser_httpflv"))
+            urls.get("httpflv")
+            or self._normalize_public_browser_url(urls.get("browser_httpflv"))
             or self._normalize_public_browser_url(urls.get("browser_httpflv_url"))
-            or urls.get("httpflv")
         )
         return {
             "webrtc_api": (
-                self._normalize_public_browser_url(urls.get("browser_webrtc_api"))
+                urls.get("webrtc_api")
+                or self._normalize_public_browser_url(urls.get("browser_webrtc_api"))
                 or self._normalize_public_browser_url(urls.get("browser_webrtc_api_url"))
                 or urls.get("webrtc")
             ),
             "hls": (
-                self._normalize_public_browser_url(urls.get("browser_hls"))
+                urls.get("hls")
+                or self._normalize_public_browser_url(urls.get("browser_hls"))
                 or self._normalize_public_browser_url(urls.get("browser_hls_url"))
-                or urls.get("hls")
             ),
             "httpflv": httpflv_url,
             "flv": httpflv_url,
@@ -226,25 +243,24 @@ class ChannelService:
 
         preview_play_url = self._normalize_browser_play_url_map(preview_play_url)
         resolved = {
-            "webrtc_api": self._normalize_public_browser_url(channel.get("webrtc_api")) or dynamic_urls.get("webrtc_api"),
-            "hls": self._normalize_public_browser_url(channel.get("hls")) or dynamic_urls.get("hls"),
+            "webrtc_api": dynamic_urls.get("webrtc_api") or self._normalize_public_browser_url(channel.get("webrtc_api")),
+            "hls": dynamic_urls.get("hls") or self._normalize_public_browser_url(channel.get("hls")),
             "httpflv": dynamic_urls.get("httpflv"),
             "flv": dynamic_urls.get("flv") or dynamic_urls.get("httpflv"),
         }
 
         if isinstance(preview_play_url, dict):
-            resolved["webrtc_api"] = preview_play_url.get("webrtc_api") or resolved.get("webrtc_api")
-            resolved["hls"] = preview_play_url.get("hls") or resolved.get("hls")
+            resolved["webrtc_api"] = resolved.get("webrtc_api") or preview_play_url.get("webrtc_api")
+            resolved["hls"] = resolved.get("hls") or preview_play_url.get("hls")
             resolved["httpflv"] = (
-                preview_play_url.get("httpflv")
+                resolved.get("httpflv")
+                or preview_play_url.get("httpflv")
                 or preview_play_url.get("flv")
-                or resolved.get("httpflv")
             )
             resolved["flv"] = (
-                preview_play_url.get("flv")
+                resolved.get("flv")
+                or preview_play_url.get("flv")
                 or preview_play_url.get("httpflv")
-                or resolved.get("flv")
-                or resolved.get("httpflv")
             )
 
         if not resolved.get("httpflv") and resolved.get("flv"):
@@ -1025,7 +1041,7 @@ class ChannelService:
         payload["stream"] = row.stream
         payload["is_online"] = bool(row.is_online) or self._is_wvp_upstream_online(payload)
         payload["is_playing"] = row.is_playing
-        payload["ai_enabled"] = row.ai_enabled
+        payload["ai_enabled"] = bool(getattr(row, "ai_enabled", payload.get("ai_enabled", False)))
         payload["record_mode"] = row.record_mode
         payload["snapshot_url"] = row.snapshot_url
         payload["snapshot_path"] = row.snapshot_path

@@ -51,17 +51,6 @@ class UpdateZoneRequest(BaseModel):
     coordinates: Optional[list[list[float]]] = None
 
 
-class AIConfigRequest(BaseModel):
-    enabled: Optional[bool] = None
-    model_id: Optional[str] = None
-    labels: Optional[list[str]] = None
-    conf: Optional[float] = None
-    frame_interval: Optional[int] = None
-    zone_ids: Optional[list[str]] = None
-    save_snapshot: Optional[bool] = None
-    models: Optional[list[dict]] = None
-
-
 class StartZonePreviewRequest(BaseModel):
     task_id: Optional[str] = None
     owner_task_id: Optional[str] = None
@@ -240,57 +229,6 @@ async def delete_channel_zone(channel_id: str, zone_id: str):
     return result
 
 
-@router.get("/{channel_id}/ai-config")
-async def get_channel_ai_config(channel_id: str):
-    result = await channel_service.get_ai_config(channel_id)
-    if result is None:
-        raise HTTPException(404, "Channel not found")
-    return result
-
-
-@router.put("/{channel_id}/ai-config")
-async def update_channel_ai_config(channel_id: str, request: AIConfigRequest):
-    result = await channel_service.update_ai_config(channel_id, request)
-    if result is None:
-        raise HTTPException(404, "Channel not found")
-    return result
-
-
-@router.post("/{channel_id}/ai/start")
-async def start_channel_ai(channel_id: str):
-    result = await channel_service.start_ai(channel_id)
-    if result is None:
-        raise HTTPException(404, "Channel not found")
-    return result
-
-
-@router.post("/{channel_id}/ai/apply")
-async def apply_channel_ai(channel_id: str):
-    try:
-        result = await channel_service.apply_ai(channel_id)
-    except RuntimeError as exc:
-        raise HTTPException(409, str(exc))
-    if result is None:
-        raise HTTPException(404, "Channel not found")
-    return result
-
-
-@router.post("/{channel_id}/ai/stop")
-async def stop_channel_ai(channel_id: str):
-    result = await channel_service.stop_ai(channel_id)
-    if result is None:
-        raise HTTPException(404, "Channel not found")
-    return result
-
-
-@router.get("/{channel_id}/ai-status")
-async def get_channel_ai_status(channel_id: str):
-    result = await channel_service.get_ai_status(channel_id)
-    if result is None:
-        raise HTTPException(404, "Channel not found")
-    return result
-
-
 @router.post("/{channel_id}/zone-preview/start")
 async def start_channel_zone_preview(channel_id: str, request: Optional[StartZonePreviewRequest] = None):
     started_at = time.perf_counter()
@@ -389,12 +327,3 @@ async def get_channel_fence_browser_play_url(channel_id: str):
     return result
 
 
-@router.post("/{channel_id}/ai/debug-once")
-async def debug_channel_ai_once(channel_id: str):
-    try:
-        result = await channel_service.debug_ai_once(channel_id)
-        if result is None:
-            raise HTTPException(404, "Channel not found")
-        return result
-    except ValueError as e:
-        raise HTTPException(400, str(e))

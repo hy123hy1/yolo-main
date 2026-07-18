@@ -13,3 +13,5 @@ docker/backend/models/
 docker/frontend/dist/
 docker/zlm
 yolo-images.tar
+.tmp/
+yolo-backend2.tar

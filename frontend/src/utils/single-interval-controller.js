@@ -23,4 +23,4 @@ export const createSingleIntervalController = ({ schedule, clear }) => {
   }
 }
 
-export const shouldPollChannelAiStatus = (tabKey) => tabKey === 'manage'
+export const shouldPollTaskStatus = (tabKey) => tabKey === 'manage'

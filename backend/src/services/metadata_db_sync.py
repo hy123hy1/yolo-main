@@ -14,7 +14,6 @@ from src.db.database import SessionLocal, engine
 from src.db.models import (
     AlgorithmRegionMeta,
     Base,
-    ChannelAIConfigMeta,
     ChannelMeta,
     ChannelZoneMeta,
     DeviceMeta,
@@ -112,6 +111,15 @@ def _normalize_datetime_value(value):
     if isinstance(value, str):
         return _parse_dt(value)
     return value
+
+
+def _sanitize_channel_payload(payload: dict) -> dict:
+    sanitized = copy.deepcopy(payload)
+    sanitized.pop("ai_enabled", None)
+    ext = sanitized.get("ext")
+    if isinstance(ext, dict):
+        ext.pop("ai_config", None)
+    return sanitized
 
 
 def _rename_table(session: Session, source_table: str, target_table: str, dialect_name: str) -> None:
@@ -571,6 +579,7 @@ def _sync_media_node(session: Session, payload: dict) -> None:
 
 
 def _sync_channel(session: Session, payload: dict) -> None:
+    payload = _sanitize_channel_payload(payload)
     _upsert(
         session,
         ChannelMeta(
@@ -584,7 +593,6 @@ def _sync_channel(session: Session, payload: dict) -> None:
             stream=payload.get("stream"),
             is_online=payload.get("is_online"),
             is_playing=payload.get("is_playing"),
-            ai_enabled=payload.get("ai_enabled"),
             record_mode=payload.get("record_mode"),
             snapshot_url=payload.get("snapshot_url"),
             snapshot_path=payload.get("snapshot_path"),
@@ -612,23 +620,6 @@ def _sync_channel(session: Session, payload: dict) -> None:
                 raw_json=copy.deepcopy(zone),
             )
         )
-
-    config = payload.get("ext", {}).get("ai_config") or {}
-    _upsert(
-        session,
-        ChannelAIConfigMeta(
-            channel_id=payload["id"],
-            enabled=config.get("enabled"),
-            model_id=config.get("model_id"),
-            labels_json=copy.deepcopy(config.get("labels") or []),
-            conf=config.get("conf"),
-            frame_interval=config.get("frame_interval"),
-            zone_ids_json=copy.deepcopy(config.get("zone_ids") or []),
-            save_snapshot=config.get("save_snapshot"),
-            raw_json=copy.deepcopy(config),
-        ),
-    )
-
 
 def _sync_event(session: Session, payload: dict) -> None:
     _upsert(
@@ -901,7 +892,6 @@ def delete_json_document(path: Path, item_id: str | None) -> None:
 
     with SessionLocal() as session:
         if path.parent == settings.CHANNELS_DIR:
-            session.query(ChannelAIConfigMeta).filter(ChannelAIConfigMeta.channel_id == item_id).delete()
             session.query(ChannelZoneMeta).filter(ChannelZoneMeta.channel_id == item_id).delete()
             session.query(ChannelMeta).filter(ChannelMeta.id == item_id).delete()
         elif path.parent == settings.DEVICES_DIR:

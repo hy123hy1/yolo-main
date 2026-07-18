@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import copy
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -85,18 +86,19 @@ class WVPService:
     def _build_channel_item_from_row(self, row: ChannelMeta) -> dict[str, Any]:
         item = dict(row.raw_json or {})
         item.setdefault("id", row.id)
+        item.pop("ai_enabled", None)
         item["stream"] = row.stream
         item["source_url"] = row.source_url
         item["name"] = row.name
         item["type"] = row.type
         item["is_online"] = row.is_online
         item["is_playing"] = row.is_playing
-        item["ai_enabled"] = row.ai_enabled
         item["record_mode"] = row.record_mode
         item["snapshot_url"] = row.snapshot_url
         item["snapshot_path"] = row.snapshot_path
         item["media_node_id"] = row.media_node_id
         item.setdefault("ext", {})
+        item["ext"].pop("ai_config", None)
         return item
 
     def _list_existing_wvp_channels(self) -> list[dict[str, Any]]:
@@ -417,6 +419,53 @@ class WVPService:
                 return str(value), source_type
         return "", "unknown"
 
+    def _has_playable_source(self, play_info: dict[str, Any]) -> bool:
+        source_url, _ = self._pick_source_url(play_info)
+        return bool(source_url)
+
+    def _clear_offline_playback_fields(self, payload: dict[str, Any]) -> dict[str, Any]:
+        payload["source_url"] = None
+        payload["source_type"] = "unknown"
+        payload["stream"] = ""
+        payload["is_online"] = False
+        payload["is_playing"] = False
+        payload["webrtc_api"] = None
+        payload["hls"] = None
+        upstream = payload.setdefault("ext", {}).setdefault("upstream", {})
+        upstream["online"] = False
+        upstream["source_type"] = "unknown"
+        upstream["play_info"] = {}
+        return payload
+
+    def _is_remote_status_off(
+        self,
+        remote_item: dict[str, Any],
+        play_info: dict[str, Any] | None = None,
+    ) -> bool:
+        falsey_text = {"off", "offline", "false", "0", "no"}
+        media_info = (play_info or {}).get("mediaInfo") or {}
+        for source in [remote_item, play_info or {}, media_info]:
+            for key in ["gbStatus", "status", "online", "isOnline", "gbOnline"]:
+                value = source.get(key)
+                if value is False:
+                    return True
+                if isinstance(value, (int, float)) and value == 0:
+                    return True
+                if isinstance(value, str) and value.strip().lower() in falsey_text:
+                    return True
+        return False
+
+    def _get_play_info_safely(self, upstream_channel_id: str) -> dict[str, Any]:
+        try:
+            return self.get_play_info(upstream_channel_id)
+        except Exception as exc:
+            logger.warning(
+                "[WVPSync] play info probe failed channel_db_id=%s error=%s",
+                upstream_channel_id,
+                exc,
+            )
+            return {}
+
     def _extract_stream_id(self, play_info: dict[str, Any], existing: dict[str, Any] | None = None) -> str:
         media_info = play_info.get("mediaInfo") or {}
         return str(
@@ -427,11 +476,15 @@ class WVPService:
         ).strip()
 
     def _is_remote_online(self, remote_item: dict[str, Any], play_info: dict[str, Any]) -> bool:
+        if self._is_remote_status_off(remote_item, play_info):
+            return False
         media_info = play_info.get("mediaInfo") or {}
         truthy_text = {"on", "online", "true", "1", "yes"}
         status_values = [
             media_info.get("online"),
             media_info.get("status"),
+            play_info.get("online"),
+            play_info.get("status"),
             remote_item.get("online"),
             remote_item.get("isOnline"),
             remote_item.get("gbOnline"),
@@ -450,7 +503,10 @@ class WVPService:
     def _build_channel_payload(self, remote_item: dict[str, Any], play_info: dict[str, Any], existing: dict[str, Any] | None) -> dict[str, Any]:
         upstream_channel_id = self._extract_upstream_channel_id(remote_item)
         media_info = play_info.get("mediaInfo") or {}
-        online = self._is_remote_online(remote_item, play_info)
+        explicit_offline = self._is_remote_status_off(remote_item, play_info)
+        online = False if explicit_offline else (
+            self._is_remote_online(remote_item, play_info) or self._has_playable_source(play_info)
+        )
         effective_play_info = play_info if online else {}
         source_url, source_type = self._pick_source_url(effective_play_info)
         stream = self._extract_stream_id(effective_play_info, existing if online else None)
@@ -466,7 +522,7 @@ class WVPService:
         app = effective_play_info.get("app") or media_info.get("app") or (existing or {}).get("app") or "rtp"
         resolved_source_url = source_url or ((existing or {}).get("source_url") if online else None)
 
-        return {
+        payload = {
             "id": channel_id,
             "device_id": str(remote_item.get("deviceId") or remote_item.get("gbDeviceId") or remote_item.get("device_id") or "") or None,
             "name": channel_name,
@@ -476,8 +532,7 @@ class WVPService:
             "stream": stream,
             "media_node_id": (existing or {}).get("media_node_id"),
             "is_online": online,
-            "is_playing": bool((existing or {}).get("is_playing", False)),
-            "ai_enabled": bool((existing or {}).get("ai_enabled", False)),
+            "is_playing": bool((existing or {}).get("is_playing", False)) if online else False,
             "record_mode": (existing or {}).get("record_mode", "none"),
             "snapshot_url": (existing or {}).get("snapshot_url"),
             "snapshot_path": (existing or {}).get("snapshot_path"),
@@ -485,16 +540,6 @@ class WVPService:
             "updated_at": current_time,
             "ext": {
                 "zones": (((existing or {}).get("ext") or {}).get("zones") or []),
-                "ai_config": (((existing or {}).get("ext") or {}).get("ai_config") or {
-                    "enabled": False,
-                    "model_id": None,
-                    "labels": [],
-                    "conf": 0.25,
-                    "frame_interval": 10,
-                    "zone_ids": [],
-                    "save_snapshot": True,
-                    "models": [],
-                }),
                 "upstream": {
                     "platform": "wvp",
                     "channel_db_id": upstream_channel_id,
@@ -504,24 +549,122 @@ class WVPService:
                     "device_id": remote_item.get("deviceId") or remote_item.get("gbDeviceId") or remote_item.get("device_id"),
                     "play_info": effective_play_info,
                     "channel_info": remote_item,
+                    "missing_from_wvp": False,
                     "synced_at": current_time,
                 },
             },
         }
+        if not online:
+            payload = self._clear_offline_playback_fields(payload)
+        return payload
+
+    def _sync_result_can_cleanup_missing_channels(self, remote: dict[str, Any], page: int, query: str | None) -> bool:
+        if not remote.get("enabled", False):
+            return False
+        if query or page != 1:
+            return False
+        items = list(remote.get("items") or [])
+        try:
+            total = int(remote.get("total", len(items)) or 0)
+        except (TypeError, ValueError):
+            total = len(items)
+        return len(items) >= total
+
+    def _mark_wvp_channel_missing_offline(self, item: dict[str, Any]) -> dict[str, Any]:
+        payload = copy.deepcopy(item)
+        current_time = now_iso()
+        payload = self._clear_offline_playback_fields(payload)
+        payload["updated_at"] = current_time
+        upstream = payload.setdefault("ext", {}).setdefault("upstream", {})
+        upstream["missing_from_wvp"] = True
+        upstream["synced_at"] = current_time
+        save_json(self.channels_dir / f"{payload['id']}.json", payload)
+        return payload
+
+    def _cleanup_missing_wvp_channels(
+        self,
+        existing_items: list[dict[str, Any]],
+        remote_upstream_channel_ids: set[str],
+        synced_channel_ids: set[str],
+    ) -> dict[str, int]:
+        existing_ids = {
+            str(item.get("id") or "").strip()
+            for item in existing_items
+            if str(item.get("id") or "").strip()
+        }
+        bound_channel_ids = self._find_bound_channel_ids(existing_ids)
+        deleted = 0
+        marked_offline = 0
+
+        for item in existing_items:
+            channel_id = str(item.get("id") or "").strip()
+            if not channel_id or channel_id in synced_channel_ids:
+                continue
+
+            upstream = ((item.get("ext") or {}).get("upstream") or {})
+            if upstream.get("platform") != "wvp":
+                continue
+
+            upstream_channel_id = str(upstream.get("channel_db_id") or "").strip()
+            if upstream_channel_id and upstream_channel_id in remote_upstream_channel_ids:
+                continue
+
+            channel_path = self.channels_dir / f"{channel_id}.json"
+            if channel_id in bound_channel_ids:
+                self._mark_wvp_channel_missing_offline(item)
+                marked_offline += 1
+                continue
+
+            channel_path.unlink(missing_ok=True)
+            delete_json_document(channel_path, channel_id)
+            deleted += 1
+
+        return {
+            "deleted": deleted,
+            "marked_offline": marked_offline,
+        }
+
+    def _is_missing_play_source(self, item: dict[str, Any] | None) -> bool:
+        if not item:
+            return True
+        return not str(item.get("source_url") or "").strip() or not str(item.get("stream") or "").strip()
+
+    def _should_hydrate_play_info(
+        self,
+        remote_item: dict[str, Any],
+        existing: dict[str, Any] | None,
+        play_info: dict[str, Any],
+    ) -> bool:
+        if play_info:
+            return False
+        if self._is_remote_status_off(remote_item):
+            return True
+        if not self._is_remote_online(remote_item, {}):
+            return False
+        return self._is_missing_play_source(existing)
 
     def sync_channels(self, page: int = 1, count: int = 100, query: str | None = None) -> dict[str, Any]:
         remote = self.list_remote_channels(page=page, count=count, query=query)
         synced_items: list[dict[str, Any]] = []
         existing_wvp_channels = self._list_existing_wvp_channels()
+        original_existing_wvp_channels = list(existing_wvp_channels)
+        remote_items = list(remote.get("items") or [])
+        remote_upstream_channel_ids: set[str] = set()
+        synced_channel_ids: set[str] = set()
         bound_existing_channel_ids = self._find_bound_channel_ids(
             {str(item.get("id") or "").strip() for item in existing_wvp_channels}
         )
 
-        for remote_item in list(remote.get("items") or []):
+        for remote_item in remote_items:
             upstream_channel_id = self._extract_upstream_channel_id(remote_item)
             if not upstream_channel_id:
                 continue
-            play_info: dict[str, Any] = {}
+            remote_upstream_channel_ids.add(str(upstream_channel_id).strip())
+            play_info: dict[str, Any] = (
+                self._get_play_info_safely(upstream_channel_id)
+                if self._is_remote_status_off(remote_item)
+                else {}
+            )
             stream_id = self._extract_stream_id(play_info)
             device_id = str(
                 remote_item.get("deviceId")
@@ -549,6 +692,25 @@ class WVPService:
             }
             existing = self._select_canonical_existing_channel(candidates, stream_id, bound_channel_ids)
             existing = self._merge_existing_candidate_data(existing, candidates)
+            if self._should_hydrate_play_info(remote_item, existing, play_info):
+                play_info = self._get_play_info_safely(upstream_channel_id)
+                hydrated_stream_id = self._extract_stream_id(play_info)
+                if hydrated_stream_id and hydrated_stream_id != stream_id:
+                    stream_id = hydrated_stream_id
+                    candidates = self._find_existing_wvp_candidates(
+                        stream_id,
+                        upstream_channel_id,
+                        device_id,
+                        channel_name,
+                        existing_wvp_channels,
+                    )
+                    bound_channel_ids = {
+                        str(item.get("id") or "").strip()
+                        for item in candidates
+                        if str(item.get("id") or "").strip() in bound_existing_channel_ids
+                    }
+                    existing = self._select_canonical_existing_channel(candidates, stream_id, bound_channel_ids)
+                    existing = self._merge_existing_candidate_data(existing, candidates)
             payload = self._build_channel_payload(remote_item, play_info, existing)
             rebound_channel_ids = self._rebind_duplicate_channel_references(
                 payload["id"],
@@ -560,6 +722,7 @@ class WVPService:
             protected_channel_ids = bound_channel_ids - rebound_channel_ids
             self._delete_duplicate_channels(candidates, payload["id"], protected_channel_ids)
             synced_items.append(payload)
+            synced_channel_ids.add(str(payload["id"]).strip())
             existing_wvp_channels = [
                 item
                 for item in existing_wvp_channels
@@ -567,11 +730,20 @@ class WVPService:
             ]
             existing_wvp_channels.append(payload)
 
+        missing_cleanup = {"deleted": 0, "marked_offline": 0}
+        if self._sync_result_can_cleanup_missing_channels(remote, page, query):
+            missing_cleanup = self._cleanup_missing_wvp_channels(
+                original_existing_wvp_channels,
+                remote_upstream_channel_ids,
+                synced_channel_ids,
+            )
+
         return {
             "enabled": remote.get("enabled", False),
             "synced": len(synced_items),
             "total": remote.get("total", len(synced_items)),
             "items": synced_items,
+            "missing_cleanup": missing_cleanup,
         }
 
     def refresh_channel_source(self, channel: dict[str, Any]) -> dict[str, Any]:
@@ -584,23 +756,30 @@ class WVPService:
             return channel
 
         play_info = self.get_play_info(upstream_channel_id)
-        if not play_info:
-            return channel
+        explicit_offline = (
+            not play_info
+            or self._is_remote_status_off(upstream.get("channel_info") or {}, play_info)
+        )
 
-        source_url, source_type = self._pick_source_url(play_info)
+        effective_play_info = {} if explicit_offline else play_info
+        source_url, source_type = self._pick_source_url(effective_play_info)
         media_info = play_info.get("mediaInfo") or {}
         current_time = now_iso()
         refreshed = dict(channel)
-        refreshed["source_url"] = source_url or refreshed.get("source_url")
+        refreshed["source_url"] = source_url or (refreshed.get("source_url") if not explicit_offline else None)
         refreshed["source_type"] = source_type
-        refreshed["app"] = play_info.get("app") or media_info.get("app") or refreshed.get("app")
-        refreshed["stream"] = play_info.get("stream") or media_info.get("stream") or refreshed.get("stream")
-        refreshed["is_online"] = self._is_remote_online(upstream.get("channel_info") or {}, play_info) or bool(refreshed.get("is_online"))
+        refreshed["app"] = effective_play_info.get("app") or media_info.get("app") or refreshed.get("app")
+        refreshed["stream"] = effective_play_info.get("stream") or media_info.get("stream") or (refreshed.get("stream") if not explicit_offline else "")
+        refreshed["is_online"] = False if explicit_offline else (
+            self._is_remote_online(upstream.get("channel_info") or {}, play_info) or self._has_playable_source(play_info)
+        )
+        if not refreshed["is_online"]:
+            refreshed = self._clear_offline_playback_fields(refreshed)
         refreshed["updated_at"] = current_time
         refreshed.setdefault("ext", {}).setdefault("upstream", {}).update({
             "source_type": source_type,
             "online": refreshed.get("is_online"),
-            "play_info": play_info,
+            "play_info": effective_play_info if refreshed.get("is_online") else {},
             "synced_at": current_time,
         })
         save_json(self.channels_dir / f"{refreshed['id']}.json", refreshed)

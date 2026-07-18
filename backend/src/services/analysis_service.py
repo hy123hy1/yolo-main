@@ -27,6 +27,7 @@ from src.services.zone_preview_service import FFmpegCapture
 
 
 logger = logging.getLogger(__name__)
+runtime_logger = logging.getLogger("uvicorn.error")
 
 DETECTION_RULE_TYPES = {
     "detection",
@@ -39,6 +40,8 @@ DETECTION_RULE_TYPES = {
 }
 
 TASK_ANALYSIS_READ_FAIL_LIMIT = 10
+# Temporary task-scoped detection logging for live debugging.
+TASK_DETECTION_DEBUG_IDS = {"8a89a58b"}
 
 
 class AnalysisService:
@@ -83,6 +86,12 @@ class AnalysisService:
 
     def _task_analysis_startup_warmup_seconds(self) -> float:
         return max(float(getattr(settings, "TASK_ANALYSIS_STARTUP_WARMUP_SECONDS", 5.0) or 0.0), 0.0)
+
+    def _task_config_refresh_interval_seconds(self) -> float:
+        return max(float(getattr(settings, "TASK_ANALYSIS_CONFIG_REFRESH_INTERVAL_SECONDS", 1.0) or 0.0), 0.0)
+
+    def _task_runtime_heartbeat_interval_seconds(self) -> float:
+        return max(float(getattr(settings, "TASK_ANALYSIS_RUNTIME_HEARTBEAT_SECONDS", 1.0) or 0.0), 0.0)
 
     def _task_inference_worker_count(self) -> int:
         configured = int(getattr(settings, "TASK_ANALYSIS_ALGORITHM_MAX_CONCURRENCY", 0) or 0)
@@ -139,11 +148,13 @@ class AnalysisService:
             gray = cv2.cvtColor(decoded, cv2.COLOR_BGR2GRAY)
         stddev = float(np.std(gray))
         dynamic_range = int(gray.max()) - int(gray.min())
+        percentile_low, percentile_high = np.percentile(gray, (1.0, 99.0))
+        robust_range = float(percentile_high - percentile_low)
         mean_value = float(np.mean(gray))
         near_mean_ratio = float(np.mean(np.abs(gray.astype(np.float32) - mean_value) <= 4.0))
         if stddev < 6.0 and dynamic_range < 24:
             return False
-        if stddev < 8.0 and dynamic_range < 32 and near_mean_ratio > 0.98:
+        if stddev < 8.0 and robust_range < 16.0 and near_mean_ratio > 0.98:
             return False
         return True
 
@@ -200,7 +211,6 @@ class AnalysisService:
                 payload["stream"] = row.stream
                 payload["is_online"] = row.is_online
                 payload["is_playing"] = row.is_playing
-                payload["ai_enabled"] = row.ai_enabled
                 payload["record_mode"] = row.record_mode
                 payload["snapshot_url"] = row.snapshot_url
                 payload["snapshot_path"] = row.snapshot_path
@@ -209,6 +219,8 @@ class AnalysisService:
                 payload["created_at"] = format_datetime(row.created_at)
                 payload["updated_at"] = format_datetime(row.updated_at)
                 payload.setdefault("ext", {})
+                payload.pop("ai_enabled", None)
+                payload["ext"].pop("ai_config", None)
                 return payload
 
         path = self._get_channel_path(channel_id)
@@ -234,12 +246,14 @@ class AnalysisService:
                 payload["stream"] = row.stream
                 payload["is_online"] = row.is_online
                 payload["is_playing"] = row.is_playing
-                payload["ai_enabled"] = row.ai_enabled
                 payload["record_mode"] = row.record_mode
                 payload["snapshot_url"] = row.snapshot_url
                 payload["snapshot_path"] = row.snapshot_path
                 payload["webrtc_api"] = row.webrtc_api
                 payload["hls"] = row.hls
+                payload.pop("ai_enabled", None)
+                payload.setdefault("ext", {})
+                payload["ext"].pop("ai_config", None)
                 row.updated_at = self._parse_runtime_dt(channel.get("updated_at")) or datetime.now()
                 row.raw_json = payload
                 session.commit()
@@ -409,48 +423,108 @@ class AnalysisService:
         }
 
     def _load_task(self, task_id: str) -> dict | None:
-        task = self._load_task_from_metadata(task_id)
+        metadata_failed = False
+        try:
+            task = self._load_task_from_metadata(task_id)
+        except Exception:
+            if settings.METADATA_DB_STRICT:
+                raise
+            metadata_failed = True
+            logger.exception(
+                "Failed to load task from metadata DB, falling back to JSON cache: task_id=%s",
+                task_id,
+            )
+            task = None
         if task:
             return task
-        if settings.METADATA_DB_ENABLED:
+        if settings.METADATA_DB_ENABLED and not metadata_failed:
             return None
         path = self._get_task_path(task_id)
-        if path.exists():
+        if not path.exists():
+            return None
+        try:
             return load_json(path)
-        return None
+        except Exception:
+            logger.exception("Failed to load task JSON cache: task_id=%s path=%s", task_id, path)
+            return None
 
     def _save_task(self, task: dict) -> None:
         task["updated_at"] = now_iso()
-        if settings.METADATA_DB_ENABLED:
-            return
         save_json(self._get_task_path(task["id"]), task, sync_metadata=False)
 
     def _probe_task_stream(self, source_url: str) -> tuple[int, int]:
-        cap = cv2.VideoCapture(source_url)
-        if not cap.isOpened():
-            raise ValueError("Failed to open task source for AI analysis")
+        ffmpeg_bin = str(getattr(settings, "FFMPEG_BIN", "ffmpeg") or "ffmpeg")
+        ffmpeg_path = Path(ffmpeg_bin)
+        ffprobe_name = "ffprobe.exe" if ffmpeg_path.suffix.lower() == ".exe" else "ffprobe"
+        ffprobe_bin = str(ffmpeg_path.with_name(ffprobe_name))
+        command = [
+            ffprobe_bin,
+            "-v",
+            "error",
+        ]
+        if str(source_url).lower().startswith("rtsp://"):
+            command.extend([
+                "-rtsp_transport",
+                "tcp",
+                "-rw_timeout",
+                "5000000",
+            ])
+        command.extend([
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=width,height",
+            "-of",
+            "json",
+            source_url,
+        ])
 
-        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
-        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+        try:
+            result = subprocess.run(
+                command,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise ValueError(f"Failed to probe task source with FFmpeg: {exc}") from exc
 
+        if result.returncode != 0:
+            detail = (result.stderr or "").strip()
+            raise ValueError(f"Failed to probe task source with FFmpeg: {detail or 'ffprobe exited with an error'}")
+
+        try:
+            payload = json.loads(result.stdout or "{}")
+        except json.JSONDecodeError as exc:
+            raise ValueError("Failed to parse FFmpeg task source probe output") from exc
+
+        streams = payload.get("streams") or []
+        if not streams:
+            raise ValueError("Task source has no video stream")
+        stream = streams[0]
+        width = int(stream.get("width") or 0)
+        height = int(stream.get("height") or 0)
         if width <= 0 or height <= 0:
-            ok, frame = cap.read()
-            if not ok or frame is None:
-                cap.release()
-                raise ValueError("Failed to read initial task frame for AI analysis")
-            height, width = frame.shape[:2]
-
-        cap.release()
+            raise ValueError("FFmpeg task source probe returned invalid video dimensions")
         return width, height
 
     def _build_task_capture(self, source_url: str):
-        if str(source_url).lower().startswith("rtsp://"):
-            width, height = self._probe_task_stream(source_url)
-            return FFmpegCapture(source_url, width, height, init_wait=0.3)
-        cap = cv2.VideoCapture(source_url)
-        if not cap.isOpened():
-            raise ValueError("Failed to open task source for AI analysis")
-        return cap
+        width, height = self._probe_task_stream(source_url)
+        return FFmpegCapture(source_url, width, height, init_wait=0.3)
+
+    def _log_task_capture_debug(self, task: dict, source_url: str, capture) -> None:
+        if not self._should_log_task_detections(task):
+            return
+        payload = {
+            "task_id": str(task.get("id") or ""),
+            "task_name": str(task.get("name") or ""),
+            "backend": "ffmpeg",
+            "source_type": str(task.get("source_type") or ""),
+            "width": int(getattr(capture, "width", 0) or 0),
+            "height": int(getattr(capture, "height", 0) or 0),
+        }
+        runtime_logger.warning("[TaskCaptureDebug] %s", json.dumps(payload, ensure_ascii=False))
 
     @staticmethod
     def _read_task_frame(capture) -> tuple[bool, Any]:
@@ -466,46 +540,6 @@ class AnalysisService:
             capture.release()
         except Exception:
             pass
-
-    def _update_runtime(
-        self,
-        channel_id: str,
-        *,
-        status: str | None = None,
-        last_error: str | None = None,
-        last_event_at: str | None = None,
-        last_analysis_at: str | None = None,
-        started_at: str | None = None,
-        stopped_at: str | None = None,
-        frame_count: int | None = None,
-        event_count: int | None = None,
-        clear_error: bool = False,
-    ) -> None:
-        channel = self._load_channel(channel_id)
-        if not channel:
-            return
-
-        runtime = channel.setdefault("ext", {}).setdefault("ai_runtime", {})
-        if status is not None:
-            runtime["status"] = status
-        if clear_error:
-            runtime["last_error"] = None
-        elif last_error is not None:
-            runtime["last_error"] = last_error
-        if last_event_at is not None:
-            runtime["last_event_at"] = last_event_at
-        if last_analysis_at is not None:
-            runtime["last_analysis_at"] = last_analysis_at
-        if started_at is not None:
-            runtime["started_at"] = started_at
-        if stopped_at is not None:
-            runtime["stopped_at"] = stopped_at
-        if frame_count is not None:
-            runtime["frame_count"] = frame_count
-        if event_count is not None:
-            runtime["event_count"] = event_count
-
-        self._save_channel(channel)
 
     def _update_task_runtime(
         self,
@@ -550,19 +584,27 @@ class AnalysisService:
             runtime["models"] = models
         runtime["is_running"] = runtime.get("status") in {"running", "starting", "restarting"}
         self._save_task(task)
-        with SessionLocal() as session:
-            row = session.query(TaskMeta).filter(TaskMeta.id == task_id).one_or_none()
-            if row:
-                row.status = runtime.get("status") or task.get("status") or "stopped"
-                row.is_running = bool(runtime.get("is_running"))
-                row.started_at = self._parse_runtime_dt(runtime.get("started_at"))
-                row.stopped_at = self._parse_runtime_dt(runtime.get("stopped_at"))
-                row.last_analysis_at = self._parse_runtime_dt(runtime.get("last_analysis_at"))
-                row.last_event_at = self._parse_runtime_dt(runtime.get("last_event_at"))
-                row.last_error = runtime.get("last_error")
-                row.updated_at = self._parse_runtime_dt(task.get("updated_at")) or datetime.now()
-                row.raw_json = dict(task)
-                session.commit()
+        try:
+            with SessionLocal() as session:
+                row = session.query(TaskMeta).filter(TaskMeta.id == task_id).one_or_none()
+                if row:
+                    row.status = runtime.get("status") or task.get("status") or "stopped"
+                    row.is_running = bool(runtime.get("is_running"))
+                    row.started_at = self._parse_runtime_dt(runtime.get("started_at"))
+                    row.stopped_at = self._parse_runtime_dt(runtime.get("stopped_at"))
+                    row.last_analysis_at = self._parse_runtime_dt(runtime.get("last_analysis_at"))
+                    row.last_event_at = self._parse_runtime_dt(runtime.get("last_event_at"))
+                    row.last_error = runtime.get("last_error")
+                    row.updated_at = self._parse_runtime_dt(task.get("updated_at")) or datetime.now()
+                    row.raw_json = dict(task)
+                    session.commit()
+        except Exception:
+            if settings.METADATA_DB_STRICT:
+                raise
+            logger.exception(
+                "Failed to persist task runtime to metadata DB, kept JSON cache: task_id=%s",
+                task_id,
+            )
 
     def _parse_runtime_dt(self, value: str | None):
         if not value or not isinstance(value, str):
@@ -696,7 +738,7 @@ class AnalysisService:
         return False
 
     def _filter_detections_by_zones(self, detections: list[dict], channel: dict) -> list[dict]:
-        config = channel.get("ext", {}).get("ai_config", {})
+        config = channel.get("ext", {}).get("detection_scope", {})
         zone_ids = config.get("zone_ids") or []
         if not zone_ids:
             return detections
@@ -720,7 +762,7 @@ class AnalysisService:
         return filtered
 
     def _filter_detections_by_labels(self, detections: list[dict], channel: dict) -> list[dict]:
-        config = channel.get("ext", {}).get("ai_config", {})
+        config = channel.get("ext", {}).get("detection_scope", {})
         if config.get("detect_all_classes"):
             return detections
         labels = config.get("labels") or []
@@ -734,26 +776,12 @@ class AnalysisService:
             if str(detection.get("class_name", "")) in label_set
         ]
 
-    def _build_scoped_channel(self, channel: dict, model_config: dict) -> dict:
-        return {
-            **channel,
-            "ext": {
-                **channel.get("ext", {}),
-                "ai_config": {
-                    **channel.get("ext", {}).get("ai_config", {}),
-                    "labels": model_config.get("labels") or [],
-                    "detect_all_classes": bool(model_config.get("detect_all_classes", False)),
-                    "zone_ids": model_config.get("zone_ids") or [],
-                },
-            },
-        }
-
     def _build_scoped_task(self, task: dict, algorithm: dict) -> dict:
         scoped_zones = list(algorithm.get("regions") or [])
         return {
             **task,
             "ext": {
-                "ai_config": {
+                "detection_scope": {
                     "labels": algorithm.get("labels") or [],
                     "detect_all_classes": bool(algorithm.get("detect_all_classes", False)),
                     "zone_ids": [
@@ -772,51 +800,6 @@ class AnalysisService:
     #         for detection in detections
     #         if detection.get("class_name") is not None
     #     })
-
-    def _normalize_model_configs(self, channel: dict) -> list[dict]:
-        ai_config = channel.get("ext", {}).get("ai_config", {}) or {}
-        models = ai_config.get("models")
-        normalized: list[dict] = []
-        if isinstance(models, list) and models:
-            for item in models:
-                if not isinstance(item, dict):
-                    continue
-                model_id = item.get("model_id")
-                if not model_id:
-                    continue
-                normalized.append({
-                    "model_id": model_id,
-                    "enabled": bool(item.get("enabled", True)),
-                    "labels": list(item.get("labels") or []),
-                    "detect_all_classes": bool(item.get("detect_all_classes", not list(item.get("labels") or []))),
-                    "conf": float(item.get("conf", ai_config.get("conf", 0.25)) or 0.25),
-                    "frame_interval": max(int(item.get("frame_interval", ai_config.get("frame_interval", 10)) or 10), 1),
-                    "alert_interval": max(int(item.get("alert_interval", ai_config.get("alert_interval", 60)) or 60), 0),
-                    "zone_ids": list(item.get("zone_ids") or []),
-                    "save_snapshot": bool(item.get("save_snapshot", ai_config.get("save_snapshot", True))),
-                })
-            return normalized
-
-        model_id = ai_config.get("model_id")
-        if model_id:
-            normalized.append({
-                "model_id": model_id,
-                "enabled": bool(ai_config.get("enabled")),
-                "labels": list(ai_config.get("labels") or []),
-                "detect_all_classes": bool(ai_config.get("detect_all_classes", not list(ai_config.get("labels") or []))),
-                "conf": float(ai_config.get("conf", 0.25) or 0.25),
-                "frame_interval": max(int(ai_config.get("frame_interval", 10) or 10), 1),
-                "alert_interval": max(int(ai_config.get("alert_interval", 60) or 60), 0),
-                "zone_ids": list(ai_config.get("zone_ids") or []),
-                "save_snapshot": bool(ai_config.get("save_snapshot", True)),
-            })
-        return normalized
-
-    def _apply_model_scoped_filters(self, detections: list[dict], channel: dict, model_config: dict) -> list[dict]:
-        scoped_channel = self._build_scoped_channel(channel, model_config)
-        detections = self._filter_detections_by_labels(detections, scoped_channel)
-        detections = self._filter_detections_by_zones(detections, scoped_channel)
-        return detections
 
     def _apply_algorithm_scoped_filters(self, detections: list[dict], task: dict, algorithm: dict) -> list[dict]:
         scoped_task = self._build_scoped_task(task, algorithm)
@@ -861,23 +844,9 @@ class AnalysisService:
 
     def _active_model_ids(self) -> set[str]:
         with self._lock:
-            channel_ids = list(self._workers.keys())
             task_ids = list(self._task_workers.keys())
 
         active_model_ids: set[str] = set()
-        for channel_id in channel_ids:
-            try:
-                channel = self._load_channel(channel_id)
-                if not channel:
-                    continue
-                active_model_ids.update(
-                    str(item["model_id"])
-                    for item in self._normalize_model_configs(channel)
-                    if item.get("enabled") and item.get("model_id")
-                )
-            except Exception:
-                logger.exception("Failed to collect active channel model ids: %s", channel_id)
-
         for task_id in task_ids:
             try:
                 task = self._load_task(task_id)
@@ -972,6 +941,52 @@ class AnalysisService:
         if conf is None:
             return class_name
         return f"{class_name} {float(conf):.2f}"
+
+    @staticmethod
+    def _serialize_debug_detection(detection: dict) -> dict[str, Any]:
+        bbox = [
+            round(float(detection.get(key) or 0.0), 1)
+            for key in ("x1", "y1", "x2", "y2")
+        ]
+        return {
+            "label": str(detection.get("class_name") or "unknown"),
+            "confidence": round(float(detection.get("conf") or 0.0), 3),
+            "bbox": bbox,
+            "zone_id": detection.get("zone_id"),
+        }
+
+    def _should_log_task_detections(self, task: dict) -> bool:
+        task_id = str(task.get("id") or "")
+        return task_id in TASK_DETECTION_DEBUG_IDS
+
+    def _log_task_detection_debug(
+        self,
+        *,
+        task: dict,
+        algorithm: dict,
+        frame_count: int,
+        stage: str,
+        detections: list[dict],
+        extra: dict[str, Any] | None = None,
+    ) -> None:
+        if not self._should_log_task_detections(task):
+            return
+        payload = {
+            "task_id": str(task.get("id") or ""),
+            "task_name": str(task.get("name") or ""),
+            "algorithm_id": str(algorithm.get("id") or ""),
+            "scene_key": str(algorithm.get("scene_key") or ""),
+            "frame": frame_count,
+            "stage": stage,
+            "count": len(detections),
+            "detections": [
+                self._serialize_debug_detection(detection)
+                for detection in detections
+            ],
+        }
+        if extra:
+            payload.update(extra)
+        runtime_logger.warning("[TaskDetectionDebug] %s", json.dumps(payload, ensure_ascii=False))
 
     @staticmethod
     def _zone_color_bgr(zone: dict | None) -> tuple[int, int, int]:
@@ -1164,6 +1179,48 @@ class AnalysisService:
             return now_iso()
         return datetime.fromtimestamp(ts).isoformat()
 
+    def _detect_alarm_video_frames(
+        self,
+        *,
+        task_id: str,
+        algorithm: dict,
+        model_id: str,
+        frames: list[tuple[float, object]],
+    ) -> list[list[dict]]:
+        detections_by_frame: list[list[dict]] = []
+        try:
+            model, model_meta = self._load_model(model_id)
+        except Exception:
+            logger.exception(
+                "Failed to load model for alarm video redetection: task=%s model=%s",
+                task_id,
+                model_id,
+            )
+            return [[] for _ in frames]
+
+        task = {"id": task_id}
+        confidence = float(algorithm.get("confidence", 0.25) or 0.25)
+        for _, frame in frames:
+            try:
+                decoded = self._decode_alarm_video_frame(frame)
+                raw_detections = self._detect_frame(
+                    model,
+                    model_meta,
+                    decoded,
+                    confidence,
+                )
+                detections_by_frame.append(
+                    self._apply_algorithm_scoped_filters(raw_detections, task, algorithm)
+                )
+            except Exception:
+                logger.exception(
+                    "Alarm video frame redetection failed: task=%s model=%s",
+                    task_id,
+                    model_id,
+                )
+                detections_by_frame.append([])
+        return detections_by_frame
+
     def _save_alarm_video(
         self,
         channel_id: str,
@@ -1171,6 +1228,10 @@ class AnalysisService:
         frames: list[object],
         detections: list[dict] | None = None,
         fps: float = 25.0,
+        event_timestamp: float | None = None,
+        task_id: str | None = None,
+        algorithm: dict | None = None,
+        model_id: str | None = None,
     ) -> str | None:
         if not frames:
             return None
@@ -1190,6 +1251,16 @@ class AnalysisService:
 
         first_frame = self._decode_alarm_video_frame(frames[0][1])
         height, width = first_frame.shape[:2]
+        frame_detections = (
+            self._detect_alarm_video_frames(
+                task_id=task_id,
+                algorithm=algorithm,
+                model_id=model_id,
+                frames=frames,
+            )
+            if task_id and algorithm and model_id
+            else None
+        )
         writer = cv2.VideoWriter(
             str(temp_output_path),
             cv2.VideoWriter_fourcc(*"mp4v"),
@@ -1197,8 +1268,19 @@ class AnalysisService:
             (width, height),
         )
         try:
-            for _, frame in frames:
-                writer.write(self._prepare_alarm_video_frame(frame, detections))
+            for index, (_, frame) in enumerate(frames):
+                current_detections = (
+                    frame_detections[index]
+                    if frame_detections is not None
+                    else detections
+                )
+                writer.write(
+                    self._prepare_alarm_video_frame(
+                        frame,
+                        current_detections,
+                        draw_detection=bool(current_detections),
+                    )
+                )
         finally:
             writer.release()
 
@@ -1235,8 +1317,17 @@ class AnalysisService:
                 temp_output_path.replace(output_path)
         return str(output_path.resolve())
 
-    def _prepare_alarm_video_frame(self, frame, detections: list[dict] | None = None):
-        return self._decode_alarm_video_frame(frame)
+    def _prepare_alarm_video_frame(
+        self,
+        frame,
+        detections: list[dict] | None = None,
+        *,
+        draw_detection: bool = False,
+    ):
+        decoded = self._decode_alarm_video_frame(frame)
+        if not draw_detection:
+            return decoded
+        return self._annotate_frame(decoded, detections)
 
     def _build_alarm_video_frames(
         self,
@@ -1324,19 +1415,40 @@ class AnalysisService:
                 eligible.append(algorithm)
         return eligible
 
-    def _run_task_algorithm_inference(self, *, task: dict, algorithm: dict, frame) -> dict[str, Any]:
+    def _run_task_algorithm_inference(self, *, task: dict, algorithm: dict, frame, frame_count: int) -> dict[str, Any]:
         model_id = algorithm["model_id"]
         algorithm_id = algorithm.get("id")
         rule_type = str(algorithm.get("rule_type") or algorithm.get("algorithm_type") or "detection").lower()
         try:
             model, model_meta = self._load_model(model_id)
-            detections = self._detect_frame(
+            raw_detections = self._detect_frame(
                 model,
                 model_meta,
                 frame,
                 float(algorithm.get("confidence", 0.25) or 0.25),
             )
-            detections = self._apply_algorithm_scoped_filters(detections, task, algorithm)
+            self._log_task_detection_debug(
+                task=task,
+                algorithm=algorithm,
+                frame_count=frame_count,
+                stage="raw",
+                detections=raw_detections,
+                extra={
+                    "confidence_threshold": float(algorithm.get("confidence", 0.25) or 0.25),
+                },
+            )
+            detections = self._apply_algorithm_scoped_filters(raw_detections, task, algorithm)
+            self._log_task_detection_debug(
+                task=task,
+                algorithm=algorithm,
+                frame_count=frame_count,
+                stage="filtered",
+                detections=detections,
+                extra={
+                    "confidence_threshold": float(algorithm.get("confidence", 0.25) or 0.25),
+                    "region_ids": list(algorithm.get("region_ids") or []),
+                },
+            )
             return {
                 "algorithm": algorithm,
                 "algorithm_id": algorithm_id,
@@ -1378,6 +1490,7 @@ class AnalysisService:
                     task=task,
                     algorithm=eligible_algorithms[0],
                     frame=frame,
+                    frame_count=frame_count,
                 )
             ]
 
@@ -1389,6 +1502,7 @@ class AnalysisService:
                     task=task,
                     algorithm=algorithm,
                     frame=frame,
+                    frame_count=frame_count,
                 ),
             )
             for index, algorithm in enumerate(eligible_algorithms)
@@ -1444,16 +1558,19 @@ class AnalysisService:
         detection: dict,
         snapshot_path: str | None,
         before_frames: list[tuple[float, object]],
+        after_frames: list[tuple[float, object]] | None = None,
         fps: float,
         before_seconds: int,
         after_seconds: int,
+        event_timestamp: float | None = None,
     ) -> None:
-        after_frame_limit = max(int(round(max(fps, 1.0) * max(after_seconds, 0))), 0)
-        after_frames = self._collect_task_alarm_after_frames(
-            source_url=source_url,
-            after_frame_limit=after_frame_limit,
-            after_seconds=after_seconds,
-        )
+        if after_frames is None:
+            after_frame_limit = max(int(round(max(fps, 1.0) * max(after_seconds, 0))), 0)
+            after_frames = self._collect_task_alarm_after_frames(
+                source_url=source_url,
+                after_frame_limit=after_frame_limit,
+                after_seconds=after_seconds,
+            )
         video_frames = self._build_alarm_video_frames(
             before_frames=before_frames,
             after_frames=after_frames,
@@ -1465,7 +1582,17 @@ class AnalysisService:
             logger.warning("Skip empty task alarm video: task=%s event=%s", task_id, event["id"])
             return
 
-        video_path = self._save_alarm_video(task_id, event["id"], video_frames, [detection], fps=fps)
+        video_path = self._save_alarm_video(
+            task_id,
+            event["id"],
+            video_frames,
+            [detection],
+            fps=fps,
+            event_timestamp=event_timestamp,
+            task_id=task_id,
+            algorithm=algorithm,
+            model_id=model_id,
+        )
         if not video_path:
             logger.warning("Failed to save task alarm video: task=%s event=%s", task_id, event["id"])
             return
@@ -1501,24 +1628,32 @@ class AnalysisService:
         detection: dict,
         snapshot_path: str | None,
         before_frames: list[tuple[float, object]],
+        after_frames: list[tuple[float, object]] | None = None,
         fps: float,
         before_seconds: int,
         after_seconds: int,
+        event_timestamp: float | None = None,
     ) -> None:
+        finalize_kwargs = {
+            "task_id": task_id,
+            "task_channel_id": task_channel_id,
+            "source_url": source_url,
+            "event": event,
+            "algorithm": algorithm,
+            "model_id": model_id,
+            "detection": detection,
+            "snapshot_path": snapshot_path,
+            "before_frames": list(before_frames),
+            "fps": fps,
+            "before_seconds": before_seconds,
+            "after_seconds": after_seconds,
+            "event_timestamp": event_timestamp,
+        }
+        if after_frames is not None:
+            finalize_kwargs["after_frames"] = list(after_frames)
         future = self._alarm_video_executor.submit(
             self._finalize_task_alarm_video_job,
-            task_id=task_id,
-            task_channel_id=task_channel_id,
-            source_url=source_url,
-            event=event,
-            algorithm=algorithm,
-            model_id=model_id,
-            detection=detection,
-            snapshot_path=snapshot_path,
-            before_frames=list(before_frames),
-            fps=fps,
-            before_seconds=before_seconds,
-            after_seconds=after_seconds,
+            **finalize_kwargs,
         )
         self._track_alarm_video_future(future)
 
@@ -1544,16 +1679,14 @@ class AnalysisService:
         if after_frame_limit <= 0:
             return []
 
-        cap = None
+        capture = None
         after_frames: list[tuple[float, object]] = []
         fail_count = 0
         deadline = time.time() + self._task_alarm_video_capture_timeout_seconds(after_seconds)
         try:
-            cap = cv2.VideoCapture(source_url)
-            if not cap.isOpened():
-                return []
+            capture = self._build_task_capture(source_url)
             while len(after_frames) < after_frame_limit and time.time() < deadline:
-                ok_after, after_frame = cap.read()
+                ok_after, after_frame = self._read_task_frame(capture)
                 if not ok_after:
                     fail_count += 1
                     if fail_count >= self._task_alarm_video_read_fail_limit():
@@ -1566,108 +1699,8 @@ class AnalysisService:
         except Exception:
             logger.exception("Failed to collect channel alarm video frames: source=%s", source_url)
         finally:
-            try:
-                if cap is not None:
-                    cap.release()
-            except Exception:
-                pass
+            self._release_task_capture(capture)
         return after_frames
-
-    def _finalize_channel_alarm_video_job(
-        self,
-        *,
-        channel_id: str,
-        source_url: str,
-        event: dict,
-        model_id: str,
-        detection: dict,
-        snapshot_path: str | None,
-        before_frames: list[tuple[float, object]],
-        fps: float,
-        before_seconds: int,
-        after_seconds: int,
-    ) -> None:
-        after_frame_limit = max(int(round(max(fps, 1.0) * max(after_seconds, 0))), 0)
-        after_frames = self._collect_channel_alarm_after_frames(
-            source_url=source_url,
-            after_frame_limit=after_frame_limit,
-            after_seconds=after_seconds,
-        )
-        video_frames = self._build_alarm_video_frames(
-            before_frames=before_frames,
-            after_frames=after_frames,
-            fps=fps,
-            before_seconds=before_seconds,
-            after_seconds=after_seconds,
-        )
-        if not video_frames:
-            logger.warning("Skip empty channel alarm video: channel=%s event=%s", channel_id, event["id"])
-            return
-
-        video_path = self._save_alarm_video(channel_id, event["id"], video_frames, [detection], fps=fps)
-        if not video_path:
-            logger.warning("Failed to save channel alarm video: channel=%s event=%s", channel_id, event["id"])
-            return
-
-        self.events_service.update_event_sync(
-            event["id"],
-            self._build_event_update_request(video_path=video_path),
-        )
-        self.recording_service.create_recording_sync(
-            self._build_alarm_recording_payload(
-                event=event,
-                channel_id=channel_id,
-                task_id=None,
-                algorithm_id=None,
-                model_id=model_id,
-                detection=detection,
-                snapshot_path=snapshot_path,
-                video_path=video_path,
-                video_frames=video_frames,
-                fps=fps,
-            )
-        )
-
-    def _submit_channel_alarm_video_job(
-        self,
-        *,
-        channel_id: str,
-        source_url: str,
-        event: dict,
-        model_id: str,
-        detection: dict,
-        snapshot_path: str | None,
-        before_frames: list[tuple[float, object]],
-        fps: float,
-        before_seconds: int,
-        after_seconds: int,
-    ) -> None:
-        future = self._alarm_video_executor.submit(
-            self._finalize_channel_alarm_video_job,
-            channel_id=channel_id,
-            source_url=source_url,
-            event=event,
-            model_id=model_id,
-            detection=detection,
-            snapshot_path=snapshot_path,
-            before_frames=list(before_frames),
-            fps=fps,
-            before_seconds=before_seconds,
-            after_seconds=after_seconds,
-        )
-        self._track_alarm_video_future(future)
-
-        def _log_failure(done_future):
-            exc = done_future.exception()
-            if exc is not None:
-                logger.error(
-                    "Channel alarm video job failed: channel=%s event=%s",
-                    channel_id,
-                    event["id"],
-                    exc_info=exc,
-                )
-
-        future.add_done_callback(_log_failure)
 
     def _track_alarm_video_future(self, future: Future) -> None:
         with self._lock:
@@ -1710,6 +1743,10 @@ class AnalysisService:
     def _absence_threshold_seconds(self, algorithm: dict) -> int:
         config = get_algorithm_rule_config("absence")
         return max(int(config.get("absence_seconds", 5) or 5), 1)
+
+    @staticmethod
+    def _absence_annotation_label(elapsed: int) -> str:
+        return f"Person absent {max(int(elapsed), 0)}s"
 
     def _algorithm_regions(self, algorithm: dict) -> list[dict]:
         return [
@@ -1811,9 +1848,19 @@ class AnalysisService:
             representative["object_count"] = current_count
             representative["zone_id"] = zone_id
             representative["zone_name"] = (region or {}).get("name") or zone_id
-            representative["annotation_label"] = f"{algorithm.get('scene_name') or rule_type} {current_count}"
+            representative["annotation_label"] = (
+                f"Person gathering {current_count}"
+                if rule_type == "gathering"
+                else f"{algorithm.get('scene_name') or rule_type} {current_count}"
+            )
             representative["label_anchor"] = self._region_label_anchor(region, representative)
-            representative["snapshot_detections"] = grouped or [dict(representative)]
+            snapshot_detections = grouped or [dict(representative)]
+            if snapshot_detections:
+                snapshot_detections[0] = {
+                    **snapshot_detections[0],
+                    "annotation_label": representative["annotation_label"],
+                }
+            representative["snapshot_detections"] = snapshot_detections
             representative["snapshot_regions"] = [region] if region else []
             threshold_state["emitted"] = True
             events.append(representative)
@@ -2006,6 +2053,12 @@ class AnalysisService:
                 state_key = self._rule_state_key(algorithm, "absence::global")
                 absence_state = state.setdefault(state_key, {})
                 if matched:
+                    absence_state["seen_present"] = True
+                    absence_state["missing_since"] = None
+                    absence_state["emitted"] = False
+                    return []
+
+                if not absence_state.get("seen_present"):
                     absence_state["missing_since"] = None
                     absence_state["emitted"] = False
                     return []
@@ -2026,7 +2079,7 @@ class AnalysisService:
                     "conf": 1.0,
                     "absence_seconds": elapsed,
                     "zone_id": "global",
-                    "annotation_label": f"{algorithm.get('scene_name') or '离岗检测'} {elapsed}s",
+                    "annotation_label": self._absence_annotation_label(elapsed),
                     "label_anchor": [16, 16],
                 }]
 
@@ -2043,6 +2096,12 @@ class AnalysisService:
                 state_key = self._rule_state_key(algorithm, f"absence::{zone_id}")
                 absence_state = state.setdefault(state_key, {})
                 if zone_id in matched_zone_ids:
+                    absence_state["seen_present"] = True
+                    absence_state["missing_since"] = None
+                    absence_state["emitted"] = False
+                    continue
+
+                if not absence_state.get("seen_present"):
                     absence_state["missing_since"] = None
                     absence_state["emitted"] = False
                     continue
@@ -2071,7 +2130,7 @@ class AnalysisService:
                     "absence_seconds": elapsed,
                     "zone_id": zone_id,
                     "zone_name": region.get("name") or zone_id,
-                    "annotation_label": f"{algorithm.get('scene_name') or '离岗检测'} {elapsed}s",
+                    "annotation_label": self._absence_annotation_label(elapsed),
                     "label_anchor": label_anchor,
                 })
             return events
@@ -2200,353 +2259,114 @@ class AnalysisService:
             })
         return normalized
 
-    def _run_worker(self, channel_id: str, stop_event: threading.Event) -> None:
-        frame_count = 0
-        event_count = 0
-        cooldown_cache: dict[str, float] = {}
-        pre_event_buffer: deque[tuple[float, object]] = deque(maxlen=self._alarm_video_pre_event_buffer_size())
-
-        try:
-            channel = self._load_channel(channel_id)
-            if not channel:
-                raise ValueError("Channel not found")
-
-            ai_config = channel.get("ext", {}).get("ai_config", {})
-            if not ai_config.get("enabled"):
-                raise ValueError("AI is not enabled for this channel")
-
-            model_configs = [
-                item for item in self._normalize_model_configs(channel)
-                if item.get("enabled") and item.get("model_id")
-            ]
-            if not model_configs:
-                raise ValueError("No enabled AI model is configured for this channel")
-
-            source_url = channel.get("source_url")
-            if not source_url:
-                raise ValueError("Channel source_url is empty")
-
-            cap = cv2.VideoCapture(source_url)
-            if not cap.isOpened():
-                raise ValueError("Failed to open channel source for AI analysis")
-
-            self._update_runtime(
-                channel_id,
-                status="running",
-                started_at=now_iso(),
-                clear_error=True,
-                frame_count=0,
-                event_count=0,
-            )
-
-            try:
-                while not stop_event.is_set():
-                    ok, frame = cap.read()
-                    if not ok:
-                        time.sleep(0.2)
-                        continue
-
-                    frame_count += 1
-                    pre_event_buffer.append((time.time(), self._pack_alarm_video_frame(frame)))
-                    self._update_runtime(
-                        channel_id,
-                        last_analysis_at=now_iso(),
-                        frame_count=frame_count,
-                        event_count=event_count,
-                    )
-                    runtime_by_model: dict[str, dict] = {}
-                    for model_config in model_configs:
-                        model_id = model_config["model_id"]
-                        frame_interval = max(int(model_config.get("frame_interval", 10) or 10), 1)
-                        if frame_count % frame_interval != 0:
-                            continue
-
-                        model, model_meta = self._load_model(model_id)
-                        conf_threshold = float(model_config.get("conf", 0.25) or 0.25)
-                        save_snapshot = bool(model_config.get("save_snapshot", True))
-                        detections = self._detect_frame(model, model_meta, frame, conf_threshold)
-                        detections = self._apply_model_scoped_filters(detections, channel, model_config)
-
-                        runtime_by_model[model_id] = {
-                            "last_analysis_at": now_iso(),
-                            "detections": len(detections),
-                        }
-
-                        # 调试统计能力先保留实现痕迹，暂时停用
-                        # scoped_channel = self._build_scoped_channel(channel, model_config)
-                        # raw_detections = self._detect_frame(model, model_meta, frame, conf_threshold)
-                        # label_filtered_detections = self._filter_detections_by_labels(raw_detections, scoped_channel)
-                        # zone_filtered_detections = self._filter_detections_by_zones(label_filtered_detections, scoped_channel)
-                        #
-                        # model_runtime = {
-                        #     "last_analysis_at": now_iso(),
-                        #     "detections": len(zone_filtered_detections),
-                        #     "raw_detections": len(raw_detections),
-                        #     "label_filtered_detections": len(label_filtered_detections),
-                        #     "zone_filtered_detections": len(zone_filtered_detections),
-                        #     "cooldown_blocked_detections": 0,
-                        #     "event_emitted_detections": 0,
-                        #     "configured_labels": list(model_config.get("labels") or []),
-                        #     "configured_zone_ids": list(model_config.get("zone_ids") or []),
-                        #     "raw_classes": self._summarize_classes(raw_detections),
-                        #     "label_filtered_classes": self._summarize_classes(label_filtered_detections),
-                        #     "zone_filtered_classes": self._summarize_classes(zone_filtered_detections),
-                        #     "debug_reason": "ready",
-                        # }
-                        #
-                        # if not raw_detections:
-                        #     model_runtime["debug_reason"] = "模型未检出目标"
-                        # elif not label_filtered_detections:
-                        #     model_runtime["debug_reason"] = "目标被类别过滤拦截"
-                        # elif not zone_filtered_detections:
-                        #     model_runtime["debug_reason"] = "目标被区域过滤拦截"
-                        #
-                        # runtime_by_model[model_id] = model_runtime
-
-                        if not detections:
-                            continue
-
-                        for detection in detections:
-                            cooldown_key = f"{model_id}::{self._event_cooldown_key_for_algorithm(model_config, detection)}"
-                            now_ts = time.time()
-                            alert_interval = max(int(model_config.get("alert_interval", 60) or 60), 0)
-                            if alert_interval > 0 and now_ts - cooldown_cache.get(cooldown_key, 0) < alert_interval:
-                                # runtime_by_model[model_id]["cooldown_blocked_detections"] += 1
-                                # runtime_by_model[model_id]["debug_reason"] = "命中冷却时间，事件被抑制"
-                                continue
-                            cooldown_cache[cooldown_key] = now_ts
-
-                            snapshot_path = self._save_event_snapshot(
-                                channel_id,
-                                frame,
-                                [detection],
-                                fallback_frame=self._latest_usable_frame(pre_event_buffer),
-                            ) if save_snapshot else None
-                            fps = 25.0
-                            before_seconds = self._alarm_video_before_seconds()
-                            after_seconds = self._alarm_video_after_seconds()
-                            before_frames = list(pre_event_buffer)
-                            payload = {
-                                "channel_id": channel_id,
-                                "model_id": model_id,
-                                "event_type": "detection",
-                                "class_name": detection.get("class_name", "unknown"),
-                                "conf": detection.get("conf", 0),
-                                "snapshot_path": snapshot_path,
-                                "handling_status": 0,
-                                "remark": json.dumps({
-                                    **detection,
-                                    "model_id": model_id,
-                                }, ensure_ascii=False),
-                                "status": "new",
-                            }
-                            event = asyncio.run(self.events_service.create_event(payload))
-                            self._submit_channel_alarm_video_job(
-                                channel_id=channel_id,
-                                source_url=source_url,
-                                event=event,
-                                model_id=model_id,
-                                detection=detection,
-                                snapshot_path=snapshot_path,
-                                before_frames=before_frames,
-                                fps=fps,
-                                before_seconds=before_seconds,
-                                after_seconds=after_seconds,
-                            )
-                            event_count += 1
-                            # runtime_by_model[model_id]["event_emitted_detections"] += 1
-                            # runtime_by_model[model_id]["debug_reason"] = "已触发事件"
-                            runtime_by_model.setdefault(model_id, {})["last_event_at"] = now_iso()
-                            self._update_runtime(
-                                channel_id,
-                                last_event_at=now_iso(),
-                                frame_count=frame_count,
-                                event_count=event_count,
-                            )
-
-                    if runtime_by_model:
-                        channel = self._load_channel(channel_id)
-                        if channel:
-                            runtime = channel.setdefault("ext", {}).setdefault("ai_runtime", {})
-                            runtime["models"] = {
-                                **runtime.get("models", {}),
-                                **runtime_by_model,
-                            }
-                            # previous_models = runtime.get("models", {})
-                            # merged_models = {}
-                            # for model_id, model_runtime in runtime_by_model.items():
-                            #     previous = previous_models.get(model_id, {})
-                            #     merged_models[model_id] = {
-                            #         **previous,
-                            #         **model_runtime,
-                            #         "total_event_emitted_detections": int(previous.get("total_event_emitted_detections", 0))
-                            #         + int(model_runtime.get("event_emitted_detections", 0)),
-                            #         "total_cooldown_blocked_detections": int(previous.get("total_cooldown_blocked_detections", 0))
-                            #         + int(model_runtime.get("cooldown_blocked_detections", 0)),
-                            #     }
-                            # runtime["models"] = {
-                            #     **previous_models,
-                            #     **merged_models,
-                            # }
-                            self._save_channel(channel)
-            finally:
-                cap.release()
-        except Exception as exc:
-            self._update_runtime(channel_id, status="error", last_error=str(exc), stopped_at=now_iso())
-        finally:
-            with self._lock:
-                self._workers.pop(channel_id, None)
-            self._prune_model_cache()
-            channel = self._load_channel(channel_id)
-            if channel and channel.get("ext", {}).get("ai_runtime", {}).get("status") != "error":
-                self._update_runtime(
-                    channel_id,
-                    status="stopped",
-                    stopped_at=now_iso(),
-                    frame_count=frame_count,
-                    event_count=event_count,
-                )
-
-    async def start_channel_analysis(self, channel_id: str) -> dict | None:
-        channel = self._load_channel(channel_id)
-        if not channel:
-            return None
-
-        with self._lock:
-            existing = self._workers.get(channel_id)
-            if existing and existing["thread"].is_alive():
-                return {
-                    "channel_id": channel_id,
-                    "status": "running",
-                    "message": "AI analysis is already running",
-                }
-
-            stop_event = threading.Event()
-            thread = threading.Thread(
-                target=self._run_worker,
-                args=(channel_id, stop_event),
-                daemon=True,
-                name=f"analysis-{channel_id}",
-            )
-            self._workers[channel_id] = {
-                "thread": thread,
-                "stop_event": stop_event,
-                "started_at": now_iso(),
-            }
-            thread.start()
-
+    def _build_task_execution_snapshot(self, task: dict) -> dict[str, Any]:
+        algorithms = [
+            item for item in self._normalize_task_algorithms(task)
+            if item.get("enabled") and item.get("model_id")
+        ]
         return {
-            "channel_id": channel_id,
-            "status": "starting",
-            "started_at": self._workers[channel_id]["started_at"],
+            "task_id": task.get("id"),
+            "channel_id": task.get("channel_id"),
+            "source_url": task.get("source_url"),
+            "algorithms": algorithms,
+            "runtime_models": dict((task.get("runtime") or {}).get("models") or {}),
         }
 
+    def _merge_task_runtime_models(
+        self,
+        current_models: dict[str, Any] | None,
+        runtime_updates: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        merged: dict[str, Any] = {
+            str(key): dict(value or {})
+            for key, value in dict(current_models or {}).items()
+        }
+        for key, value in dict(runtime_updates or {}).items():
+            normalized_key = str(key)
+            merged[normalized_key] = {
+                **dict(merged.get(normalized_key) or {}),
+                **dict(value or {}),
+            }
+        return merged
+
+    def _sync_task_runtime_state(
+        self,
+        *,
+        algorithms: list[dict],
+        runtime_models: dict[str, Any] | None,
+        cooldown_cache: dict[str, float] | None = None,
+        rule_state: dict[str, dict] | None = None,
+    ) -> dict[str, Any]:
+        runtime_keys = {
+            self._task_runtime_model_key(algorithm)
+            for algorithm in list(algorithms or [])
+        }
+        algorithm_keys = {
+            str(algorithm.get("id") or algorithm.get("model_id") or "unknown")
+            for algorithm in list(algorithms or [])
+        }
+        synced_runtime_models = {
+            str(key): dict(value or {})
+            for key, value in dict(runtime_models or {}).items()
+            if str(key) in runtime_keys
+        }
+        if cooldown_cache is not None:
+            stale_cooldown_keys = [
+                key for key in list(cooldown_cache.keys())
+                if key.split("::", 1)[0] not in runtime_keys
+            ]
+            for key in stale_cooldown_keys:
+                cooldown_cache.pop(key, None)
+        if rule_state is not None:
+            stale_rule_keys = [
+                key for key in list(rule_state.keys())
+                if key.split("::", 1)[0] not in algorithm_keys
+            ]
+            for key in stale_rule_keys:
+                rule_state.pop(key, None)
+        return synced_runtime_models
+
+    async def start_channel_analysis(self, channel_id: str) -> dict | None:
+        raise RuntimeError("Channel-level analysis is disabled; use task analysis instead")
+
     async def restart_channel_analysis(self, channel_id: str) -> dict | None:
-        channel = self._load_channel(channel_id)
-        if not channel:
-            return None
-
-        with self._lock:
-            existing = self._workers.get(channel_id)
-            if existing:
-                existing["stop_event"].set()
-
-        wait_deadline = time.time() + 5.0
-        while time.time() < wait_deadline:
-          with self._lock:
-              existing = self._workers.get(channel_id)
-              if not existing or not existing["thread"].is_alive():
-                  break
-          time.sleep(0.1)
-
-        with self._lock:
-            existing = self._workers.get(channel_id)
-            if existing and existing["thread"].is_alive():
-                raise RuntimeError("AI analysis worker did not stop in time")
-            if existing and not existing["thread"].is_alive():
-                self._workers.pop(channel_id, None)
-
-        self._update_runtime(channel_id, status="restarting", stopped_at=now_iso())
-        return await self.start_channel_analysis(channel_id)
+        raise RuntimeError("Channel-level analysis is disabled; use task analysis instead")
 
     async def stop_channel_analysis(self, channel_id: str) -> dict | None:
-        channel = self._load_channel(channel_id)
-        if not channel:
-            return None
-
-        with self._lock:
-            existing = self._workers.get(channel_id)
-            if existing:
-                existing["stop_event"].set()
-
-        self._update_runtime(channel_id, status="stopping", stopped_at=now_iso())
+        logger.info(
+            "[ChannelAnalysisCompatibility] stop_channel_analysis noop because task-driven analysis is enabled: channel_id=%s",
+            channel_id,
+        )
         return {
             "channel_id": channel_id,
-            "status": "stopping",
+            "status": "stopped",
+            "message": "Channel-level analysis is disabled; use task analysis instead",
         }
 
     async def get_channel_analysis_status(self, channel_id: str) -> dict | None:
         channel = self._load_channel(channel_id)
         if not channel:
             return None
-
-        runtime = channel.get("ext", {}).get("ai_runtime", {})
-        with self._lock:
-            worker = self._workers.get(channel_id)
-            is_running = bool(worker and worker["thread"].is_alive())
-
         return {
             "channel_id": channel_id,
-            "enabled": bool(channel.get("ext", {}).get("ai_config", {}).get("enabled")),
-            "status": runtime.get("status", "running" if is_running else "stopped"),
-            "is_running": is_running,
-            "started_at": runtime.get("started_at"),
-            "stopped_at": runtime.get("stopped_at"),
-            "last_analysis_at": runtime.get("last_analysis_at"),
-            "last_event_at": runtime.get("last_event_at"),
-            "last_error": runtime.get("last_error"),
-            "frame_count": runtime.get("frame_count", 0),
-            "event_count": runtime.get("event_count", 0),
-            "models": runtime.get("models", {}),
+            "enabled": False,
+            "status": "stopped",
+            "is_running": False,
+            "started_at": None,
+            "stopped_at": None,
+            "last_analysis_at": None,
+            "last_event_at": None,
+            "last_error": "Channel-level analysis is disabled; use task analysis instead",
+            "frame_count": 0,
+            "event_count": 0,
+            "models": {},
         }
 
     async def restore_enabled_channels(self) -> dict:
-        restored = 0
-        skipped = 0
-        if settings.METADATA_DB_ENABLED:
-            with SessionLocal() as session:
-                channel_ids = [row[0] for row in session.query(ChannelMeta.id).all()]
-            channels = [self._load_channel(channel_id) for channel_id in channel_ids if channel_id]
-        else:
-            channels = []
-            for path in self.channels_dir.glob("*.json"):
-                try:
-                    channels.append(load_json(path))
-                except Exception:
-                    skipped += 1
-                    continue
-
-        for channel in channels:
-            if not channel:
-                skipped += 1
-                continue
-            ai_config = channel.get("ext", {}).get("ai_config", {})
-            model_configs = [
-                item for item in self._normalize_model_configs(channel)
-                if item.get("enabled") and item.get("model_id")
-            ]
-            if not ai_config.get("enabled") or not model_configs:
-                continue
-
-            result = await self.start_channel_analysis(channel["id"])
-            if result:
-                restored += 1
-            else:
-                skipped += 1
-
+        logger.info("[ChannelAnalysisCompatibility] restore_enabled_channels skipped because task-driven analysis is enabled")
         return {
-            "restored": restored,
-            "skipped": skipped,
+            "restored": 0,
+            "skipped": 0,
         }
 
     def _run_task_worker(self, task_id: str, stop_event: threading.Event) -> None:
@@ -2555,27 +2375,57 @@ class AnalysisService:
         cooldown_cache: dict[str, float] = {}
         rule_state: dict[str, dict] = {}
         pre_event_buffer: deque[tuple[float, object]] = deque(maxlen=self._alarm_video_pre_event_buffer_size())
+        pending_alarm_videos: list[dict[str, Any]] = []
         capture = None
         read_fail_count = 0
         reconnect_count = 0
+
+        def flush_pending_alarm_videos(*, ready_only: bool) -> None:
+            nonlocal pending_alarm_videos
+            remaining_jobs: list[dict[str, Any]] = []
+            for job in pending_alarm_videos:
+                if ready_only and len(job["after_frames"]) < job["after_frame_limit"]:
+                    remaining_jobs.append(job)
+                    continue
+                submit_args = {
+                    key: value
+                    for key, value in job.items()
+                    if key != "after_frame_limit"
+                }
+                submit_args["after_frames"] = list(job["after_frames"])
+                self._submit_task_alarm_video_job(**submit_args)
+            pending_alarm_videos = remaining_jobs
 
         try:
             task = self._load_task(task_id)
             if not task:
                 raise ValueError("Task not found")
 
-            source_url = task.get("source_url")
+            task_snapshot = self._build_task_execution_snapshot(task)
+            source_url = task_snapshot.get("source_url")
             if not source_url:
                 raise ValueError("Task source_url is empty")
 
-            algorithms = [
-                item for item in self._normalize_task_algorithms(task)
-                if item.get("enabled") and item.get("model_id")
-            ]
+            algorithms = list(task_snapshot.get("algorithms") or [])
             if not algorithms:
                 raise ValueError("Task has no enabled algorithms")
+            runtime_models = self._sync_task_runtime_state(
+                algorithms=algorithms,
+                runtime_models=task_snapshot.get("runtime_models") or {},
+                cooldown_cache=cooldown_cache,
+                rule_state=rule_state,
+            )
+            config_refresh_interval = self._task_config_refresh_interval_seconds()
+            runtime_heartbeat_interval = self._task_runtime_heartbeat_interval_seconds()
+            next_config_refresh_at = (
+                time.time() + config_refresh_interval
+                if config_refresh_interval > 0
+                else 0.0
+            )
+            next_runtime_heartbeat_at = time.time()
 
             capture = self._build_task_capture(source_url)
+            self._log_task_capture_debug(task, source_url, capture)
             warmup_seconds = self._task_analysis_startup_warmup_seconds()
             warmup_until_ts = time.time() + warmup_seconds if warmup_seconds > 0 else 0.0
 
@@ -2587,6 +2437,7 @@ class AnalysisService:
                 clear_error=True,
                 frame_count=0,
                 event_count=0,
+                models=runtime_models,
             )
 
             try:
@@ -2596,6 +2447,7 @@ class AnalysisService:
                         read_fail_count += 1
                         if read_fail_count >= TASK_ANALYSIS_READ_FAIL_LIMIT:
                             reconnect_count += 1
+                            flush_pending_alarm_videos(ready_only=False)
                             self._release_task_capture(capture)
                             capture = None
                             last_error = f"task stream stalled, reconnect={reconnect_count}"
@@ -2604,9 +2456,35 @@ class AnalysisService:
                                 raise RuntimeError("Task source read failed repeatedly")
                             time.sleep(min(2 ** min(reconnect_count, 3), 5))
                             task = self._load_task(task_id) or task
-                            source_url = task.get("source_url") or source_url
+                            task_snapshot = self._build_task_execution_snapshot(task)
+                            latest_source_url = task_snapshot.get("source_url")
+                            if not latest_source_url:
+                                raise ValueError("Task source_url is empty")
+                            latest_algorithms = list(task_snapshot.get("algorithms") or [])
+                            if not latest_algorithms:
+                                raise ValueError("Task has no enabled algorithms")
+                            source_changed = latest_source_url != source_url
+                            source_url = latest_source_url
+                            algorithms = latest_algorithms
+                            runtime_models = self._sync_task_runtime_state(
+                                algorithms=algorithms,
+                                runtime_models=self._merge_task_runtime_models(
+                                    runtime_models,
+                                    task_snapshot.get("runtime_models") or {},
+                                ),
+                                cooldown_cache=cooldown_cache,
+                                rule_state=rule_state,
+                            )
+                            if source_changed:
+                                pre_event_buffer.clear()
                             capture = self._build_task_capture(source_url)
+                            self._log_task_capture_debug(task, source_url, capture)
                             warmup_until_ts = time.time() + warmup_seconds if warmup_seconds > 0 else 0.0
+                            next_config_refresh_at = (
+                                time.time() + config_refresh_interval
+                                if config_refresh_interval > 0
+                                else 0.0
+                            )
                             read_fail_count = 0
                         else:
                             time.sleep(0.2)
@@ -2621,21 +2499,68 @@ class AnalysisService:
                     now_ts = time.time()
                     is_warming_up = warmup_until_ts > 0 and now_ts < warmup_until_ts
                     if is_warming_up:
-                        self._update_task_runtime(
-                            task_id,
-                            last_analysis_at=now_iso(),
-                            frame_count=frame_count,
-                            event_count=event_count,
-                        )
+                        if runtime_heartbeat_interval <= 0 or now_ts >= next_runtime_heartbeat_at:
+                            self._update_task_runtime(
+                                task_id,
+                                last_analysis_at=now_iso(),
+                                frame_count=frame_count,
+                                event_count=event_count,
+                                models=runtime_models,
+                            )
+                            next_runtime_heartbeat_at = (
+                                now_ts + runtime_heartbeat_interval
+                                if runtime_heartbeat_interval > 0
+                                else 0.0
+                            )
                         continue
-                    pre_event_buffer.append((now_ts, self._pack_alarm_video_frame(frame)))
+                    packed_frame = (now_ts, self._pack_alarm_video_frame(frame))
+                    pre_event_buffer.append(packed_frame)
+                    for pending_job in pending_alarm_videos:
+                        pending_job["after_frames"].append(packed_frame)
+                    flush_pending_alarm_videos(ready_only=True)
+
+                    if config_refresh_interval > 0 and now_ts >= next_config_refresh_at:
+                        source_changed = False
+                        latest_task = self._load_task(task_id)
+                        if latest_task:
+                            latest_snapshot = self._build_task_execution_snapshot(latest_task)
+                            latest_source_url = latest_snapshot.get("source_url") or source_url
+                            latest_algorithms = list(latest_snapshot.get("algorithms") or [])
+                            if not latest_algorithms:
+                                raise ValueError("Task has no enabled algorithms")
+                            source_changed = latest_source_url != source_url
+                            if latest_source_url != source_url:
+                                flush_pending_alarm_videos(ready_only=False)
+                                self._release_task_capture(capture)
+                                capture = self._build_task_capture(latest_source_url)
+                                self._log_task_capture_debug(latest_task, latest_source_url, capture)
+                                warmup_until_ts = time.time() + warmup_seconds if warmup_seconds > 0 else 0.0
+                                read_fail_count = 0
+                                reconnect_count = 0
+                                pre_event_buffer.clear()
+                            task = latest_task
+                            task_snapshot = latest_snapshot
+                            source_url = latest_source_url
+                            algorithms = latest_algorithms
+                            runtime_models = self._sync_task_runtime_state(
+                                algorithms=algorithms,
+                                runtime_models=self._merge_task_runtime_models(
+                                    runtime_models,
+                                    latest_snapshot.get("runtime_models") or {},
+                                ),
+                                cooldown_cache=cooldown_cache,
+                                rule_state=rule_state,
+                            )
+                        next_config_refresh_at = (
+                            now_ts + config_refresh_interval
+                            if config_refresh_interval > 0
+                            else 0.0
+                        )
+                        if latest_task and source_changed:
+                            continue
 
                     runtime_by_model: dict[str, dict] = {}
-                    task = self._load_task(task_id) or task
-                    algorithms = [
-                        item for item in self._normalize_task_algorithms(task)
-                        if item.get("enabled") and item.get("model_id")
-                    ]
+                    last_event_runtime_at: str | None = None
                     inference_results = self._collect_task_algorithm_inferences(
                         task=task,
                         algorithms=algorithms,
@@ -2675,6 +2600,13 @@ class AnalysisService:
                             now_ts=now_ts,
                             state=rule_state,
                         )
+                        self._log_task_detection_debug(
+                            task=task,
+                            algorithm=algorithm,
+                            frame_count=frame_count,
+                            stage="rule_events",
+                            detections=rule_events,
+                        )
                         if not rule_events:
                             continue
 
@@ -2684,6 +2616,17 @@ class AnalysisService:
                             if alert_interval > 0 and now_ts - cooldown_cache.get(cooldown_key, 0) < alert_interval:
                                 continue
                             cooldown_cache[cooldown_key] = now_ts
+                            self._log_task_detection_debug(
+                                task=task,
+                                algorithm=algorithm,
+                                frame_count=frame_count,
+                                stage="event_create",
+                                detections=[detection],
+                                extra={
+                                    "cooldown_key": cooldown_key,
+                                    "alert_interval": alert_interval,
+                                },
+                            )
 
                             snapshot_detections = list(detection.get("snapshot_detections") or [detection])
                             snapshot_regions = detection.get("snapshot_regions")
@@ -2704,6 +2647,17 @@ class AnalysisService:
                                 snapshot_path=snapshot_path,
                             )
                             event = asyncio.run(self.events_service.create_event(payload))
+                            self._log_task_detection_debug(
+                                task=task,
+                                algorithm=algorithm,
+                                frame_count=frame_count,
+                                stage="event_created",
+                                detections=[detection],
+                                extra={
+                                    "event_id": event.get("id"),
+                                    "snapshot_path": snapshot_path,
+                                },
+                            )
 
                             if algorithm.get("need_video_clip", True):
                                 fps = 25.0
@@ -2731,50 +2685,59 @@ class AnalysisService:
                                     item for item in list(pre_event_buffer)
                                     if now_ts - item[0] <= before_seconds
                                 ]
-                                self._submit_task_alarm_video_job(
-                                    task_id=task_id,
-                                    task_channel_id=task.get("channel_id"),
-                                    source_url=source_url,
-                                    event=event,
-                                    algorithm=algorithm,
-                                    model_id=model_id,
-                                    detection=detection,
-                                    snapshot_path=snapshot_path,
-                                    before_frames=before_frames,
-                                    fps=fps,
-                                    before_seconds=before_seconds,
-                                    after_seconds=after_seconds,
-                                )
+                                video_job = {
+                                    "task_id": task_id,
+                                    "task_channel_id": task.get("channel_id"),
+                                    "source_url": source_url,
+                                    "event": event,
+                                    "algorithm": algorithm,
+                                    "model_id": model_id,
+                                    "detection": detection,
+                                    "snapshot_path": snapshot_path,
+                                    "before_frames": before_frames,
+                                    "after_frames": [],
+                                    "after_frame_limit": max(int(round(max(fps, 1.0) * after_seconds)), 0),
+                                    "fps": fps,
+                                    "before_seconds": before_seconds,
+                                    "after_seconds": after_seconds,
+                                    "event_timestamp": now_ts,
+                                }
+                                if video_job["after_frame_limit"] > 0:
+                                    pending_alarm_videos.append(video_job)
+                                else:
+                                    video_job.pop("after_frame_limit")
+                                    self._submit_task_alarm_video_job(**video_job)
 
                             event_count += 1
-                            runtime_by_model.setdefault(runtime_key, {})["last_event_at"] = now_iso()
-                            self._update_task_runtime(
-                                task_id,
-                                last_event_at=now_iso(),
-                                last_analysis_at=now_iso(),
-                                frame_count=frame_count,
-                                event_count=event_count,
-                            )
+                            event_ts_iso = now_iso()
+                            runtime_by_model.setdefault(runtime_key, {})["last_event_at"] = event_ts_iso
+                            last_event_runtime_at = event_ts_iso
 
                     if runtime_by_model:
+                        runtime_models = self._sync_task_runtime_state(
+                            algorithms=algorithms,
+                            runtime_models=self._merge_task_runtime_models(runtime_models, runtime_by_model),
+                            cooldown_cache=cooldown_cache,
+                            rule_state=rule_state,
+                        )
+                    heartbeat_due = runtime_heartbeat_interval <= 0 or now_ts >= next_runtime_heartbeat_at
+                    if last_event_runtime_at is not None or heartbeat_due:
                         self._update_task_runtime(
                             task_id,
+                            last_event_at=last_event_runtime_at,
                             last_analysis_at=now_iso(),
                             frame_count=frame_count,
                             event_count=event_count,
-                            models={
-                                **((self._load_task(task_id) or {}).get("runtime", {}).get("models", {})),
-                                **runtime_by_model,
-                            },
+                            models=runtime_models,
                         )
-                    else:
-                        self._update_task_runtime(
-                            task_id,
-                            last_analysis_at=now_iso(),
-                            frame_count=frame_count,
-                            event_count=event_count,
-                        )
+                        if heartbeat_due:
+                            next_runtime_heartbeat_at = (
+                                now_ts + runtime_heartbeat_interval
+                                if runtime_heartbeat_interval > 0
+                                else 0.0
+                            )
             finally:
+                flush_pending_alarm_videos(ready_only=False)
                 self._release_task_capture(capture)
         except Exception as exc:
             self._update_task_runtime(task_id, status="error", last_error=str(exc), stopped_at=now_iso())
@@ -2909,7 +2872,6 @@ class AnalysisService:
         safe_timeout = max(float(timeout_seconds or 0), 0.0)
         with self._lock:
             workers = [
-                *self._workers.values(),
                 *self._task_workers.values(),
             ]
 
@@ -2924,7 +2886,6 @@ class AnalysisService:
                 running_workers = [
                     worker
                     for worker in [
-                        *self._workers.values(),
                         *self._task_workers.values(),
                     ]
                     if worker.get("thread") and worker["thread"].is_alive()
@@ -2937,16 +2898,10 @@ class AnalysisService:
             remaining_workers = [
                 worker
                 for worker in [
-                    *self._workers.values(),
                     *self._task_workers.values(),
                 ]
                 if worker.get("thread") and worker["thread"].is_alive()
             ]
-            self._workers = {
-                channel_id: worker
-                for channel_id, worker in self._workers.items()
-                if worker.get("thread") and worker["thread"].is_alive()
-            }
             self._task_workers = {
                 task_id: worker
                 for task_id, worker in self._task_workers.items()

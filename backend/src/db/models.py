@@ -66,7 +66,6 @@ class ChannelMeta(Base):
     stream: Mapped[str | None] = mapped_column(String(255), index=True)
     is_online: Mapped[bool | None] = mapped_column(Boolean, index=True)
     is_playing: Mapped[bool | None] = mapped_column(Boolean, index=True)
-    ai_enabled: Mapped[bool | None] = mapped_column(Boolean, index=True)
     record_mode: Mapped[str | None] = mapped_column(String(64), index=True)
     snapshot_url: Mapped[str | None] = mapped_column(Text)
     snapshot_path: Mapped[str | None] = mapped_column(Text)
@@ -86,20 +85,6 @@ class ChannelZoneMeta(Base):
     color: Mapped[str | None] = mapped_column(String(32))
     labels_json: Mapped[list | None] = mapped_column(JSON)
     coordinates_json: Mapped[list | None] = mapped_column(JSON)
-    raw_json: Mapped[dict | None] = mapped_column(JSON)
-
-
-class ChannelAIConfigMeta(Base):
-    __tablename__ = "channel_ai_configs"
-
-    channel_id: Mapped[str] = mapped_column(String(64), ForeignKey("channels.id", ondelete="CASCADE"), primary_key=True)
-    enabled: Mapped[bool | None] = mapped_column(Boolean, index=True)
-    model_id: Mapped[str | None] = mapped_column(String(64), index=True)
-    labels_json: Mapped[list | None] = mapped_column(JSON)
-    conf: Mapped[float | None] = mapped_column(Float)
-    frame_interval: Mapped[int | None] = mapped_column(Integer)
-    zone_ids_json: Mapped[list | None] = mapped_column(JSON)
-    save_snapshot: Mapped[bool | None] = mapped_column(Boolean)
     raw_json: Mapped[dict | None] = mapped_column(JSON)
 
 

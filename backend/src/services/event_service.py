@@ -1,5 +1,6 @@
 import asyncio
 import copy
+import logging
 from datetime import datetime
 from pathlib import Path
 
@@ -16,6 +17,8 @@ from src.services.platform_storage import (
     save_json,
 )
 
+logger = logging.getLogger(__name__)
+
 
 class EventService:
     def __init__(self):
@@ -27,6 +30,27 @@ class EventService:
 
     def _get_recording_path(self, recording_id: str) -> Path:
         return self.recordings_dir / f"{recording_id}.json"
+
+    @staticmethod
+    def _build_event_item(payload: dict, *, event_id: str | None = None, created_at: datetime | None = None) -> dict:
+        now_dt = created_at or datetime.now()
+        return {
+            "id": event_id or generate_id("evt"),
+            "channel_id": payload.get("channel_id"),
+            "task_id": payload.get("task_id"),
+            "algorithm_id": payload.get("algorithm_id"),
+            "model_id": payload.get("model_id"),
+            "event_type": payload.get("event_type", "detection"),
+            "class_name": payload.get("class_name", "unknown"),
+            "conf": payload.get("conf", 0),
+            "snapshot_path": payload.get("snapshot_path"),
+            "video_path": payload.get("video_path"),
+            "handling_status": payload.get("handling_status", 0),
+            "remark": payload.get("remark"),
+            "status": payload.get("status", "new"),
+            "created_at": format_datetime(now_dt),
+            "updated_at": format_datetime(now_dt),
+        }
 
     def _event_from_meta(self, row: EventMeta) -> dict:
         return {
@@ -193,31 +217,22 @@ class EventService:
         return await asyncio.to_thread(load_json, path)
 
     async def create_event(self, payload: dict):
+        def _create_to_json():
+            item = self._build_event_item(payload)
+            save_json(self._get_path(item["id"]), item, sync_metadata=False)
+            return item
+
         if settings.METADATA_DB_ENABLED:
             def _create_in_metadata():
-                event_id = generate_id("evt")
                 now_dt = datetime.now()
-                item = {
-                    "id": event_id,
-                    "channel_id": payload.get("channel_id"),
-                    "task_id": payload.get("task_id"),
-                    "algorithm_id": payload.get("algorithm_id"),
-                    "model_id": payload.get("model_id"),
-                    "event_type": payload.get("event_type", "detection"),
-                    "class_name": payload.get("class_name", "unknown"),
-                    "conf": payload.get("conf", 0),
-                    "snapshot_path": payload.get("snapshot_path"),
-                    "video_path": payload.get("video_path"),
-                    "handling_status": payload.get("handling_status", 0),
-                    "remark": payload.get("remark"),
-                    "status": payload.get("status", "new"),
-                    "created_at": format_datetime(now_dt),
-                    "updated_at": format_datetime(now_dt),
-                }
+                item = self._build_event_item(
+                    payload,
+                    created_at=now_dt,
+                )
                 with SessionLocal() as session:
                     session.add(
                         EventMeta(
-                            id=event_id,
+                            id=item["id"],
                             channel_id=item["channel_id"],
                             task_id=item["task_id"],
                             algorithm_id=item["algorithm_id"],
@@ -238,56 +253,43 @@ class EventService:
                     session.commit()
                 return item
 
-            return await asyncio.to_thread(_create_in_metadata)
+            try:
+                return await asyncio.to_thread(_create_in_metadata)
+            except Exception:
+                if settings.METADATA_DB_STRICT:
+                    raise
+                logger.exception("Failed to create event in metadata DB, falling back to JSON cache")
 
-        def _create():
-            event_id = generate_id("evt")
-            item = {
-                "id": event_id,
-                "channel_id": payload.get("channel_id"),
-                "task_id": payload.get("task_id"),
-                "algorithm_id": payload.get("algorithm_id"),
-                "model_id": payload.get("model_id"),
-                "event_type": payload.get("event_type", "detection"),
-                "class_name": payload.get("class_name", "unknown"),
-                "conf": payload.get("conf", 0),
-                "snapshot_path": payload.get("snapshot_path"),
-                "video_path": payload.get("video_path"),
-                "handling_status": payload.get("handling_status", 0),
-                "remark": payload.get("remark"),
-                "status": payload.get("status", "new"),
-                "created_at": now_iso(),
-                "updated_at": now_iso(),
-            }
-            save_json(self._get_path(event_id), item)
-            return item
-
-        return await asyncio.to_thread(_create)
+        return await asyncio.to_thread(_create_to_json)
 
     def update_event_sync(self, event_id: str, request):
         if settings.METADATA_DB_ENABLED:
-            with SessionLocal() as session:
-                row = session.query(EventMeta).filter(EventMeta.id == event_id).one_or_none()
-                if not row:
-                    return None
-                for field in [
-                    "event_type",
-                    "class_name",
-                    "conf",
-                    "snapshot_path",
-                    "video_path",
-                    "handling_status",
-                    "remark",
-                    "status",
-                ]:
-                    value = getattr(request, field, None)
-                    if value is not None:
-                        setattr(row, field, value)
-                row.updated_at = datetime.now()
-                row.raw_json = self._event_payload_from_meta(row)
-                session.commit()
-                session.refresh(row)
-                return self._event_from_meta(row)
+            try:
+                with SessionLocal() as session:
+                    row = session.query(EventMeta).filter(EventMeta.id == event_id).one_or_none()
+                    if row:
+                        for field in [
+                            "event_type",
+                            "class_name",
+                            "conf",
+                            "snapshot_path",
+                            "video_path",
+                            "handling_status",
+                            "remark",
+                            "status",
+                        ]:
+                            value = getattr(request, field, None)
+                            if value is not None:
+                                setattr(row, field, value)
+                        row.updated_at = datetime.now()
+                        row.raw_json = self._event_payload_from_meta(row)
+                        session.commit()
+                        session.refresh(row)
+                        return self._event_from_meta(row)
+            except Exception:
+                if settings.METADATA_DB_STRICT:
+                    raise
+                logger.exception("Failed to update event in metadata DB, falling back to JSON cache: %s", event_id)
 
         path = self._get_path(event_id)
         if not path.exists():
@@ -307,7 +309,7 @@ class EventService:
             if value is not None:
                 item[field] = value
         item["updated_at"] = now_iso()
-        save_json(path, item)
+        save_json(path, item, sync_metadata=False)
         return item
 
     async def update_event(self, event_id: str, request):

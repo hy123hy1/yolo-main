@@ -1332,6 +1332,26 @@ class TaskService:
                 pass
         return result
 
+    async def restart_task(self, task_id: str) -> dict[str, Any] | None:
+        task = await self.get_task(task_id, prefer_metadata=True)
+        if not task:
+            return None
+        refreshed_payload = await self._hydrate_task_source_from_channel(task)
+        if task.get("channel_id") and not refreshed_payload.get("source_url"):
+            raise ValueError(f"Task bound channel not found: {task.get('channel_id')}")
+        if refreshed_payload.get("source_url") != task.get("source_url") or refreshed_payload.get("source_type") != task.get("source_type"):
+            task = self._normalize_task(refreshed_payload, current=task)
+            task["id"] = task_id
+            task = await self._persist_task(task)
+        if not self._has_runnable_algorithm(task):
+            raise ValueError("Task has no enabled algorithms")
+        result = await analysis_service.restart_task_analysis(task_id)
+        if self._should_block_on_preview_warmup(task):
+            await self._warmup_task_preview(task)
+        else:
+            self._schedule_task_preview_warmup(task, reason="task-restart")
+        return result
+
     async def restore_running_tasks(self) -> dict[str, Any]:
         def _cleanup_stale_stopping_tasks() -> int:
             cleaned = 0

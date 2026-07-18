@@ -78,6 +78,27 @@ class ZonePreviewServiceTest(unittest.IsolatedAsyncioTestCase):
         settings.CHANNELS_DIR = self.original_channels_dir
         self.temp_dir.cleanup()
 
+    async def test_ffmpeg_capture_rtsp_probe_keeps_hevc_codec_headers(self):
+        capture = object.__new__(FFmpegCapture)
+        capture.source_url = "rtsp://example/live/test"
+        capture.width = 1920
+        capture.height = 1080
+        capture.frame_size = 1920 * 1080 * 3
+        capture.process = None
+        capture._pending_frame_bytes = bytearray()
+
+        fake_process = object()
+        with (
+            patch("src.services.zone_preview_service.subprocess.Popen", return_value=fake_process) as popen_mock,
+            patch("src.services.zone_preview_service.time.sleep"),
+        ):
+            capture.start()
+
+        command = popen_mock.call_args.args[0]
+        self.assertEqual(command[command.index("-probesize") + 1], "5M")
+        self.assertEqual(command[command.index("-analyzeduration") + 1], "1M")
+        self.assertEqual(command[command.index("-fflags") + 1], "+genpts+discardcorrupt")
+
     async def test_ffmpeg_capture_read_accumulates_partial_frame_bytes(self):
         capture = object.__new__(FFmpegCapture)
         capture.source_url = "rtsp://example/live/partial-frame"
@@ -85,6 +106,7 @@ class ZonePreviewServiceTest(unittest.IsolatedAsyncioTestCase):
         capture.height = 1
         capture.frame_size = 6
         capture.process = _ChunkedProcess([b"\x00\x01", b"\x02\x03\x04\x05"])
+        capture._pending_frame_bytes = bytearray()
 
         ok, frame = capture.read(retry=2)
 

@@ -81,35 +81,6 @@ export const getChannelFenceBrowserPlayUrl = async (channelId: string) => {
   return data
 }
 
-export const debugChannelAIOnce = async (channelId: string) => {
-  const { data } = await api.post(`/channels/${channelId}/ai/debug-once`)
-  return data
-}
-
-export const getChannelAIStatus = async (channelId: string) => {
-  const { data } = await api.get(`/channels/${channelId}/ai-status`)
-  return data
-}
-
-export interface ChannelAIConfigPayload {
-  enabled?: boolean
-  model_id?: string
-  labels?: string[]
-  conf?: number
-  frame_interval?: number
-  zone_ids?: string[]
-  save_snapshot?: boolean
-  models?: Array<{
-    model_id: string
-    enabled?: boolean
-    labels?: string[]
-    conf?: number
-    frame_interval?: number
-    zone_ids?: string[]
-    save_snapshot?: boolean
-  }>
-}
-
 export interface ChannelZonePayload {
   name: string
   color?: string
@@ -122,11 +93,6 @@ export interface UpdateChannelZonePayload {
   color?: string
   labels?: string[]
   coordinates?: number[][]
-}
-
-export const updateChannelAIConfig = async (channelId: string, payload: ChannelAIConfigPayload) => {
-  const { data } = await api.put(`/channels/${channelId}/ai-config`, payload)
-  return data
 }
 
 export const listChannelZones = async (channelId: string) => {
@@ -160,21 +126,6 @@ export const captureChannelSnapshot = async (channelId: string) => {
 
 export const getLatestChannelSnapshot = async (channelId: string) => {
   const { data } = await api.get(`/channels/${channelId}/snapshot/latest`)
-  return data
-}
-
-export const startChannelAI = async (channelId: string) => {
-  const { data } = await api.post(`/channels/${channelId}/ai/start`)
-  return data
-}
-
-export const applyChannelAI = async (channelId: string) => {
-  const { data } = await api.post(`/channels/${channelId}/ai/apply`)
-  return data
-}
-
-export const stopChannelAI = async (channelId: string) => {
-  const { data } = await api.post(`/channels/${channelId}/ai/stop`)
   return data
 }
 

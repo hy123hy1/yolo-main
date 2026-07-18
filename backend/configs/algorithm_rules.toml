@@ -1,11 +1,11 @@
 # 离岗
 [absence]
-absence_seconds = 5
+absence_seconds = 300
 
 # 聚集
 [gathering]
 count_threshold = 3
-hold_seconds = 2
+hold_seconds = 1
 
 # 拥堵
 [congestion]

@@ -16,8 +16,8 @@ from src.core.settings import settings
 from src.db.models import (
     AlgorithmRegionMeta,
     Base,
-    ChannelAIConfigMeta,
     ChannelMeta,
+    ChannelZoneMeta,
     ModelMetaRecord,
     TaskAlgorithmMeta,
     TaskMeta,
@@ -62,7 +62,7 @@ class MetadataDbSyncTest(unittest.TestCase):
         settings.CHANNELS_DIR = self.original_channels_dir
         self.temp_dir.cleanup()
 
-    def test_sync_channel_persists_parent_before_ai_config_children(self):
+    def test_sync_channel_persists_parent_and_strips_legacy_ai_fields(self):
         channel_payload = {
             "id": "ch_sync_parent_first",
             "name": "sync-parent-first",
@@ -72,7 +72,6 @@ class MetadataDbSyncTest(unittest.TestCase):
             "stream": "channel",
             "is_online": True,
             "is_playing": False,
-            "ai_enabled": True,
             "record_mode": "none",
             "snapshot_url": None,
             "snapshot_path": "G:/data/snapshots/ch_sync_parent_first.jpg",
@@ -106,14 +105,15 @@ class MetadataDbSyncTest(unittest.TestCase):
             channel_row = session.execute(
                 select(ChannelMeta).where(ChannelMeta.id == channel_payload["id"])
             ).scalar_one()
-            config_row = session.execute(
-                select(ChannelAIConfigMeta).where(ChannelAIConfigMeta.channel_id == channel_payload["id"])
+            zone_row = session.execute(
+                select(ChannelZoneMeta).where(ChannelZoneMeta.channel_id == channel_payload["id"])
             ).scalar_one()
 
         self.assertEqual(channel_row.name, "sync-parent-first")
         self.assertEqual(channel_row.snapshot_path, "G:/data/snapshots/ch_sync_parent_first.jpg")
-        self.assertEqual(config_row.model_id, "model_person")
-        self.assertEqual(config_row.labels_json, ["person"])
+        self.assertNotIn("ai_enabled", channel_row.raw_json)
+        self.assertNotIn("ai_config", (channel_row.raw_json.get("ext") or {}))
+        self.assertEqual(zone_row.id, "zone_sync_parent_first")
 
     def test_sync_all_metadata_from_files_does_not_resurrect_channels_when_db_has_rows(self):
         stale_payload = {
@@ -147,7 +147,6 @@ class MetadataDbSyncTest(unittest.TestCase):
                     stream="existing_db",
                     is_online=False,
                     is_playing=False,
-                    ai_enabled=False,
                     record_mode="none",
                     raw_json={
                         "id": "ch_existing_db",
@@ -158,7 +157,6 @@ class MetadataDbSyncTest(unittest.TestCase):
                         "stream": "existing_db",
                         "is_online": False,
                         "is_playing": False,
-                        "ai_enabled": False,
                         "record_mode": "none",
                         "ext": {},
                     },
@@ -302,7 +300,6 @@ class MetadataDbSyncTest(unittest.TestCase):
                     stream="cascade",
                     is_online=True,
                     is_playing=False,
-                    ai_enabled=False,
                     record_mode="none",
                     raw_json={},
                 )

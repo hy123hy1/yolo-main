@@ -110,12 +110,39 @@ class ChannelServiceTest(unittest.IsolatedAsyncioTestCase):
                     stream=payload.get("stream"),
                     is_online=payload.get("is_online"),
                     is_playing=payload.get("is_playing"),
-                    ai_enabled=payload.get("ai_enabled"),
                     record_mode=payload.get("record_mode"),
                     snapshot_url=payload.get("snapshot_url"),
                     snapshot_path=payload.get("snapshot_path"),
                     webrtc_api=payload.get("webrtc_api"),
                     hls=payload.get("hls"),
+                    created_at=None,
+                    updated_at=None,
+                    raw_json=payload,
+                )
+            )
+            session.commit()
+
+    def _insert_task_meta(self, payload: dict):
+        runtime = dict(payload.get("runtime") or {})
+        with self.session_local() as session:
+            session.merge(
+                TaskMeta(
+                    id=payload["id"],
+                    name=payload.get("name"),
+                    source_url=payload.get("source_url"),
+                    source_type=payload.get("source_type"),
+                    channel_id=payload.get("channel_id"),
+                    channel_name=payload.get("channel_name"),
+                    frame_interval=int(payload.get("frame_interval", 10) or 10),
+                    status=runtime.get("status") or payload.get("status") or "stopped",
+                    algorithm_count=len(list(payload.get("algorithms") or [])),
+                    region_count=len(list(payload.get("regions") or [])),
+                    is_running=bool(runtime.get("is_running")),
+                    started_at=None,
+                    stopped_at=None,
+                    last_analysis_at=None,
+                    last_event_at=None,
+                    last_error=runtime.get("last_error"),
                     created_at=None,
                     updated_at=None,
                     raw_json=payload,
@@ -207,7 +234,6 @@ class ChannelServiceTest(unittest.IsolatedAsyncioTestCase):
                     stream="meta_busy",
                     is_online=True,
                     is_playing=False,
-                    ai_enabled=False,
                     record_mode="none",
                     snapshot_url=None,
                     snapshot_path=None,
@@ -242,7 +268,6 @@ class ChannelServiceTest(unittest.IsolatedAsyncioTestCase):
                     stream="meta_free",
                     is_online=True,
                     is_playing=False,
-                    ai_enabled=False,
                     record_mode="none",
                     snapshot_url=None,
                     snapshot_path=None,
@@ -328,6 +353,69 @@ class ChannelServiceTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual([item["id"] for item in result["items"]], [channel_id])
 
+    async def test_get_ai_status_uses_bound_task_runtime(self):
+        channel_id = "ch_task_status"
+        task_id = "task_status_demo"
+        self._insert_channel_meta(
+            {
+                "id": channel_id,
+                "name": "task-status-channel",
+                "type": "rtsp",
+                "source_url": "rtsp://example/live/task-status",
+                "app": "live",
+                "stream": "task_status_stream",
+                "is_online": True,
+                "is_playing": False,
+                "ai_enabled": False,
+                "record_mode": "none",
+                "ext": {},
+            }
+        )
+        self._insert_task_meta(
+            {
+                "id": task_id,
+                "name": "test-task",
+                "channel_id": channel_id,
+                "source_url": "rtsp://example/live/task-status",
+                "source_type": "rtsp",
+                "status": "running",
+                "runtime": {
+                    "status": "running",
+                    "is_running": True,
+                },
+                "algorithms": [
+                    {"id": "algo_a", "enabled": True, "model_id": "model_a"},
+                ],
+                "regions": [],
+            }
+        )
+
+        service = ChannelService()
+        task_payload = {
+            "id": task_id,
+            "name": "test-task",
+            "channel_id": channel_id,
+            "status": "running",
+            "runtime": {
+                "status": "running",
+                "is_running": True,
+            },
+            "algorithms": [
+                {"id": "algo_a", "enabled": True, "model_id": "model_a"},
+            ],
+        }
+        task_status = {
+            "task_id": task_id,
+            "status": "running",
+            "runtime": {
+                "status": "running",
+                "is_running": True,
+                "frame_count": 12,
+                "event_count": 3,
+                "models": {"algo_a": {"detections": 1}},
+            },
+        }
+
     async def test_get_channel_prefers_metadata_row(self):
         channel_id = "ch_detail_db_first"
         persist_json(
@@ -366,7 +454,6 @@ class ChannelServiceTest(unittest.IsolatedAsyncioTestCase):
                     stream="detail_db_first",
                     is_online=True,
                     is_playing=False,
-                    ai_enabled=False,
                     record_mode="none",
                     snapshot_url=None,
                     snapshot_path=None,
@@ -417,7 +504,6 @@ class ChannelServiceTest(unittest.IsolatedAsyncioTestCase):
                     stream="runtime_metadata_only",
                     is_online=True,
                     is_playing=True,
-                    ai_enabled=False,
                     record_mode="none",
                     snapshot_url="/static/snapshots/runtime.jpg",
                     snapshot_path=str((self.snapshots_dir / "runtime.jpg").resolve()),
@@ -472,7 +558,6 @@ class ChannelServiceTest(unittest.IsolatedAsyncioTestCase):
                     stream="restore_playing",
                     is_online=True,
                     is_playing=True,
-                    ai_enabled=False,
                     record_mode="none",
                     snapshot_url=None,
                     snapshot_path=None,
@@ -505,7 +590,6 @@ class ChannelServiceTest(unittest.IsolatedAsyncioTestCase):
                     stream="restore_stopped",
                     is_online=False,
                     is_playing=False,
-                    ai_enabled=False,
                     record_mode="none",
                     snapshot_url=None,
                     snapshot_path=None,
@@ -598,7 +682,6 @@ class ChannelServiceTest(unittest.IsolatedAsyncioTestCase):
                     stream="runtime_existing",
                     is_online=False,
                     is_playing=False,
-                    ai_enabled=False,
                     record_mode="none",
                     snapshot_url=None,
                     snapshot_path=None,
@@ -634,7 +717,6 @@ class ChannelServiceTest(unittest.IsolatedAsyncioTestCase):
                     stream="metadata_only_visible",
                     is_online=False,
                     is_playing=False,
-                    ai_enabled=False,
                     record_mode="none",
                     snapshot_url=None,
                     snapshot_path=None,
@@ -714,7 +796,6 @@ class ChannelServiceTest(unittest.IsolatedAsyncioTestCase):
                     stream="runtime_zone_preview",
                     is_online=True,
                     is_playing=True,
-                    ai_enabled=False,
                     record_mode="none",
                     snapshot_url=None,
                     snapshot_path=None,
@@ -1390,7 +1471,6 @@ class ChannelServiceTest(unittest.IsolatedAsyncioTestCase):
                     stream="metadata_only",
                     is_online=False,
                     is_playing=False,
-                    ai_enabled=False,
                     record_mode="none",
                     snapshot_url=None,
                     snapshot_path=None,

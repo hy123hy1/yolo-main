@@ -1187,7 +1187,6 @@ class TaskServiceTest(unittest.IsolatedAsyncioTestCase):
                     stream=channel["stream"],
                     is_online=channel["is_online"],
                     is_playing=channel["is_playing"],
-                    ai_enabled=channel["ai_enabled"],
                     record_mode=channel["record_mode"],
                     snapshot_url=channel["snapshot_url"],
                     raw_json=channel,
@@ -2155,69 +2154,6 @@ class TaskServiceTest(unittest.IsolatedAsyncioTestCase):
         stale_loaded = service._load_task(task["id"])
 
         self.assertIsNone(stale_loaded)
-
-    async def test_analysis_service_updates_channel_runtime_in_metadata_row(self):
-        channel_id = "ch_analysis_runtime_db"
-        with self.session_local() as session:
-            session.merge(
-                ChannelMeta(
-                    id=channel_id,
-                    device_id=None,
-                    media_node_id=None,
-                    name="analysis-runtime-db",
-                    type="rtsp",
-                    source_url="rtsp://example/live/channel-runtime",
-                    app="live",
-                    stream="channel_runtime_db",
-                    is_online=True,
-                    is_playing=False,
-                    ai_enabled=True,
-                    record_mode="none",
-                    snapshot_url=None,
-                    snapshot_path=None,
-                    webrtc_api=None,
-                    hls=None,
-                    created_at=None,
-                    updated_at=None,
-                    raw_json={
-                        "id": channel_id,
-                        "name": "analysis-runtime-db",
-                        "type": "rtsp",
-                        "source_url": "rtsp://example/live/channel-runtime",
-                        "app": "live",
-                        "stream": "channel_runtime_db",
-                        "is_online": True,
-                        "is_playing": False,
-                        "ai_enabled": True,
-                        "record_mode": "none",
-                        "ext": {
-                            "ai_config": {
-                                "enabled": True,
-                                "models": [],
-                            }
-                        },
-                    },
-                )
-            )
-            session.commit()
-
-        service = AnalysisService()
-        service._update_runtime(
-            channel_id,
-            status="running",
-            last_analysis_at="2026-06-23 10:00:00",
-            frame_count=12,
-            event_count=3,
-        )
-
-        with self.session_local() as session:
-            row = session.query(ChannelMeta).filter(ChannelMeta.id == channel_id).one()
-            runtime = ((row.raw_json or {}).get("ext") or {}).get("ai_runtime") or {}
-
-        self.assertEqual(runtime.get("status"), "running")
-        self.assertEqual(runtime.get("last_analysis_at"), "2026-06-23 10:00:00")
-        self.assertEqual(runtime.get("frame_count"), 12)
-        self.assertEqual(runtime.get("event_count"), 3)
 
     async def test_start_task_can_use_metadata_when_json_missing(self):
         task = await self.service.create_task(
