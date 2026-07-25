@@ -10,6 +10,8 @@
         <router-link to="/models">模型管理</router-link>
         <router-link to="/infer">推理</router-link>
         <router-link to="/channels">通道</router-link>
+        <router-link to="/camera-health">摄像头健康</router-link>
+        <router-link to="/electronic-seal">电子封条</router-link>
         <router-link to="/events">事件</router-link>
         <router-link to="/recordings">录像</router-link>
       </div>

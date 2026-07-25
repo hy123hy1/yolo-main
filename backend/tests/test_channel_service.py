@@ -23,6 +23,71 @@ from src.services.platform_storage import save_json as persist_json
 
 
 class ChannelServiceTest(unittest.IsolatedAsyncioTestCase):
+    def test_wvp_channel_without_playable_source_is_offline_even_when_db_flag_is_true(self):
+        service = ChannelService()
+        row = ChannelMeta(
+            id="wvp_no_source_1",
+            name="大门口7",
+            type="wvp",
+            source_url=None,
+            app="rtp",
+            stream="",
+            is_online=True,
+            is_playing=False,
+            raw_json={
+                "id": "wvp_no_source_1",
+                "name": "大门口7",
+                "type": "wvp",
+                "is_online": True,
+                "source_url": None,
+                "stream": "",
+                "ext": {
+                    "upstream": {
+                        "platform": "wvp",
+                        "online": False,
+                        "play_info": {},
+                    }
+                },
+            },
+        )
+
+        channel = service._build_channel_from_metadata_row(row)
+
+        self.assertFalse(channel["is_online"])
+
+    def test_wvp_channel_ignores_stale_db_online_flag_when_upstream_is_offline(self):
+        service = ChannelService()
+        row = ChannelMeta(
+            id="wvp_stale_online_1",
+            name="大门口9",
+            type="wvp",
+            source_url="rtsp://example.test/stale",
+            app="rtp",
+            stream="stale_stream",
+            is_online=True,
+            is_playing=False,
+            raw_json={
+                "id": "wvp_stale_online_1",
+                "name": "大门口9",
+                "type": "wvp",
+                "is_online": True,
+                "source_url": "rtsp://example.test/stale",
+                "stream": "stale_stream",
+                "ext": {
+                    "upstream": {
+                        "platform": "wvp",
+                        "online": False,
+                        "channel_info": {"gbStatus": "OFF"},
+                        "play_info": {},
+                    }
+                },
+            },
+        )
+
+        channel = service._build_channel_from_metadata_row(row)
+
+        self.assertFalse(channel["is_online"])
+
     def test_wvp_channel_uses_upstream_online_when_db_column_is_false(self):
         service = ChannelService()
         row = ChannelMeta(

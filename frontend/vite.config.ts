@@ -49,6 +49,17 @@ export default defineConfig(({ mode }) => {
               console.log('media proxy error', err)
             })
           }
+        },
+        '/electronic-seal-api': {
+          target: env.ELECTRONIC_SEAL_API_TARGET || 'http://localhost:9001',
+          changeOrigin: true,
+          rewrite: (value) => value.replace(/^\/electronic-seal-api/, ''),
+          ws: true,
+          configure: (proxy) => {
+            proxy.on('error', (err) => {
+              console.log('electronic seal proxy error', err)
+            })
+          }
         }
       }
     }

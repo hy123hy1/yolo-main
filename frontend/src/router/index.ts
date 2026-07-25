@@ -52,6 +52,16 @@ const routes = [
     component: () => import('../pages/Channels.vue')
   },
   {
+    path: '/camera-health',
+    name: 'CameraHealth',
+    component: () => import('../pages/CameraHealth.vue')
+  },
+  {
+    path: '/electronic-seal',
+    name: 'ElectronicSeal',
+    component: () => import('../pages/ElectronicSeal.vue')
+  },
+  {
     path: '/events',
     name: 'Events',
     component: () => import('../pages/Events.vue')

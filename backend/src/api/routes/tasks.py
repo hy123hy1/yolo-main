@@ -1,9 +1,11 @@
+import asyncio
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, Field
 
-from src.services.task_service import TaskService
+from src.services.realtime_detection_service import realtime_detection_hub
+from src.services.task_service import ElectronicSealChannelOwnedError, TaskService
 
 router = APIRouter(prefix="/tasks", tags=["tasks"])
 task_service = TaskService()
@@ -82,6 +84,8 @@ async def resync_all_task_metadata():
 async def create_task(request: TaskCreateRequest):
     try:
         return await task_service.create_task(request.model_dump())
+    except ElectronicSealChannelOwnedError as exc:
+        raise HTTPException(exc.status_code, exc.detail) from exc
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
 
@@ -122,6 +126,8 @@ async def list_task_available_models(task_id: str):
 async def update_task(task_id: str, request: TaskUpdateRequest):
     try:
         result = await task_service.update_task(task_id, request.model_dump(exclude_none=True))
+    except ElectronicSealChannelOwnedError as exc:
+        raise HTTPException(exc.status_code, exc.detail) from exc
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
     if not result:
@@ -141,6 +147,8 @@ async def delete_task(task_id: str):
 async def start_task(task_id: str):
     try:
         result = await task_service.start_task(task_id)
+    except ElectronicSealChannelOwnedError as exc:
+        raise HTTPException(exc.status_code, exc.detail) from exc
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
     if not result:
@@ -162,6 +170,38 @@ async def get_task_status(task_id: str):
     if not result:
         raise HTTPException(404, "Task not found")
     return result
+
+
+@router.websocket("/{task_id}/detections/ws")
+async def task_detection_websocket(task_id: str, websocket: WebSocket):
+    await websocket.accept()
+    subscription = realtime_detection_hub.subscribe(task_id)
+    disconnect_task = asyncio.create_task(websocket.receive())
+    try:
+        await websocket.send_json({"type": "ready", "task_id": task_id})
+        while True:
+            queue_task = asyncio.create_task(subscription.queue.get())
+            done, _ = await asyncio.wait(
+                (queue_task, disconnect_task),
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if disconnect_task in done:
+                queue_task.cancel()
+                await asyncio.gather(queue_task, return_exceptions=True)
+                message = disconnect_task.result()
+                if message.get("type") == "websocket.disconnect":
+                    break
+                disconnect_task = asyncio.create_task(websocket.receive())
+                continue
+
+            payload = queue_task.result()
+            await websocket.send_json(payload)
+    except WebSocketDisconnect:
+        pass
+    finally:
+        disconnect_task.cancel()
+        await asyncio.gather(disconnect_task, return_exceptions=True)
+        subscription.unsubscribe()
 
 
 @router.get("/{task_id}/metrics")

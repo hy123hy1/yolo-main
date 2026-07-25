@@ -1,4 +1,5 @@
 import asyncio
+import json
 import sys
 import tempfile
 import threading
@@ -17,10 +18,87 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from src.core.settings import settings
+import src.services.analysis_service as analysis_service
 from src.services.analysis_service import AnalysisService
 
 
 class AnalysisServiceTest(unittest.TestCase):
+    def test_parse_task_detection_debug_ids_reads_comma_separated_environment_value(self):
+        self.assertEqual(
+            analysis_service._parse_task_detection_debug_ids(" f5035e1e, 8a89a58b, f5035e1e "),
+            {"f5035e1e", "8a89a58b"},
+        )
+
+    def test_build_realtime_detection_payload(self):
+        service = AnalysisService()
+        frame = np.zeros((720, 1280, 3), dtype=np.uint8)
+        algorithms = [
+            {
+                "id": "algo_person",
+                "scene_name": "Person detection",
+                "overlay_color": "#22c55e",
+            },
+            {
+                "id": "algo_empty",
+                "scene_name": "Vehicle detection",
+            },
+        ]
+        inference_results = [
+            {
+                "algorithm": algorithms[0],
+                "algorithm_id": "algo_person",
+                "detections": [
+                    {
+                        "class_name": "person",
+                        "conf": 0.91234,
+                        "x1": 10,
+                        "y1": 20,
+                        "x2": 110,
+                        "y2": 220,
+                        "zone_id": "zone_gate",
+                        "model": object(),
+                    }
+                ],
+            },
+            {
+                "algorithm": algorithms[1],
+                "algorithm_id": "algo_empty",
+                "detections": [],
+            },
+        ]
+
+        payload = service._build_realtime_detection_payload(
+            task={"id": "task_demo", "channel_id": "channel_demo"},
+            frame=frame,
+            frame_count=42,
+            frame_timestamp=1700000000.25,
+            inference_results=inference_results,
+        )
+
+        self.assertEqual(payload["type"], "task_detection")
+        self.assertEqual(payload["task_id"], "task_demo")
+        self.assertEqual(payload["channel_id"], "channel_demo")
+        self.assertEqual(payload["seq"], 42)
+        self.assertEqual(payload["timestamp"], 1700000000.25)
+        self.assertEqual(payload["source_width"], 1280)
+        self.assertEqual(payload["source_height"], 720)
+        self.assertEqual(payload["algorithms"][0]["algorithm_id"], "algo_person")
+        self.assertEqual(payload["algorithms"][0]["label"], "Person detection")
+        self.assertEqual(payload["algorithms"][0]["color"], "#22c55e")
+        self.assertEqual(
+            payload["algorithms"][0]["detections"],
+            [
+                {
+                    "label": "person",
+                    "confidence": 0.912,
+                    "bbox": [10.0, 20.0, 110.0, 220.0],
+                    "zone_id": "zone_gate",
+                }
+            ],
+        )
+        self.assertEqual(payload["algorithms"][1]["detections"], [])
+        json.dumps(payload)
+
     def test_build_task_capture_uses_ffmpeg_probe_and_capture_for_rtsp(self):
         service = AnalysisService()
         ffprobe_result = type(
@@ -43,7 +121,50 @@ class AnalysisServiceTest(unittest.TestCase):
 
         self.assertIs(capture, fake_capture)
         run_mock.assert_called_once()
-        capture_mock.assert_called_once_with("rtsp://example/live/test", 1920, 1080, init_wait=0.3)
+        capture_mock.assert_called_once_with(
+            "rtsp://example/live/test",
+            1920,
+            1080,
+            init_wait=0.3,
+            latest_only=True,
+        )
+
+    def test_build_realtime_detection_payload_includes_processing_timing(self):
+        service = AnalysisService()
+        frame = np.zeros((720, 1280, 3), dtype=np.uint8)
+
+        payload = service._build_realtime_detection_payload(
+            task={"id": "task_timing", "channel_id": "channel_timing"},
+            frame=frame,
+            frame_count=8,
+            frame_timestamp=100.0,
+            inference_results=[],
+            captured_at=99.6,
+            inference_started_at=99.7,
+            inference_finished_at=99.95,
+            published_at=100.0,
+            capture_sequence=120,
+            dropped_frames=4,
+        )
+
+        self.assertEqual(payload["timestamp"], 100.0)
+        self.assertEqual(
+            payload["timing"],
+            {
+                "capture_sequence": 120,
+                "dropped_frames": 4,
+                "captured_at": 99.6,
+                "inference_started_at": 99.7,
+                "inference_finished_at": 99.95,
+                "published_at": 100.0,
+                "capture_to_inference_ms": 100.0,
+                "inference_ms": 250.0,
+                "inference_to_publish_ms": 50.0,
+                "end_to_end_ms": 400.0,
+            },
+        )
+        self.assertEqual(payload["capture_sequence"], 120)
+        self.assertEqual(payload["dropped_frames"], 4)
 
     def test_build_task_execution_snapshot_uses_task_source_and_enabled_algorithms(self):
         service = AnalysisService()

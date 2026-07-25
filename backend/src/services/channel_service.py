@@ -762,6 +762,7 @@ class ChannelService:
         for field in ["pid", "log_path", "log_tail", "process_alive", "inspect_rtmp", "stopped_at", "startup_exception"]:
             browser.pop(field, None)
         ffmpeg_key = browser.get("ffmpeg_key")
+        stopped_managed_transcode = bool(ffmpeg_key)
         if ffmpeg_key:
             adapter = self._build_adapter(node)
             try:
@@ -776,7 +777,7 @@ class ChannelService:
         adapter = self._build_adapter(node)
         try:
             existing = adapter.get_media_list(item["app"], browser_stream, "rtmp")
-            if existing.get("code") == 0 and existing.get("data"):
+            if not stopped_managed_transcode and existing.get("code") == 0 and existing.get("data"):
                 browser.update({
                     "enabled": True,
                     "app": item["app"],
@@ -1039,7 +1040,14 @@ class ChannelService:
         payload["source_url"] = row.source_url
         payload["app"] = row.app
         payload["stream"] = row.stream
-        payload["is_online"] = bool(row.is_online) or self._is_wvp_upstream_online(payload)
+        if str(row.type or "").lower() == "wvp":
+            has_playable_source = bool(
+                str(row.source_url or "").strip()
+                and str(row.stream or "").strip()
+            )
+            payload["is_online"] = has_playable_source and self._is_wvp_upstream_online(payload)
+        else:
+            payload["is_online"] = bool(row.is_online)
         payload["is_playing"] = row.is_playing
         payload["ai_enabled"] = bool(getattr(row, "ai_enabled", payload.get("ai_enabled", False)))
         payload["record_mode"] = row.record_mode

@@ -32,6 +32,7 @@ from src.db.models import (
     TaskRegionMeta,
 )
 from src.services import metadata_db_sync
+from src.services import channel_service as channel_service_module
 from src.services.analysis_service import AnalysisService, analysis_service
 from src.services.channel_service import ChannelService
 from src.services.event_service import EventService
@@ -4320,6 +4321,39 @@ class TaskServiceTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("/live/e36c059e_browser", browser_target)
         self.assertEqual(zone_stream, "e36c059e_zone")
         self.assertIn("/live/e36c059e_zone", zone_target)
+
+    def test_browser_transcode_does_not_reuse_managed_stream_after_stop(self):
+        class FakeAdapter:
+            def __init__(self):
+                self.add_calls = []
+
+            def delete_ffmpeg_source(self, key):
+                return {"code": 0, "data": {"flag": True}}
+
+            def get_media_list(self, app, stream, schema):
+                return {"code": 0, "data": [{"app": app, "stream": stream, "schema": schema}]}
+
+            def add_ffmpeg_source(self, **kwargs):
+                self.add_calls.append(kwargs)
+                return {"code": 0, "data": {"key": "new-ffmpeg-key"}}
+
+        service = ChannelService()
+        adapter = FakeAdapter()
+        item = {
+            "id": "ch-browser-refresh",
+            "app": "rtp",
+            "stream": "source-stream",
+            "source_url": "rtsp://camera/source",
+            "ext": {"browser_transcode": {"ffmpeg_key": "old-ffmpeg-key"}},
+        }
+
+        with patch.object(service, "_build_adapter", return_value=adapter), patch.object(
+            channel_service_module.time, "sleep"
+        ):
+            result = service._start_browser_transcode(None, item)
+
+        self.assertEqual(len(adapter.add_calls), 1)
+        self.assertEqual(result["ffmpeg_key"], "new-ffmpeg-key")
 
     async def test_zone_preview_play_urls_fallback_uses_channel_id_unique_stream(self):
         channel_payload = {

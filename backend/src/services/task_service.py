@@ -10,6 +10,7 @@ from typing import Any
 from src.core.settings import settings
 from src.db.database import SessionLocal
 from src.db.models import AlgorithmRegionMeta, ModelMetaRecord, TaskAlgorithmMeta, TaskAlgorithmMetricMeta, TaskAlgorithmRegionMeta, TaskMeta, TaskRegionMeta
+from src.electronic_seal.store import ElectronicSealStore
 from src.services.analysis_service import analysis_service
 from src.services.channel_service import ChannelService
 from src.services import metadata_db_sync
@@ -25,13 +26,48 @@ model_service = ModelService()
 logger = logging.getLogger("uvicorn.error")
 
 
+class ElectronicSealChannelOwnedError(ValueError):
+    status_code = 409
+    detail = "channel_owned_by_electronic_seal"
+
+    def __init__(self, channel_id: str):
+        self.channel_id = str(channel_id)
+        super().__init__(f"Channel is owned by electronic seal: {self.channel_id}")
+
+
 class TaskService:
-    def __init__(self):
+    def __init__(self, electronic_seal_store: ElectronicSealStore | None = None):
         self.tasks_dir: Path = settings.TASKS_DIR
+        self.electronic_seal_store = electronic_seal_store or ElectronicSealStore(
+            session_factory=SessionLocal
+        )
         self._preview_warmup_jobs: dict[str, asyncio.Task] = {}
         self._preview_warmup_semaphore: asyncio.Semaphore | None = None
         self._preview_warmup_semaphore_limit: int | None = None
         self._source_refresh_jobs: dict[str, asyncio.Task] = {}
+
+    def _assert_channel_not_owned_by_electronic_seal(self, channel_id: str | None) -> None:
+        channel_id = str(channel_id or "").strip()
+        if not channel_id:
+            return
+        override = getattr(self, "electronic_seal_owner", None)
+        if callable(override):
+            if bool(override(channel_id)):
+                raise ElectronicSealChannelOwnedError(channel_id)
+            return
+        try:
+            profile = self.electronic_seal_store.get_channel_profile(channel_id)
+        except Exception as exc:
+            # A worker/database startup race must not make unrelated AI tasks
+            # unavailable; the worker will enforce ownership once its schema is ready.
+            logger.warning(
+                "[TaskOwnership] channel_id=%s ownership_lookup_failed error=%s",
+                channel_id,
+                exc,
+            )
+            return
+        if profile and bool(profile.get("bound")):
+            raise ElectronicSealChannelOwnedError(channel_id)
 
     @staticmethod
     def _extract_scalar_id(row: Any) -> str:
@@ -1020,6 +1056,7 @@ class TaskService:
     async def create_task(self, payload: dict[str, Any]) -> dict[str, Any]:
         if not payload.get("channel_id"):
             raise ValueError("Task creation requires channel_id")
+        self._assert_channel_not_owned_by_electronic_seal(payload.get("channel_id"))
         normalized_payload = await self._hydrate_task_source_from_channel(payload)
         existing_task = await self._find_any_task_on_channel(normalized_payload.get("channel_id"))
         if existing_task:
@@ -1033,6 +1070,7 @@ class TaskService:
         if not current:
             return None
         merged_payload = {**current, **payload}
+        self._assert_channel_not_owned_by_electronic_seal(merged_payload.get("channel_id"))
         if payload.get("channel_id") and "source_url" not in payload:
             merged_payload["source_url"] = None
             merged_payload["source_type"] = None
@@ -1279,6 +1317,7 @@ class TaskService:
         _log_step("get_task")
         if not task:
             return None
+        self._assert_channel_not_owned_by_electronic_seal(task.get("channel_id"))
         running_task = await self._find_running_task_on_channel(task.get("channel_id"), exclude_task_id=task_id)
         _log_step("find_running_task")
         if running_task:
@@ -1336,6 +1375,7 @@ class TaskService:
         task = await self.get_task(task_id, prefer_metadata=True)
         if not task:
             return None
+        self._assert_channel_not_owned_by_electronic_seal(task.get("channel_id"))
         refreshed_payload = await self._hydrate_task_source_from_channel(task)
         if task.get("channel_id") and not refreshed_payload.get("source_url"):
             raise ValueError(f"Task bound channel not found: {task.get('channel_id')}")

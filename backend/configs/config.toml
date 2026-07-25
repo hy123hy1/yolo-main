@@ -65,3 +65,13 @@
   APIBase = "http://192.168.1.58:18080"
   ChannelListPath = "/api/common/channel/list"
   ChannelPlayPath = "/api/common/channel/play"
+
+[CameraHealth]
+  Enabled = true
+  SampleIntervalMs = 1000
+  FrameStaleSeconds = 5
+  WarmupSeconds = 30
+  AlarmHoldSeconds = 10
+  RecoveryHoldSeconds = 15
+  MaxWorkers = 8
+  ThresholdsFile = "configs/camera_health_thresholds.toml"

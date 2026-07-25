@@ -51,6 +51,17 @@ def _load_config_toml_to_environment(base_dir: Path) -> None:
     _set_env_if_absent("TASK_ALARM_VIDEO_CAPTURE_TIMEOUT_SECONDS", startup.get("TaskAlarmVideoCaptureTimeoutSeconds"))
     _set_env_if_absent("TASK_ALARM_VIDEO_READ_FAIL_LIMIT", startup.get("TaskAlarmVideoReadFailLimit"))
 
+    camera_health = config.get("CameraHealth", {})
+    if isinstance(camera_health, dict):
+        _set_env_if_absent("CAMERA_HEALTH_ENABLED", camera_health.get("Enabled"))
+        _set_env_if_absent("CAMERA_HEALTH_SAMPLE_INTERVAL_MS", camera_health.get("SampleIntervalMs"))
+        _set_env_if_absent("CAMERA_HEALTH_FRAME_STALE_SECONDS", camera_health.get("FrameStaleSeconds"))
+        _set_env_if_absent("CAMERA_HEALTH_WARMUP_SECONDS", camera_health.get("WarmupSeconds"))
+        _set_env_if_absent("CAMERA_HEALTH_ALARM_HOLD_SECONDS", camera_health.get("AlarmHoldSeconds"))
+        _set_env_if_absent("CAMERA_HEALTH_RECOVERY_HOLD_SECONDS", camera_health.get("RecoveryHoldSeconds"))
+        _set_env_if_absent("CAMERA_HEALTH_MAX_WORKERS", camera_health.get("MaxWorkers"))
+        _set_env_if_absent("CAMERA_HEALTH_THRESHOLDS_FILE", camera_health.get("ThresholdsFile"))
+
     ai_cfg = config.get("AI", {}) if isinstance(config.get("AI"), dict) else {}
     _set_env_if_absent("AI_INFERENCE_DEVICE", ai_cfg.get("InferenceDevice"))
 
@@ -145,6 +156,16 @@ class Settings(BaseSettings):
     TASK_ALARM_VIDEO_READ_FAIL_LIMIT: int = 20
     AI_INFERENCE_DEVICE: str = "auto"
 
+    CAMERA_HEALTH_ENABLED: bool = True
+    CAMERA_HEALTH_SAMPLE_INTERVAL_MS: int = 1000
+    CAMERA_HEALTH_FRAME_STALE_SECONDS: float = 5.0
+    CAMERA_HEALTH_WARMUP_SECONDS: int = 30
+    CAMERA_HEALTH_ALARM_HOLD_SECONDS: int = 10
+    CAMERA_HEALTH_RECOVERY_HOLD_SECONDS: int = 15
+    CAMERA_HEALTH_MAX_WORKERS: int = 8
+    CAMERA_HEALTH_THRESHOLDS_FILE: Path = CONFIG_DIR / "camera_health_thresholds.toml"
+    CAMERA_HEALTH_SNAPSHOT_DIR: Path = DATA_DIR / "camera_health_snapshots"
+
     WVP_ENABLED: bool = False
     WVP_API_BASE: str = ""
     WVP_CHANNEL_LIST_PATH: str = "/api/common/channel/list"
@@ -209,6 +230,7 @@ class Settings(BaseSettings):
             self.EVENTS_DIR,
             self.RECORDINGS_DIR,
             self.SNAPSHOTS_DIR,
+            self.CAMERA_HEALTH_SNAPSHOT_DIR,
             self.TRANSCODE_LOGS_DIR,
             self.MODELS_DIR,
             self.REGISTRY_DIR,

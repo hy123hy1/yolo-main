@@ -13,6 +13,7 @@ import numpy as np
 
 from src.core.settings import settings
 from src.services.platform_storage import load_json, now_iso, save_json
+from src.vision_core.ffmpeg_capture import FFmpegCapture
 
 
 logger = logging.getLogger("uvicorn.error")
@@ -28,103 +29,6 @@ ZONE_PREVIEW_EXPECTED_SHUTDOWN_ERROR_KEYWORDS = (
     "error muxing a packet",
     "task finished with error code: -32",
 )
-
-
-class FFmpegCapture:
-    def __init__(self, source_url: str, width: int, height: int, init_wait: float = 1.0):
-        self.source_url = source_url
-        self.width = width
-        self.height = height
-        self.frame_size = width * height * 3
-        self.process: subprocess.Popen | None = None
-        self._pending_frame_bytes = bytearray()
-        self.start()
-        if init_wait > 0:
-            time.sleep(init_wait)
-
-    def start(self):
-        self._pending_frame_bytes.clear()
-        cmd = [
-            settings.FFMPEG_BIN,
-            "-loglevel",
-            "error",
-        ]
-        if str(self.source_url).lower().startswith("rtsp://"):
-            cmd.extend([
-                "-rtsp_transport",
-                "tcp",
-                "-fflags",
-                "+genpts+discardcorrupt",
-                "-flags",
-                "low_delay",
-                "-max_delay",
-                "500000",
-                "-probesize",
-                "5M",
-                "-analyzeduration",
-                "1M",
-            ])
-        cmd.extend([
-            "-i",
-            self.source_url,
-            "-an",
-            "-c:v",
-            "rawvideo",
-            "-pix_fmt",
-            "bgr24",
-            "-f",
-            "rawvideo",
-            "pipe:1",
-        ])
-
-        kwargs = {}
-        if sys.platform == "win32":
-            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
-
-        self.process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            bufsize=10**8,
-            **kwargs,
-        )
-
-    def read(self, retry: int = 3):
-        for _ in range(retry):
-            if self.process is None or self.process.poll() is not None or self.process.stdout is None:
-                return False, None
-            try:
-                while len(self._pending_frame_bytes) < self.frame_size:
-                    raw = self.process.stdout.read(self.frame_size - len(self._pending_frame_bytes))
-                    if len(raw) == 0:
-                        break
-                    self._pending_frame_bytes.extend(raw)
-            except Exception as exc:
-                logger.warning("FFmpegCapture read error: %s", exc)
-                return False, None
-
-            if len(self._pending_frame_bytes) >= self.frame_size:
-                raw = bytes(self._pending_frame_bytes[: self.frame_size])
-                del self._pending_frame_bytes[: self.frame_size]
-                frame = np.frombuffer(raw, dtype=np.uint8).reshape((self.height, self.width, 3)).copy()
-                return True, frame
-            time.sleep(0.05)
-        return False, None
-
-    def release(self):
-        if self.process is None:
-            return
-        try:
-            self.process.kill()
-            self.process.wait(timeout=2)
-        except Exception:
-            pass
-        finally:
-            self.process = None
-            self._pending_frame_bytes.clear()
-
-    def is_healthy(self) -> bool:
-        return self.process is not None and self.process.poll() is None
 
 
 class ZonePreviewService:

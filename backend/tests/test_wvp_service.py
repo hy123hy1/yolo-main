@@ -79,6 +79,80 @@ class WVPServiceTest(unittest.TestCase):
             )
         )
 
+    def test_configured_recorder_rtsp_is_distinguished_from_wvp_stream_rtsp(self):
+        from src.services.wvp_service import WVPService
+
+        base = {
+            "app": "rtp",
+            "stream": "stream_1",
+            "source_type": "rtsp",
+        }
+        self.assertTrue(
+            WVPService.is_configured_recorder_rtsp(
+                {**base, "source_url": "rtsp://admin:password@192.168.1.2:554/Streaming/Channels/101"}
+            )
+        )
+        self.assertFalse(
+            WVPService.is_configured_recorder_rtsp(
+                {**base, "source_url": "rtsp://192.168.1.36:554/rtp/stream_1"}
+            )
+        )
+
+    @patch("src.services.wvp_service.urlopen")
+    def test_refresh_channel_source_keeps_configured_recorder_rtsp_for_local_playback(self, mock_urlopen):
+        from src.services.wvp_service import WVPService
+
+        stream_id = "34020000001110000121_34020000001320000002"
+        recorder_source = "rtsp://admin:password@192.168.1.2:554/Streaming/Channels/101"
+        channel = {
+            "id": "8224",
+            "device_id": "34020000001320000002",
+            "name": "大门口",
+            "type": "wvp",
+            "source_url": recorder_source,
+            "source_type": "rtsp",
+            "app": "rtp",
+            "stream": stream_id,
+            "is_online": True,
+            "is_playing": True,
+            "ext": {
+                "upstream": {
+                    "platform": "wvp",
+                    "channel_db_id": "8226",
+                    "online": True,
+                    "channel_info": {"gbStatus": "ON"},
+                    "play_info": {},
+                }
+            },
+        }
+
+        def fake_urlopen(request, timeout=0):
+            if "channel/play" in request.full_url:
+                return _FakeHTTPResponse(
+                    {
+                        "code": 0,
+                        "data": {
+                            "app": "rtp",
+                            "stream": stream_id,
+                            "rtsp": f"rtsp://192.168.1.36:554/rtp/{stream_id}?videoCodec=H264",
+                            "mediaInfo": {"online": True, "videoCodec": "H264", "stream": stream_id},
+                        },
+                    }
+                )
+            raise AssertionError(f"Unexpected URL: {request.full_url}")
+
+        mock_urlopen.side_effect = fake_urlopen
+
+        refreshed = WVPService().refresh_channel_source(channel)
+
+        self.assertEqual(refreshed["source_url"], recorder_source)
+        self.assertEqual(refreshed["source_type"], "rtsp")
+        self.assertEqual(refreshed["stream"], stream_id)
+        self.assertEqual(
+            refreshed["ext"]["upstream"]["play_info"]["rtsp"],
+            f"rtsp://192.168.1.36:554/rtp/{stream_id}?videoCodec=H264",
+        )
+
     @patch("src.services.wvp_service.urlopen")
     def test_sync_channels_hydrates_missing_online_channel_play_info(self, mock_urlopen):
         from src.services.wvp_service import WVPService

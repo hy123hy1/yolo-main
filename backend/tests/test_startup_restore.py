@@ -27,9 +27,11 @@ class StartupRestoreTest(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch.object(main, "initialize_metadata_database", side_effect=lambda: time.sleep(0.2)),
+            patch.object(main, "ensure_camera_health_schema"),
             patch.object(main.channel_service, "restore_channel_proxies", AsyncMock(side_effect=slow_restore)),
             patch.object(main.task_service, "restore_running_tasks", AsyncMock(side_effect=slow_restore)),
             patch.object(main.analysis_service, "restore_enabled_channels", AsyncMock(side_effect=slow_restore)),
+            patch.object(main.camera_health_manager, "restore_enabled_channels", side_effect=slow_restore),
             patch("asyncio.create_task", side_effect=fake_create_task),
         ):
             await asyncio.wait_for(main.restore_ai_analysis_tasks(), timeout=0.05)
@@ -43,6 +45,7 @@ class StartupRestoreTest(unittest.IsolatedAsyncioTestCase):
             patch.object(main.channel_service, "restore_channel_proxies", AsyncMock(return_value={"restored": 0})),
             patch.object(main.task_service, "restore_running_tasks", AsyncMock(return_value={"restored": 0})),
             patch.object(main.analysis_service, "restore_enabled_channels", AsyncMock(return_value={"restored": 0})),
+            patch.object(main.camera_health_manager, "restore_enabled_channels", return_value={"restored": 0}),
             patch("src.main.asyncio.sleep", AsyncMock()) as mocked_sleep,
         ):
             await main._restore_runtime_state_after_startup()
@@ -53,13 +56,29 @@ class StartupRestoreTest(unittest.IsolatedAsyncioTestCase):
         with (
             patch.object(main.settings, "STARTUP_TASK_RESTORE_INITIAL_DELAY_SECONDS", 0.0, create=True),
             patch.object(main, "initialize_metadata_database") as mocked_initialize,
+            patch.object(main, "ensure_camera_health_schema"),
             patch.object(main.channel_service, "restore_channel_proxies", AsyncMock(return_value={"restored": 0})),
             patch.object(main.task_service, "restore_running_tasks", AsyncMock(return_value={"restored": 0})),
             patch.object(main.analysis_service, "restore_enabled_channels", AsyncMock(return_value={"restored": 0})),
+            patch.object(main.camera_health_manager, "restore_enabled_channels", return_value={"restored": 0}),
         ):
             await main._restore_runtime_state_after_startup()
 
         mocked_initialize.assert_called_once_with(sync_files=False)
+
+    async def test_startup_restores_enabled_camera_health_channels(self):
+        with (
+            patch.object(main, "initialize_metadata_database", side_effect=lambda: None),
+            patch.object(main, "ensure_camera_health_schema"),
+            patch.object(main, "ensure_camera_health_schema"),
+            patch.object(main.channel_service, "restore_channel_proxies", AsyncMock(return_value={"restored": 0})),
+            patch.object(main.task_service, "restore_running_tasks", AsyncMock(return_value={"restored": 0})),
+            patch.object(main.analysis_service, "restore_enabled_channels", AsyncMock(return_value={"restored": 0})),
+            patch.object(main.camera_health_manager, "restore_enabled_channels") as mocked_restore,
+        ):
+            await main._restore_runtime_state_after_startup()
+
+        mocked_restore.assert_called_once_with()
 
 
 if __name__ == "__main__":

@@ -23,6 +23,7 @@ from src.services.event_service import EventService
 from src.services.metric_service import metric_service
 from src.services.recording_service import RecordingService
 from src.services.platform_storage import format_datetime, load_json, now_iso, save_json
+from src.services.realtime_detection_service import realtime_detection_hub
 from src.services.zone_preview_service import FFmpegCapture
 
 
@@ -40,8 +41,17 @@ DETECTION_RULE_TYPES = {
 }
 
 TASK_ANALYSIS_READ_FAIL_LIMIT = 10
+
+
+def _parse_task_detection_debug_ids(raw_value: str | None) -> set[str]:
+    value = raw_value if raw_value is not None else "8a89a58b"
+    return {item.strip() for item in value.split(",") if item.strip()}
+
+
 # Temporary task-scoped detection logging for live debugging.
-TASK_DETECTION_DEBUG_IDS = {"8a89a58b"}
+TASK_DETECTION_DEBUG_IDS = _parse_task_detection_debug_ids(
+    os.getenv("TASK_DETECTION_DEBUG_IDS")
+)
 
 
 class AnalysisService:
@@ -511,7 +521,7 @@ class AnalysisService:
 
     def _build_task_capture(self, source_url: str):
         width, height = self._probe_task_stream(source_url)
-        return FFmpegCapture(source_url, width, height, init_wait=0.3)
+        return FFmpegCapture(source_url, width, height, init_wait=0.3, latest_only=True)
 
     def _log_task_capture_debug(self, task: dict, source_url: str, capture) -> None:
         if not self._should_log_task_detections(task):
@@ -954,6 +964,93 @@ class AnalysisService:
             "bbox": bbox,
             "zone_id": detection.get("zone_id"),
         }
+
+    def _build_realtime_detection_payload(
+        self,
+        *,
+        task: dict,
+        frame,
+        frame_count: int,
+        frame_timestamp: float,
+        inference_results: list[dict[str, Any]],
+        captured_at: float | None = None,
+        inference_started_at: float | None = None,
+        inference_finished_at: float | None = None,
+        published_at: float | None = None,
+        capture_sequence: int | None = None,
+        dropped_frames: int = 0,
+    ) -> dict[str, Any]:
+        algorithms: list[dict[str, Any]] = []
+        for result in inference_results:
+            algorithm = result.get("algorithm") or {}
+            algorithm_id = str(result.get("algorithm_id") or algorithm.get("id") or "")
+            algorithm_label = str(
+                algorithm.get("scene_name")
+                or algorithm.get("scene_key")
+                or algorithm.get("algorithm_type")
+                or algorithm_id
+                or "detection"
+            )
+            detections = [
+                self._serialize_debug_detection(detection)
+                for detection in list(result.get("detections") or [])
+                if isinstance(detection, dict)
+            ]
+            algorithms.append({
+                "algorithm_id": algorithm_id,
+                "label": algorithm_label,
+                "color": str(algorithm.get("overlay_color") or "#ff4d4f"),
+                "detections": detections,
+            })
+
+        captured_at = float(captured_at if captured_at is not None else frame_timestamp)
+        inference_started_at = float(
+            inference_started_at if inference_started_at is not None else frame_timestamp
+        )
+        inference_finished_at = float(
+            inference_finished_at if inference_finished_at is not None else inference_started_at
+        )
+        published_at = float(published_at if published_at is not None else inference_finished_at)
+
+        def _elapsed_ms(end_at: float, start_at: float) -> float:
+            return round(max(end_at - start_at, 0.0) * 1000, 3)
+
+        return {
+            "type": "task_detection",
+            "task_id": str(task.get("id") or ""),
+            "channel_id": str(task.get("channel_id") or ""),
+            "seq": int(frame_count),
+            "capture_sequence": int(capture_sequence) if capture_sequence is not None else None,
+            "dropped_frames": max(int(dropped_frames or 0), 0),
+            "timestamp": float(frame_timestamp),
+            "source_width": int(frame.shape[1]),
+            "source_height": int(frame.shape[0]),
+            "timing": {
+                "capture_sequence": int(capture_sequence) if capture_sequence is not None else None,
+                "dropped_frames": max(int(dropped_frames or 0), 0),
+                "captured_at": captured_at,
+                "inference_started_at": inference_started_at,
+                "inference_finished_at": inference_finished_at,
+                "published_at": published_at,
+                "capture_to_inference_ms": _elapsed_ms(inference_started_at, captured_at),
+                "inference_ms": _elapsed_ms(inference_finished_at, inference_started_at),
+                "inference_to_publish_ms": _elapsed_ms(published_at, inference_finished_at),
+                "end_to_end_ms": _elapsed_ms(published_at, captured_at),
+            },
+            "algorithms": algorithms,
+        }
+
+    def _log_task_detection_timing(self, task: dict, frame_count: int, timing: dict[str, Any]) -> None:
+        if not self._should_log_task_detections(task):
+            return
+        payload = {
+            "task_id": str(task.get("id") or ""),
+            "frame": frame_count,
+            "capture_sequence": timing.get("capture_sequence"),
+            "dropped_frames": timing.get("dropped_frames"),
+            **timing,
+        }
+        runtime_logger.warning("[TaskDetectionTiming] %s", json.dumps(payload, ensure_ascii=False))
 
     def _should_log_task_detections(self, task: dict) -> bool:
         task_id = str(task.get("id") or "")
@@ -2379,6 +2476,7 @@ class AnalysisService:
         capture = None
         read_fail_count = 0
         reconnect_count = 0
+        previous_capture_sequence: int | None = None
 
         def flush_pending_alarm_videos(*, ready_only: bool) -> None:
             nonlocal pending_alarm_videos
@@ -2478,6 +2576,7 @@ class AnalysisService:
                             if source_changed:
                                 pre_event_buffer.clear()
                             capture = self._build_task_capture(source_url)
+                            previous_capture_sequence = None
                             self._log_task_capture_debug(task, source_url, capture)
                             warmup_until_ts = time.time() + warmup_seconds if warmup_seconds > 0 else 0.0
                             next_config_refresh_at = (
@@ -2533,6 +2632,7 @@ class AnalysisService:
                                 flush_pending_alarm_videos(ready_only=False)
                                 self._release_task_capture(capture)
                                 capture = self._build_task_capture(latest_source_url)
+                                previous_capture_sequence = None
                                 self._log_task_capture_debug(latest_task, latest_source_url, capture)
                                 warmup_until_ts = time.time() + warmup_seconds if warmup_seconds > 0 else 0.0
                                 read_fail_count = 0
@@ -2561,12 +2661,52 @@ class AnalysisService:
 
                     runtime_by_model: dict[str, dict] = {}
                     last_event_runtime_at: str | None = None
+                    inference_started_at = time.time()
                     inference_results = self._collect_task_algorithm_inferences(
                         task=task,
                         algorithms=algorithms,
                         frame=frame,
                         frame_count=frame_count,
                     )
+                    inference_finished_at = time.time()
+                    if inference_results:
+                        captured_at = float(
+                            getattr(capture, "last_frame_timestamp", None) or now_ts
+                        )
+                        capture_sequence_value = getattr(capture, "last_frame_sequence", None)
+                        capture_sequence = (
+                            int(capture_sequence_value)
+                            if capture_sequence_value is not None
+                            else None
+                        )
+                        dropped_frames = 0
+                        if capture_sequence is not None and previous_capture_sequence is not None:
+                            dropped_frames = max(capture_sequence - previous_capture_sequence - 1, 0)
+                        if capture_sequence is not None:
+                            previous_capture_sequence = capture_sequence
+                        published_at = time.time()
+                        realtime_payload = self._build_realtime_detection_payload(
+                            task=task,
+                            frame=frame,
+                            frame_count=frame_count,
+                            frame_timestamp=now_ts,
+                            inference_results=inference_results,
+                            captured_at=captured_at,
+                            inference_started_at=inference_started_at,
+                            inference_finished_at=inference_finished_at,
+                            published_at=published_at,
+                            capture_sequence=capture_sequence,
+                            dropped_frames=dropped_frames,
+                        )
+                        realtime_detection_hub.publish(
+                            task_id,
+                            realtime_payload,
+                        )
+                        self._log_task_detection_timing(
+                            task,
+                            frame_count,
+                            realtime_payload["timing"],
+                        )
 
                     for result in inference_results:
                         algorithm = result["algorithm"]

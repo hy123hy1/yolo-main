@@ -437,6 +437,88 @@ class TaskEventUpdatesTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(create_event_mock.await_count, 0)
 
+    async def test_task_worker_publishes_filtered_realtime_detections(self):
+        self._insert_channel("ch_realtime", "实时检测通道")
+        task = await self.task_service.create_task(
+            {
+                "name": "实时检测任务",
+                "channel_id": "ch_realtime",
+                "frame_interval": 1,
+                "algorithms": [
+                    {
+                        "id": "algo_person",
+                        "model_id": "model_person",
+                        "scene_name": "Person detection",
+                        "overlay_color": "#22c55e",
+                        "labels": ["person"],
+                        "enabled": True,
+                        "need_snapshot": False,
+                        "need_video_clip": False,
+                    },
+                    {
+                        "id": "algo_vehicle",
+                        "model_id": "model_vehicle",
+                        "scene_name": "Vehicle detection",
+                        "labels": ["car"],
+                        "enabled": True,
+                        "need_snapshot": False,
+                        "need_video_clip": False,
+                    },
+                ],
+            }
+        )
+
+        stop_event = threading.Event()
+        capture = object()
+        detection = {
+            "class_name": "person",
+            "conf": 0.95,
+            "x1": 1,
+            "y1": 2,
+            "x2": 10,
+            "y2": 12,
+            "zone_id": "zone_gate",
+        }
+
+        def _fake_read(_capture):
+            if not stop_event.is_set():
+                stop_event.set()
+                return True, np.zeros((16, 32, 3), dtype=np.uint8)
+            return False, None
+
+        def _fake_load_model(model_id):
+            return model_id, {"classes": ["person"]}
+
+        def _fake_detect(model, _model_meta, _frame, _confidence):
+            return [detection] if model == "model_person" else []
+
+        with (
+            patch.object(self.analysis_service, "_build_task_capture", return_value=capture),
+            patch.object(self.analysis_service, "_read_task_frame", side_effect=_fake_read),
+            patch.object(self.analysis_service, "_release_task_capture"),
+            patch.object(self.analysis_service, "_load_model", side_effect=_fake_load_model),
+            patch.object(self.analysis_service, "_detect_frame", side_effect=_fake_detect),
+            patch.object(
+                self.analysis_service,
+                "_apply_algorithm_scoped_filters",
+                side_effect=lambda detections, _task, _algorithm: detections,
+            ),
+            patch.object(self.analysis_service, "_build_rule_events", return_value=[]),
+            patch("src.services.analysis_service.realtime_detection_hub.publish") as publish_mock,
+            patch.object(self.analysis_service, "_task_analysis_startup_warmup_seconds", return_value=0.0, create=True),
+            patch("src.services.analysis_service.time.sleep", lambda *_args, **_kwargs: None),
+        ):
+            await asyncio.to_thread(self.analysis_service._run_task_worker, task["id"], stop_event)
+
+        self.assertEqual(publish_mock.call_count, 1)
+        task_id, payload = publish_mock.call_args.args
+        self.assertEqual(task_id, task["id"])
+        self.assertEqual(payload["source_width"], 32)
+        self.assertEqual(payload["source_height"], 16)
+        self.assertEqual([item["algorithm_id"] for item in payload["algorithms"]], ["algo_person", "algo_vehicle"])
+        self.assertEqual(payload["algorithms"][0]["detections"][0]["label"], "person")
+        self.assertEqual(payload["algorithms"][1]["detections"], [])
+
     async def test_task_worker_submits_alarm_video_job_without_inline_video_encoding(self):
         self._insert_channel("ch_async_video", "卸料口")
         task = await self.task_service.create_task(

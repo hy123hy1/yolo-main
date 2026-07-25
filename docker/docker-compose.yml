@@ -60,6 +60,8 @@ services:
       - TZ=Asia/Shanghai
       - METADATA_DB_ENABLED=true
       - METADATA_DB_STRICT=false
+      - METADATA_DATABASE_URL=mysql+pymysql://root:root@192.168.1.58:3006/sp-ai-yolo?charset=utf8mb4
+      - TASK_DETECTION_DEBUG_IDS=f5035e1e
       - ZLM_API_BASE=http://zlm-server:8010
       - ZLM_SECRET=HC5elxV5pt8guwuvV8NmddzVhb4u1lyY
     depends_on:
@@ -71,6 +73,47 @@ services:
       timeout: 10s
       retries: 3
       start_period: 40s
+
+  electronic-seal-worker:
+    image: docker-backend
+    container_name: electronic-seal-worker
+    restart: unless-stopped
+    ports:
+      - "9001:9001"
+    volumes:
+      - ../backend/configs:/app/configs:ro
+      - ../backend/data/electronic_seal:/app/data/electronic_seal
+      - ../backend/models:/app/models:ro
+      - ../backend/src:/app/src:ro
+    networks:
+      - yolo-network
+    environment:
+      ELECTRONIC_SEAL_ENABLED: "true"
+      ELECTRONIC_SEAL_DEVICE: "cpu"
+      ELECTRONIC_SEAL_MAX_WORKERS: "2"
+      ELECTRONIC_SEAL_MAX_CHANNEL_WORKERS: "8"
+      MYSQL_HOST: "192.168.1.58"
+      MYSQL_PORT: "3006"
+      MYSQL_DATABASE: "sp-ai-yolo"
+      MYSQL_USER: "root"
+      MYSQL_PASSWORD: "root"
+      MYSQL_CHARSET: "utf8mb4"
+      METADATA_DATABASE_URL: "mysql+pymysql://root:root@192.168.1.58:3006/sp-ai-yolo?charset=utf8mb4"
+      METADATA_DB_ENABLED: "true"
+      METADATA_DB_STRICT: "false"
+      TZ: "Asia/Shanghai"
+    command: ["uvicorn", "src.electronic_seal.main:app", "--host", "0.0.0.0", "--port", "9001"]
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: "2g"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9001/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
 
   frontend:
     build:
@@ -105,12 +148,14 @@ services:
     depends_on:
       - backend
       - zlm-server
+      - electronic-seal-worker
     volumes:
       - ../frontend:/app
     environment:
       - CHOKIDAR_USEPOLLING=true
       - VITE_API_BASE=/dev-api
       - VITE_API_TARGET=http://backend:8000
+      - ELECTRONIC_SEAL_API_TARGET=http://electronic-seal-worker:9001
     command: ["sh", "-c", "npm install && npm run dev -- --host 0.0.0.0 --port 3000"]
 
 networks:

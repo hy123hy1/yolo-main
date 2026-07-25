@@ -1,0 +1,16 @@
+# Electronic-seal worker defaults. The worker is CPU-only by design.
+enabled = true
+device = "cpu"
+max_workers = 2
+max_channel_workers = 8
+sample_interval_ms = 1000
+camera_health_interval_seconds = 3600
+upload_max_attempts = 5
+upload_retry_base_seconds = 5.0
+upload_retry_max_seconds = 300.0
+supervision_base_url = ""
+supervision_event_path = "/events"
+supervision_evidence_path = "/events/{event_id}/evidence"
+supervision_request_timeout_seconds = 10.0
+upload_deadline_seconds = 30.0
+upload_poll_seconds = 1.0

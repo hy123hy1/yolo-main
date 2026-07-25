@@ -1,6 +1,6 @@
 # 离岗
 [absence]
-absence_seconds = 300
+absence_seconds = 600
 
 # 聚集
 [gathering]

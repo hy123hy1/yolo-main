@@ -252,7 +252,7 @@
 
             <div class="zone-preview-player-shell fence-preview-shell">
               <video
-                :ref="(el) => setVideoRef(item.id, el as HTMLVideoElement | null)"
+                :ref="(el) => setFenceVideoRef(item.id, el as HTMLVideoElement | null)"
                 class="zone-preview-player fence-preview-player"
                 autoplay
                 muted
@@ -288,7 +288,7 @@
 
             <div class="zone-preview-actions">
               <template v-if="canManualPlayFencePreview(item.id)">
-                <button class="ghost-btn" type="button" @click="openExpandedPreview(item)">放大预览</button>
+                <button class="ghost-btn" type="button" @click="openExpandedFencePreview(item)">放大预览</button>
                 <button class="ghost-btn" type="button" @click="redrawFenceOverlay(item.id)">重绘围栏</button>
               </template>
             </div>
@@ -411,7 +411,10 @@
           <button class="ghost-btn modal-close-btn" @click="closeExpandedPreview" aria-label="关闭">×</button>
         </div>
 
-        <div class="preview-modal-player-shell">
+        <div
+          class="preview-modal-player-shell"
+          :class="{ 'fence-expanded-player-shell': expandedPreview.mode === 'fence' }"
+        >
           <video
             ref="expandedPreviewVideoRef"
             class="preview-modal-player"
@@ -419,6 +422,14 @@
             muted
             playsinline
             controls
+            @loadedmetadata="handleExpandedPreviewVideoReady"
+            @loadeddata="handleExpandedPreviewVideoReady"
+            @playing="handleExpandedPreviewVideoReady"
+          />
+          <canvas
+            v-if="expandedPreview.mode === 'fence'"
+            ref="expandedFenceCanvasRef"
+            class="expanded-fence-overlay-canvas"
           />
         </div>
 
@@ -563,6 +574,43 @@ type FenceRenderableRegion = {
   algorithmName?: string
 }
 
+type RealtimeDetection = {
+  label: string
+  confidence: number
+  bbox: [number, number, number, number]
+  zone_id?: string | null
+}
+
+type RealtimeDetectionAlgorithm = {
+  algorithm_id: string
+  label: string
+  color: string
+  detections: RealtimeDetection[]
+}
+
+type RealtimeDetectionPayload = {
+  type: 'task_detection'
+  task_id: string
+  channel_id: string
+  seq: number
+  timestamp: number
+  source_width: number
+  source_height: number
+  timing?: {
+    capture_sequence: number | null
+    dropped_frames: number
+    captured_at: number
+    inference_started_at: number
+    inference_finished_at: number
+    published_at: number
+    capture_to_inference_ms: number
+    inference_ms: number
+    inference_to_publish_ms: number
+    end_to_end_ms: number
+  }
+  algorithms: RealtimeDetectionAlgorithm[]
+}
+
 type ChannelEditState = {
   name: string
   type: string
@@ -606,6 +654,8 @@ const debugResults = ref<Record<string, string>>({})
 const rtcErrors = ref<Record<string, string>>({})
 const zonePreviewDebug = ref<Record<string, string>>({})
 const zonePreviewErrors = ref<Record<string, string>>({})
+const realtimeDetectionPayloads = ref<Record<string, RealtimeDetectionPayload>>({})
+const realtimeDetectionLastMessageAt = ref<Record<string, number>>({})
 const message = ref('')
 const messageType = ref<'success' | 'error'>('success')
 const editingChannel = ref<any | null>(null)
@@ -648,6 +698,7 @@ const editForm = ref<ChannelEditState>({
 })
 
 const videoRefs = new Map<string, HTMLVideoElement>()
+const fenceVideoRefs = new Map<string, HTMLVideoElement>()
 const fenceCanvasRefs = new Map<string, HTMLCanvasElement>()
 const fenceOverlayFrameIds = new Map<string, number>()
 const peerConnections = new Map<string, RTCPeerConnection>()
@@ -658,9 +709,21 @@ const zonePreviewPeerConnections = new Map<string, RTCPeerConnection>()
 const zonePreviewAttemptIds = new Map<string, number>()
 const previewCardRefs = new Map<string, HTMLElement>()
 const fenceCardRefs = new Map<string, HTMLElement>()
-const expandedPreview = ref<{ channelId: string; name: string; sourceUrl: string; mode?: 'channel' | 'zone' } | null>(null)
+const realtimeDetectionSockets = new Map<string, WebSocket>()
+const realtimeDetectionTaskIds = new Map<string, string>()
+const realtimeDetectionReconnectTimers = new Map<string, number>()
+const realtimeDetectionReconnectAttempts = new Map<string, number>()
+const realtimeDetectionExpiryTimers = new Map<string, number>()
+const expandedPreview = ref<{
+  channelId: string
+  name: string
+  sourceUrl: string
+  mode?: 'channel' | 'zone' | 'fence'
+} | null>(null)
 const expandedPreviewVideoRef = ref<HTMLVideoElement | null>(null)
+const expandedFenceCanvasRef = ref<HTMLCanvasElement | null>(null)
 const expandedPreviewPlaying = ref(false)
+let expandedFenceOverlayFrameId = 0
 const expandedPreviewError = ref('')
 const taskStatusPollController = createSingleIntervalController({
   schedule(callback: TimerHandler, intervalMs: number) {
@@ -673,6 +736,8 @@ const taskStatusPollController = createSingleIntervalController({
 let pageDeactivated = false
 let expandedPreviewPeerConnection: RTCPeerConnection | null = null
 let expandedPreviewAttemptId = 0
+const REALTIME_DETECTION_TTL_MS = 2000
+const REALTIME_DETECTION_MAX_RECONNECT_DELAY_MS = 5000
 
 const showMessage = (type: 'success' | 'error', text: string) => {
   messageType.value = type
@@ -847,6 +912,7 @@ const loadTaskStatuses = async (taskIds: string[]) => {
   )
   taskStatuses.value = Object.fromEntries(statusEntries.filter(([_, value]) => value))
   syncAIStatusesFromTasks()
+  syncAllRealtimeDetectionSockets()
 }
 
 const loadTasksForCurrentChannel = async (silent = false) => {
@@ -1382,6 +1448,174 @@ const isTaskRunningForChannel = (channelId: string) => {
   return Boolean(runtime?.is_running) || ['running', 'starting', 'restarting'].includes(normalized)
 }
 
+const clearRealtimeDetectionState = (channelId: string) => {
+  const expiryTimer = realtimeDetectionExpiryTimers.get(channelId)
+  if (expiryTimer !== undefined) {
+    window.clearTimeout(expiryTimer)
+    realtimeDetectionExpiryTimers.delete(channelId)
+  }
+  const nextPayloads = { ...realtimeDetectionPayloads.value }
+  const nextTimestamps = { ...realtimeDetectionLastMessageAt.value }
+  delete nextPayloads[channelId]
+  delete nextTimestamps[channelId]
+  realtimeDetectionPayloads.value = nextPayloads
+  realtimeDetectionLastMessageAt.value = nextTimestamps
+}
+
+const getRealtimeDetectionWebSocketUrl = (taskId: string) => {
+  const configuredBase = String(import.meta.env.VITE_API_BASE || '/dev-api').replace(/\/+$/, '')
+  const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
+  const baseUrl = new URL(configuredBase || '/', window.location.origin)
+  const basePath = baseUrl.pathname.replace(/\/+$/, '')
+  return `${protocol}//${baseUrl.host}${basePath}/tasks/${encodeURIComponent(taskId)}/detections/ws`
+}
+
+const realtimeDetectionSocketIsActive = (channelId: string, taskId: string) => {
+  const task = taskForChannel(channelId)
+  const expandedFencePlaying =
+    expandedPreview.value?.mode === 'fence'
+    && expandedPreview.value.channelId === channelId
+    && expandedPreviewPlaying.value
+  return (
+    activeTab.value === 'fence'
+    && (isPreviewPlaying(channelId) || expandedFencePlaying)
+    && isTaskRunningForChannel(channelId)
+    && String(task?.id || '') === taskId
+  )
+}
+
+const closeRealtimeDetectionSocket = (channelId: string, clearState = true) => {
+  const timer = realtimeDetectionReconnectTimers.get(channelId)
+  if (timer !== undefined) {
+    window.clearTimeout(timer)
+    realtimeDetectionReconnectTimers.delete(channelId)
+  }
+
+  const socket = realtimeDetectionSockets.get(channelId)
+  realtimeDetectionSockets.delete(channelId)
+  realtimeDetectionTaskIds.delete(channelId)
+  realtimeDetectionReconnectAttempts.delete(channelId)
+  if (socket) {
+    socket.onopen = null
+    socket.onmessage = null
+    socket.onerror = null
+    socket.onclose = null
+    socket.close()
+  }
+  if (clearState) {
+    clearRealtimeDetectionState(channelId)
+    redrawFenceOverlay(channelId)
+  }
+}
+
+const scheduleRealtimeDetectionReconnect = (channelId: string, taskId: string) => {
+  if (!realtimeDetectionSocketIsActive(channelId, taskId)) return
+  if (realtimeDetectionReconnectTimers.has(channelId)) return
+
+  const attempt = (realtimeDetectionReconnectAttempts.get(channelId) || 0) + 1
+  realtimeDetectionReconnectAttempts.set(channelId, attempt)
+  const delay = Math.min(500 * (2 ** Math.min(attempt - 1, 3)), REALTIME_DETECTION_MAX_RECONNECT_DELAY_MS)
+  const timer = window.setTimeout(() => {
+    realtimeDetectionReconnectTimers.delete(channelId)
+    if (realtimeDetectionSocketIsActive(channelId, taskId)) {
+      openRealtimeDetectionSocket(channelId, taskId)
+    } else {
+      closeRealtimeDetectionSocket(channelId)
+    }
+  }, delay)
+  realtimeDetectionReconnectTimers.set(channelId, timer)
+}
+
+const openRealtimeDetectionSocket = (channelId: string, taskId: string) => {
+  if (!realtimeDetectionSocketIsActive(channelId, taskId)) return
+  const currentSocket = realtimeDetectionSockets.get(channelId)
+  if (currentSocket && realtimeDetectionTaskIds.get(channelId) === taskId) {
+    return
+  }
+  if (currentSocket) {
+    closeRealtimeDetectionSocket(channelId, false)
+  }
+
+  let socket: WebSocket
+  try {
+    socket = new WebSocket(getRealtimeDetectionWebSocketUrl(taskId))
+  } catch {
+    scheduleRealtimeDetectionReconnect(channelId, taskId)
+    return
+  }
+
+  realtimeDetectionSockets.set(channelId, socket)
+  realtimeDetectionTaskIds.set(channelId, taskId)
+  socket.onopen = () => {
+    if (realtimeDetectionSockets.get(channelId) !== socket) return
+    realtimeDetectionReconnectAttempts.delete(channelId)
+  }
+  socket.onmessage = (event) => {
+    if (realtimeDetectionSockets.get(channelId) !== socket) return
+    try {
+      const payload = JSON.parse(String(event.data || '')) as Partial<RealtimeDetectionPayload>
+      if (payload.type !== 'task_detection' || payload.task_id !== taskId) return
+      const current = realtimeDetectionPayloads.value[channelId]
+      if (current && Number(payload.seq || 0) < current.seq) return
+      realtimeDetectionPayloads.value = {
+        ...realtimeDetectionPayloads.value,
+        [channelId]: payload as RealtimeDetectionPayload,
+      }
+      realtimeDetectionLastMessageAt.value = {
+        ...realtimeDetectionLastMessageAt.value,
+        [channelId]: Date.now(),
+      }
+      const expiryTimer = realtimeDetectionExpiryTimers.get(channelId)
+      if (expiryTimer !== undefined) {
+        window.clearTimeout(expiryTimer)
+      }
+      const receivedAt = realtimeDetectionLastMessageAt.value[channelId]
+      realtimeDetectionExpiryTimers.set(channelId, window.setTimeout(() => {
+        if (realtimeDetectionLastMessageAt.value[channelId] !== receivedAt) return
+        clearRealtimeDetectionState(channelId)
+        redrawFenceOverlay(channelId)
+      }, REALTIME_DETECTION_TTL_MS))
+      redrawFenceOverlay(channelId)
+    } catch {
+      // Ignore malformed messages without affecting the video connection.
+    }
+  }
+  socket.onerror = () => {
+    if (realtimeDetectionSockets.get(channelId) === socket) {
+      socket.close()
+    }
+  }
+  socket.onclose = () => {
+    if (realtimeDetectionSockets.get(channelId) !== socket) return
+    realtimeDetectionSockets.delete(channelId)
+    realtimeDetectionTaskIds.delete(channelId)
+    clearRealtimeDetectionState(channelId)
+    redrawFenceOverlay(channelId)
+    scheduleRealtimeDetectionReconnect(channelId, taskId)
+  }
+}
+
+const syncRealtimeDetectionSocket = (channelId: string) => {
+  const task = taskForChannel(channelId)
+  if (!task?.id || !realtimeDetectionSocketIsActive(channelId, String(task.id))) {
+    closeRealtimeDetectionSocket(channelId)
+    return
+  }
+  openRealtimeDetectionSocket(channelId, String(task.id))
+}
+
+const syncAllRealtimeDetectionSockets = () => {
+  items.value.forEach((item) => syncRealtimeDetectionSocket(item.id))
+}
+
+const closeAllRealtimeDetectionSockets = () => {
+  const channelIds = new Set<string>([
+    ...realtimeDetectionSockets.keys(),
+    ...Object.keys(realtimeDetectionPayloads.value),
+  ])
+  channelIds.forEach((channelId) => closeRealtimeDetectionSocket(channelId))
+}
+
 const canManualPlayFencePreview = (channelId: string) => {
   const channel = items.value.find((item) => item.id === channelId)
   return Boolean(channel?.is_online)
@@ -1576,11 +1810,7 @@ const startZonePreviewPlayer = async (channelId: string) => {
 
     pc.ontrack = (event) => {
       if (!isActiveZonePreviewAttempt(channelId, attemptId)) return
-      if (event.streams?.length) {
-        event.streams[0].getTracks().forEach((track) => remoteStream.addTrack(track))
-      } else {
-        remoteStream.addTrack(event.track)
-      }
+      attachRemoteStreamToVideo(video, remoteStream, event)
     }
 
     pc.onconnectionstatechange = () => {
@@ -1617,6 +1847,7 @@ const startZonePreviewPlayer = async (channelId: string) => {
     })
 
     await safePlayWithCheck(video, channelId, attemptId, isActiveZonePreviewAttempt)
+    await waitForVideoFrame(video)
     if (isActiveZonePreviewAttempt(channelId, attemptId)) {
       zonePreviewPlaybackState.value = {
         ...zonePreviewPlaybackState.value,
@@ -1641,6 +1872,7 @@ const startZonePreviewPlayer = async (channelId: string) => {
       videoEl.src = hlsUrl
       videoEl.load()
       await safePlayWithCheck(videoEl, channelId, attemptId, isActiveZonePreviewAttempt)
+      await waitForVideoFrame(videoEl)
       if (isActiveZonePreviewAttempt(channelId, attemptId)) {
         zonePreviewPlaybackState.value = {
           ...zonePreviewPlaybackState.value,
@@ -1699,6 +1931,7 @@ const resetAllBrowserPlayers = async () => {
     ...Object.keys(previewPlaybackState.value || {}),
     ...Array.from(peerConnections.keys()),
     ...Array.from(videoRefs.keys()),
+    ...Array.from(fenceVideoRefs.keys()),
   ])
   await Promise.all(Array.from(channelIds).map((channelId) => stopBrowserPlay(channelId)))
   previewPlaybackState.value = {}
@@ -1828,6 +2061,14 @@ const setFenceCardRef = (channelId: string, el: HTMLElement | null) => {
   }
 }
 
+const setFenceVideoRef = (channelId: string, el: HTMLVideoElement | null) => {
+  if (el) {
+    fenceVideoRefs.set(channelId, el)
+  } else {
+    fenceVideoRefs.delete(channelId)
+  }
+}
+
 const setFenceCanvasRef = (channelId: string, el: HTMLCanvasElement | null) => {
   if (el) {
     fenceCanvasRefs.set(channelId, el)
@@ -1889,8 +2130,64 @@ const drawFenceLabel = (
   ctx.fillText(content, labelX + paddingX, labelY + 11, labelWidth - paddingX * 2)
 }
 
-const renderFenceOverlay = (channelId: string) => {
-  const canvas = fenceCanvasRefs.get(channelId)
+const freshRealtimeDetectionPayload = (channelId: string) => {
+  const payload = realtimeDetectionPayloads.value[channelId]
+  const receivedAt = realtimeDetectionLastMessageAt.value[channelId]
+  if (!payload || !receivedAt || Date.now() - receivedAt > REALTIME_DETECTION_TTL_MS) {
+    if (payload || receivedAt) {
+      clearRealtimeDetectionState(channelId)
+    }
+    return null
+  }
+  return payload
+}
+
+const drawRealtimeDetections = (
+  ctx: CanvasRenderingContext2D,
+  payload: RealtimeDetectionPayload | null,
+  sourceWidth: number,
+  sourceHeight: number,
+  width: number,
+  height: number,
+) => {
+  if (!payload) return
+  const scaleX = width / sourceWidth
+  const scaleY = height / sourceHeight
+
+  payload.algorithms.forEach((algorithm) => {
+    const color = algorithm.color || '#ff4d4f'
+    algorithm.detections.forEach((detection) => {
+      if (!Array.isArray(detection.bbox) || detection.bbox.length < 4) return
+      const [x1, y1, x2, y2] = detection.bbox.map(Number)
+      if (![x1, y1, x2, y2].every(Number.isFinite)) return
+
+      const left = x1 * scaleX
+      const top = y1 * scaleY
+      const boxWidth = Math.max((x2 - x1) * scaleX, 1)
+      const boxHeight = Math.max((y2 - y1) * scaleY, 1)
+      ctx.strokeStyle = color
+      ctx.lineWidth = 2
+      ctx.strokeRect(left, top, boxWidth, boxHeight)
+
+      const confidence = Number(detection.confidence)
+      const confidenceText = Number.isFinite(confidence) ? ` ${confidence.toFixed(2)}` : ''
+      drawFenceLabel(
+        ctx,
+        `${detection.label || 'unknown'}${confidenceText}`,
+        color,
+        left,
+        top,
+        width,
+      )
+    })
+  })
+}
+
+const renderFenceOverlayOnCanvas = (
+  channelId: string,
+  canvas: HTMLCanvasElement | null | undefined,
+  video: HTMLVideoElement | null | undefined,
+) => {
   if (!canvas) return
 
   const ctx = canvas.getContext('2d')
@@ -1900,15 +2197,19 @@ const renderFenceOverlay = (channelId: string) => {
   ctx.clearRect(0, 0, width, height)
 
   const regions = fenceRegionsForChannel(channelId)
-  if (!regions.length) {
-    return
-  }
-
-  const video = videoRefs.get(channelId)
+  const realtimePayload = freshRealtimeDetectionPayload(channelId)
   const maxCoordinateX = Math.max(...regions.flatMap((region) => region.coordinates.map((point) => point[0])), width)
   const maxCoordinateY = Math.max(...regions.flatMap((region) => region.coordinates.map((point) => point[1])), height)
-  const sourceWidth = Math.max(Number(video?.videoWidth || 0), maxCoordinateX, 1)
-  const sourceHeight = Math.max(Number(video?.videoHeight || 0), maxCoordinateY, 1)
+  const sourceWidth = Math.max(
+    Number(realtimePayload?.source_width || video?.videoWidth || 0),
+    maxCoordinateX,
+    1,
+  )
+  const sourceHeight = Math.max(
+    Number(realtimePayload?.source_height || video?.videoHeight || 0),
+    maxCoordinateY,
+    1,
+  )
   const scaleX = width / sourceWidth
   const scaleY = height / sourceHeight
 
@@ -1946,6 +2247,12 @@ const renderFenceOverlay = (channelId: string) => {
     )
     drawFenceLabel(ctx, region.name, region.color, anchor.x, anchor.y, width)
   })
+
+  drawRealtimeDetections(ctx, realtimePayload, sourceWidth, sourceHeight, width, height)
+}
+
+const renderFenceOverlay = (channelId: string) => {
+  renderFenceOverlayOnCanvas(channelId, fenceCanvasRefs.get(channelId), fenceVideoRefs.get(channelId))
 }
 
 const redrawFenceOverlay = (channelId: string) => {
@@ -1956,8 +2263,26 @@ const redrawFenceOverlay = (channelId: string) => {
   const frameId = window.requestAnimationFrame(() => {
     fenceOverlayFrameIds.delete(channelId)
     renderFenceOverlay(channelId)
+    if (expandedPreview.value?.mode === 'fence' && expandedPreview.value.channelId === channelId) {
+      redrawExpandedFenceOverlay()
+    }
   })
   fenceOverlayFrameIds.set(channelId, frameId)
+}
+
+const redrawExpandedFenceOverlay = () => {
+  if (expandedFenceOverlayFrameId) {
+    window.cancelAnimationFrame(expandedFenceOverlayFrameId)
+  }
+  expandedFenceOverlayFrameId = window.requestAnimationFrame(() => {
+    expandedFenceOverlayFrameId = 0
+    if (expandedPreview.value?.mode !== 'fence') return
+    renderFenceOverlayOnCanvas(
+      expandedPreview.value.channelId,
+      expandedFenceCanvasRef.value,
+      expandedPreviewVideoRef.value,
+    )
+  })
 }
 
 const redrawAllFenceOverlays = () => {
@@ -1970,6 +2295,12 @@ const redrawAllFenceOverlays = () => {
 const handleFenceVideoReady = (channelId: string) => {
   if (activeTab.value !== 'fence') return
   redrawFenceOverlay(channelId)
+}
+
+const handleExpandedPreviewVideoReady = () => {
+  if (expandedPreview.value?.mode === 'fence') {
+    redrawExpandedFenceOverlay()
+  }
 }
 
 const startFencePreview = async (channelId: string) => {
@@ -2153,7 +2484,7 @@ const ensureBrowserPlaybackUrls = async (channelId: string) => {
 
 const getVideoEl = async (channelId: string) => {
   for (let i = 0; i < 6; i += 1) {
-    const video = videoRefs.get(channelId)
+    const video = (activeTab.value === 'fence' ? fenceVideoRefs : videoRefs).get(channelId)
     if (video) return video
     await nextTick()
     if (i < 5) {
@@ -2173,6 +2504,54 @@ const getZonePreviewVideoEl = async (channelId: string) => {
     }
   }
   throw new Error('区域预览播放器尚未初始化')
+}
+
+const attachRemoteStreamToVideo = (
+  video: HTMLVideoElement | null,
+  remoteStream: MediaStream,
+  event: RTCTrackEvent,
+) => {
+  if (!video) return
+  const stream = event.streams?.[0]
+  if (stream) {
+    video.srcObject = stream
+  } else if (!remoteStream.getTracks().some((track) => track.id === event.track.id)) {
+    remoteStream.addTrack(event.track)
+  }
+  void video.play().catch(() => undefined)
+}
+
+const waitForVideoFrame = (video: HTMLVideoElement, timeoutMs = 5000) => {
+  if (video.readyState >= 2 && video.videoWidth > 0 && video.videoHeight > 0) {
+    return Promise.resolve()
+  }
+
+  return new Promise<void>((resolve, reject) => {
+    let timer = 0
+    const cleanup = () => {
+      video.removeEventListener('loadeddata', handleReady)
+      video.removeEventListener('playing', handleReady)
+      video.removeEventListener('error', handleError)
+      window.clearTimeout(timer)
+    }
+    const handleReady = () => {
+      if (video.readyState < 2 || video.videoWidth <= 0 || video.videoHeight <= 0) return
+      cleanup()
+      resolve()
+    }
+    const handleError = () => {
+      cleanup()
+      reject(new Error('视频流未收到首帧'))
+    }
+
+    video.addEventListener('loadeddata', handleReady)
+    video.addEventListener('playing', handleReady)
+    video.addEventListener('error', handleError, { once: true })
+    timer = window.setTimeout(() => {
+      cleanup()
+      reject(new Error('视频流未收到首帧'))
+    }, timeoutMs)
+  })
 }
 
 const safePlayWithCheck = async (
@@ -2214,11 +2593,13 @@ const tryHlsFallback = async (
   targetVideo.src = hlsUrl
   targetVideo.load()
   await safePlay(targetVideo, channelId, attemptId)
+  await waitForVideoFrame(targetVideo)
   if (isActiveAttempt(channelId, attemptId)) {
     previewPlaybackState.value = {
       ...previewPlaybackState.value,
       [channelId]: true,
     }
+    syncRealtimeDetectionSocket(channelId)
     debugResults.value[channelId] = 'WebRTC 播放失败，已切换到 HLS-fMP4 回退播放'
   }
 }
@@ -2244,6 +2625,11 @@ const getExpandedPreviewVideoEl = async () => {
 const stopExpandedPreviewPlayback = async (clearAttempt = true) => {
   if (clearAttempt) {
     nextExpandedPreviewAttempt()
+  }
+
+  if (expandedFenceOverlayFrameId) {
+    window.cancelAnimationFrame(expandedFenceOverlayFrameId)
+    expandedFenceOverlayFrameId = 0
   }
 
   if (expandedPreviewPeerConnection) {
@@ -2296,11 +2682,7 @@ const startExpandedPreviewPlayback = async (channelId: string) => {
 
     pc.ontrack = (event) => {
       if (!isActiveExpandedPreviewAttempt(attemptId)) return
-      if (event.streams?.length) {
-        event.streams[0].getTracks().forEach((track) => remoteStream.addTrack(track))
-      } else {
-        remoteStream.addTrack(event.track)
-      }
+      attachRemoteStreamToVideo(video, remoteStream, event)
     }
 
     pc.onconnectionstatechange = () => {
@@ -2338,6 +2720,7 @@ const startExpandedPreviewPlayback = async (channelId: string) => {
 
     try {
       await video.play()
+      await waitForVideoFrame(video)
     } catch (error: any) {
       const text = String(error?.message || '')
       if (
@@ -2353,6 +2736,10 @@ const startExpandedPreviewPlayback = async (channelId: string) => {
 
     if (isActiveExpandedPreviewAttempt(attemptId)) {
       expandedPreviewPlaying.value = true
+      if (previewMode === 'fence') {
+        syncRealtimeDetectionSocket(channelId)
+        redrawExpandedFenceOverlay()
+      }
     }
   } catch (error: any) {
     if (!isActiveExpandedPreviewAttempt(attemptId)) return
@@ -2362,7 +2749,7 @@ const startExpandedPreviewPlayback = async (channelId: string) => {
         ? await ensureZonePreviewPlayInfo(channelId, true)
         : (browserPlayInfos.value[channelId] || {})
 
-    if (!autoStartedProxy && previewMode === 'channel' && currentMessage.includes('stream not found')) {
+    if (!autoStartedProxy && previewMode !== 'zone' && currentMessage.includes('stream not found')) {
       try {
         const result = await startChannelPlay(channelId)
         playInfos.value[channelId] = result.play_urls || result.urls || {}
@@ -2374,7 +2761,7 @@ const startExpandedPreviewPlayback = async (channelId: string) => {
       }
     }
 
-    if (previewMode === 'channel' && Object.keys(browserPlayInfos.value[channelId] || {}).length > 0 && currentMessage.includes('stream not found')) {
+    if (previewMode !== 'zone' && Object.keys(browserPlayInfos.value[channelId] || {}).length > 0 && currentMessage.includes('stream not found')) {
       for (let i = 0; i < 6; i += 1) {
         if (!isActiveExpandedPreviewAttempt(attemptId)) return
         await sleep(500)
@@ -2396,11 +2783,7 @@ const startExpandedPreviewPlayback = async (channelId: string) => {
 
           retryPc.ontrack = (event) => {
             if (!isActiveExpandedPreviewAttempt(attemptId)) return
-            if (event.streams?.length) {
-              event.streams[0].getTracks().forEach((track) => remoteStream.addTrack(track))
-            } else {
-              remoteStream.addTrack(event.track)
-            }
+            attachRemoteStreamToVideo(retryVideo, remoteStream, event)
           }
 
           const offer = await retryPc.createOffer()
@@ -2425,9 +2808,14 @@ const startExpandedPreviewPlayback = async (channelId: string) => {
           })
 
           await retryVideo.play()
+          await waitForVideoFrame(retryVideo)
           if (isActiveExpandedPreviewAttempt(attemptId)) {
             expandedPreviewPlaying.value = true
             expandedPreviewError.value = ''
+            if (previewMode === 'fence') {
+              syncRealtimeDetectionSocket(channelId)
+              redrawExpandedFenceOverlay()
+            }
           }
           return
         } catch {
@@ -2444,9 +2832,14 @@ const startExpandedPreviewPlayback = async (channelId: string) => {
       video.src = hlsUrl
       video.load()
       await video.play()
+      await waitForVideoFrame(video)
       if (isActiveExpandedPreviewAttempt(attemptId)) {
         expandedPreviewPlaying.value = true
         expandedPreviewError.value = `WebRTC 播放失败：${currentMessage}；已切换到 HLS-fMP4`
+        if (previewMode === 'fence') {
+          syncRealtimeDetectionSocket(channelId)
+          redrawExpandedFenceOverlay()
+        }
       }
     } catch (fallbackError: any) {
       if (isActiveExpandedPreviewAttempt(attemptId)) {
@@ -2469,18 +2862,21 @@ const stopBrowserPlay = async (channelId: string, clearAttempt = true) => {
     peerConnections.delete(channelId)
   }
 
-  const video = videoRefs.get(channelId)
-  if (video) {
+  const videos = [videoRefs.get(channelId), fenceVideoRefs.get(channelId)].filter(
+    (video): video is HTMLVideoElement => Boolean(video),
+  )
+  videos.forEach((video) => {
     video.pause()
     video.srcObject = null
     video.removeAttribute('src')
     video.load()
-  }
+  })
 
   previewPlaybackState.value = {
     ...previewPlaybackState.value,
     [channelId]: false,
   }
+  closeRealtimeDetectionSocket(channelId)
   rtcErrors.value[channelId] = ''
 }
 
@@ -2518,11 +2914,7 @@ const startBrowserPlay = async (channelId: string) => {
 
     pc.ontrack = (event) => {
       if (!isActiveAttempt(channelId, attemptId)) return
-      if (event.streams?.length) {
-        event.streams[0].getTracks().forEach((track) => remoteStream.addTrack(track))
-      } else {
-        remoteStream.addTrack(event.track)
-      }
+      attachRemoteStreamToVideo(video, remoteStream, event)
     }
 
     pc.onconnectionstatechange = () => {
@@ -2559,11 +2951,13 @@ const startBrowserPlay = async (channelId: string) => {
     })
 
     await safePlay(video, channelId, attemptId)
+    await waitForVideoFrame(video)
     if (isActiveAttempt(channelId, attemptId)) {
       previewPlaybackState.value = {
         ...previewPlaybackState.value,
         [channelId]: true,
       }
+      syncRealtimeDetectionSocket(channelId)
       debugResults.value[channelId] = '浏览器专用转码流已通过 WebRTC 播放'
     }
   } catch (error: any) {
@@ -2607,11 +3001,7 @@ const startBrowserPlay = async (channelId: string) => {
 
           retryPc.ontrack = (event) => {
             if (!isActiveAttempt(channelId, attemptId)) return
-            if (event.streams?.length) {
-              event.streams[0].getTracks().forEach((track) => remoteStream.addTrack(track))
-            } else {
-              remoteStream.addTrack(event.track)
-            }
+            attachRemoteStreamToVideo(retryVideo, remoteStream, event)
           }
 
           const offer = await retryPc.createOffer()
@@ -2636,11 +3026,13 @@ const startBrowserPlay = async (channelId: string) => {
           })
 
           await safePlay(retryVideo, channelId, attemptId)
+          await waitForVideoFrame(retryVideo)
           if (isActiveAttempt(channelId, attemptId)) {
             previewPlaybackState.value = {
               ...previewPlaybackState.value,
               [channelId]: true,
             }
+            syncRealtimeDetectionSocket(channelId)
             debugResults.value[channelId] = '浏览器专用转码流已通过 WebRTC 播放'
             rtcErrors.value[channelId] = ''
           }
@@ -2722,6 +3114,19 @@ const openExpandedPreview = async (item: any) => {
   await startExpandedPreviewPlayback(item.id)
 }
 
+const openExpandedFencePreview = async (item: any) => {
+  expandedPreview.value = {
+    channelId: item.id,
+    name: `${item.name} - 电子围栏预览`,
+    sourceUrl: item.source_url || '-',
+    mode: 'fence',
+  }
+  expandedPreviewError.value = ''
+  await nextTick()
+  await startExpandedPreviewPlayback(item.id)
+  redrawExpandedFenceOverlay()
+}
+
 const openZonePreviewModal = async (item: any) => {
   const zoneUrls = await ensureZonePreviewPlayInfo(item.id, true)
   expandedPreview.value = {
@@ -2742,9 +3147,13 @@ void startZonePreviewPlayer
 void openZonePreviewModal
 
 const closeExpandedPreview = async () => {
+  const channelId = expandedPreview.value?.channelId
   await stopExpandedPreviewPlayback()
   expandedPreview.value = null
   expandedPreviewError.value = ''
+  if (channelId) {
+    syncRealtimeDetectionSocket(channelId)
+  }
 }
 
 const handleZonesUpdated = async () => {
@@ -2776,6 +3185,7 @@ onActivated(() => {
 onDeactivated(() => {
   pageDeactivated = true
   stopTaskStatusPolling()
+  closeAllRealtimeDetectionSockets()
   void resetAllBrowserPlayers()
   void resetAllZonePreviewPlayers()
 })
@@ -2796,6 +3206,7 @@ watch(activeTab, async (tab) => {
     await loadAllZonePreviewStatuses()
     await restoreFencePlaybackForActiveChannels()
   } else {
+    closeAllRealtimeDetectionSockets()
     await resetAllZonePreviewPlayers()
   }
   if (tab !== 'preview' && tab !== 'fence') {
@@ -2809,6 +3220,7 @@ onBeforeUnmount(() => {
     return
   }
   stopTaskStatusPolling()
+  closeAllRealtimeDetectionSockets()
   Array.from(peerConnections.keys()).forEach((channelId) => {
     void stopBrowserPlay(channelId)
   })
@@ -3636,10 +4048,15 @@ onBeforeUnmount(() => {
 }
 
 .preview-modal-player-shell {
+  position: relative;
   border-radius: 18px;
   overflow: hidden;
   background: #020617;
   border: 1px solid #1e293b;
+}
+
+.fence-expanded-player-shell {
+  isolation: isolate;
 }
 
 .preview-modal-player {
@@ -3648,6 +4065,15 @@ onBeforeUnmount(() => {
   aspect-ratio: 16 / 9;
   display: block;
   background: #000;
+}
+
+.expanded-fence-overlay-canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  z-index: 2;
 }
 
 .modal-grid .span-2 {
