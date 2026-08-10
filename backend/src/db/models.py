@@ -103,6 +103,9 @@ class ElectronicSealChannelProfileMeta(Base):
     )
     role: Mapped[str] = mapped_column(String(64))
     bound: Mapped[bool] = mapped_column(Boolean, default=True, server_default=text("1"), index=True)
+    runtime_owner: Mapped[str | None] = mapped_column(String(32), index=True)
+    runtime_owner_id: Mapped[str | None] = mapped_column(String(128))
+    runtime_lease_until: Mapped[DateTime | None] = mapped_column(ELECTRONIC_SEAL_DATETIME_TYPE, index=True)
     profile_version: Mapped[str] = mapped_column(
         String(64),
         default="role-v1",
@@ -252,7 +255,7 @@ class TaskAlgorithmMetricHistoryMeta(Base):
     __tablename__ = "task_algorithm_metric_history"
 
     id: Mapped[int] = mapped_column(METRIC_PK_TYPE, primary_key=True, autoincrement=True)
-    task_id: Mapped[str] = mapped_column(String(64), ForeignKey("tasks.id", ondelete="CASCADE"), index=True)
+    task_id: Mapped[str] = mapped_column(String(64), index=True)
     algorithm_id: Mapped[str] = mapped_column(String(64), index=True)
     channel_id: Mapped[str | None] = mapped_column(String(64), index=True)
     model_id: Mapped[str | None] = mapped_column(String(64), index=True)
@@ -387,6 +390,27 @@ class ModelMetaRecord(Base):
     raw_json: Mapped[dict | None] = mapped_column(JSON)
 
 
+class ElectronicSealModelMetaRecord(Base):
+    __tablename__ = "electronic_seal_models"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    name: Mapped[str | None] = mapped_column(String(255))
+    version: Mapped[str | None] = mapped_column(String(64))
+    source: Mapped[str | None] = mapped_column(String(64), index=True)
+    description: Mapped[str | None] = mapped_column(Text)
+    tags_json: Mapped[list | None] = mapped_column(JSON)
+    classes_json: Mapped[list | None] = mapped_column(JSON)
+    weights_path: Mapped[str | None] = mapped_column(Text)
+    file_size: Mapped[int | None] = mapped_column(BigInteger)
+    file_size_mb: Mapped[float | None] = mapped_column(Float)
+    job_id: Mapped[str | None] = mapped_column(String(64), index=True)
+    confidence: Mapped[float | None] = mapped_column(Float)
+    alert_interval: Mapped[int | None] = mapped_column(Integer)
+    created_at: Mapped[DateTime | None] = mapped_column(DateTime(), index=True)
+    updated_at: Mapped[DateTime | None] = mapped_column(DateTime(), index=True)
+    raw_json: Mapped[dict | None] = mapped_column(JSON)
+
+
 class EventMeta(Base):
     __tablename__ = "events"
 
@@ -447,13 +471,17 @@ class ElectronicSealConfigMeta(Base):
         ForeignKey("channels.id", ondelete="CASCADE"),
     )
     algorithm_type: Mapped[str] = mapped_column(String(64))
-    model_id: Mapped[str | None] = mapped_column(String(64), index=True)
+    model_id: Mapped[str | None] = mapped_column(
+        String(64),
+        ForeignKey("electronic_seal_models.id", ondelete="RESTRICT"),
+        index=True,
+    )
     enabled: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("0"))
     sample_interval_ms: Mapped[int] = mapped_column(Integer, default=1000, server_default=text("1000"))
     camera_health_interval_seconds: Mapped[int] = mapped_column(
         Integer,
-        default=3600,
-        server_default=text("3600"),
+        default=1,
+        server_default=text("1"),
     )
     alarm_hold_seconds: Mapped[int] = mapped_column(Integer, default=10, server_default=text("10"))
     recovery_hold_seconds: Mapped[int] = mapped_column(Integer, default=15, server_default=text("15"))

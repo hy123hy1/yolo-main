@@ -23,6 +23,7 @@ from src.db.models import (
     ElectronicSealCameraViewShiftEventMeta,
     ElectronicSealEventMeta,
     ElectronicSealEventIndexMeta,
+    ElectronicSealModelMetaRecord,
     ElectronicSealRoomEmptyEventMeta,
     ElectronicSealTruckCountMeta,
     ElectronicSealTruckDepartureEventMeta,
@@ -33,6 +34,7 @@ from src.services.platform_storage import format_datetime, generate_id
 
 
 ELECTRONIC_SEAL_TABLES = [
+    ElectronicSealModelMetaRecord.__table__,
     ElectronicSealChannelProfileMeta.__table__,
     ElectronicSealConfigMeta.__table__,
     ElectronicSealBaselineMeta.__table__,
@@ -172,6 +174,37 @@ def _config_dict(row: ElectronicSealConfigMeta) -> dict:
     }
 
 
+def _electronic_seal_model_dict(row: ElectronicSealModelMetaRecord) -> dict:
+    payload = deepcopy(row.raw_json) if isinstance(row.raw_json, dict) else {}
+    payload.update(
+        {
+            "model_id": row.id,
+            "name": row.name,
+            "version": row.version,
+            "source": row.source,
+            "description": row.description,
+            "tags": list(row.tags_json or []),
+            "classes": list(row.classes_json or []),
+            "weights_path": row.weights_path,
+            "file_size": row.file_size,
+            "file_size_mb": row.file_size_mb,
+            "job_id": row.job_id,
+            "confidence": float(row.confidence) if row.confidence is not None else 0.25,
+            "alert_interval": int(row.alert_interval) if row.alert_interval is not None else 60,
+            "created_at": _format_electronic_seal_datetime(row.created_at),
+            "updated_at": _format_electronic_seal_datetime(row.updated_at),
+        }
+    )
+    return payload
+
+
+def _validate_model_id(session: Session, model_id: str | None) -> None:
+    if not model_id:
+        return
+    if session.get(ElectronicSealModelMetaRecord, str(model_id).strip()) is None:
+        raise ValueError(f"electronic_seal_models model not found: {model_id}")
+
+
 def _channel_profile_dict(row: ElectronicSealChannelProfileMeta) -> dict:
     return {
         "channel_id": row.channel_id,
@@ -266,7 +299,11 @@ def _event_datetime_value(value: datetime | str | float | int | None, fallback: 
     return datetime.fromisoformat(text_value.replace("Z", "+00:00")).replace(tzinfo=None)
 
 
-def _indexed_event_dict(index_row: ElectronicSealEventIndexMeta, detail_row=None) -> dict:
+def _indexed_event_dict(
+    index_row: ElectronicSealEventIndexMeta,
+    detail_row=None,
+    upload_job: ElectronicSealUploadJobMeta | None = None,
+) -> dict:
     metrics = deepcopy(getattr(detail_row, "metrics_json", None) or {})
     return {
         "id": index_row.id,
@@ -280,6 +317,8 @@ def _indexed_event_dict(index_row: ElectronicSealEventIndexMeta, detail_row=None
         "ended_at": _format_electronic_seal_datetime(index_row.ended_at),
         "uploaded_at": _format_electronic_seal_datetime(index_row.uploaded_at),
         "upload_status": index_row.upload_status,
+        "upload_job_id": getattr(upload_job, "id", None),
+        "upload_target": getattr(upload_job, "target", None),
         "duration_seconds": (
             (index_row.ended_at - index_row.started_at).total_seconds()
             if index_row.ended_at is not None and index_row.started_at is not None
@@ -294,6 +333,15 @@ def _indexed_event_dict(index_row: ElectronicSealEventIndexMeta, detail_row=None
         "created_at": _format_electronic_seal_datetime(index_row.created_at),
         "updated_at": _format_electronic_seal_datetime(index_row.updated_at),
     }
+
+
+def _upload_job_for_event(session: Session, event_id: str) -> ElectronicSealUploadJobMeta | None:
+    return (
+        session.query(ElectronicSealUploadJobMeta)
+        .filter(ElectronicSealUploadJobMeta.event_id == event_id)
+        .order_by(ElectronicSealUploadJobMeta.created_at.asc())
+        .first()
+    )
 
 
 def _upload_job_dict(row: ElectronicSealUploadJobMeta) -> dict:
@@ -319,6 +367,40 @@ def _upload_job_dict(row: ElectronicSealUploadJobMeta) -> dict:
 class ElectronicSealStore:
     def __init__(self, session_factory: Callable[[], Session] = SessionLocal):
         self.session_factory = session_factory
+
+    def list_models(self) -> list[dict]:
+        with self.session_factory() as session:
+            rows = (
+                session.query(ElectronicSealModelMetaRecord)
+                .order_by(
+                    ElectronicSealModelMetaRecord.created_at.desc(),
+                    ElectronicSealModelMetaRecord.id.asc(),
+                )
+                .all()
+            )
+            return [_electronic_seal_model_dict(row) for row in rows]
+
+    def get_model(self, model_id: str) -> dict | None:
+        with self.session_factory() as session:
+            row = session.get(ElectronicSealModelMetaRecord, str(model_id).strip())
+            return _electronic_seal_model_dict(row) if row else None
+
+    def find_model_by_name(self, name: str) -> dict | None:
+        with self.session_factory() as session:
+            rows = (
+                session.query(ElectronicSealModelMetaRecord)
+                .filter(ElectronicSealModelMetaRecord.name == str(name))
+                .all()
+            )
+            if len(rows) > 1:
+                raise ValueError(
+                    f"expected one electronic-seal model named {name!r}, found {len(rows)}"
+                )
+            return _electronic_seal_model_dict(rows[0]) if rows else None
+
+    def model_exists(self, model_id: str) -> bool:
+        with self.session_factory() as session:
+            return session.get(ElectronicSealModelMetaRecord, str(model_id).strip()) is not None
 
     def get_channel_profile(self, channel_id: str) -> dict | None:
         with self.session_factory() as session:
@@ -405,6 +487,7 @@ class ElectronicSealStore:
                 result: list[dict] = []
                 for default in defaults:
                     algorithm_type = str(default["algorithm_type"])
+                    _validate_model_id(session, model_id)
                     row = (
                         session.query(ElectronicSealConfigMeta)
                         .filter(
@@ -422,7 +505,7 @@ class ElectronicSealStore:
                             model_id=model_id,
                             enabled=True,
                             sample_interval_ms=1000,
-                            camera_health_interval_seconds=3600,
+                            camera_health_interval_seconds=1,
                             alarm_hold_seconds=10,
                             recovery_hold_seconds=15,
                             need_snapshot=True,
@@ -476,6 +559,7 @@ class ElectronicSealStore:
         with _channel_lock(channel_id):
             with self.session_factory() as session:
                 _lock_channel_row(session, channel_id)
+                _validate_model_id(session, payload.get("model_id"))
                 now = datetime.now()
                 row = (
                     session.query(ElectronicSealConfigMeta)
@@ -494,7 +578,7 @@ class ElectronicSealStore:
                         model_id=None,
                         enabled=False,
                         sample_interval_ms=1000,
-                        camera_health_interval_seconds=3600,
+                        camera_health_interval_seconds=1,
                         alarm_hold_seconds=10,
                         recovery_hold_seconds=15,
                         need_snapshot=True,
@@ -712,7 +796,7 @@ class ElectronicSealStore:
             )
             if existing is not None:
                 detail = session.get(detail_model, existing.id)
-                return _indexed_event_dict(existing, detail)
+                return _indexed_event_dict(existing, detail, _upload_job_for_event(session, existing.id))
 
             started_at = _event_datetime_value(payload.get("started_at"), now)
             detected_at = _event_datetime_value(payload.get("detected_at"), started_at)
@@ -761,6 +845,7 @@ class ElectronicSealStore:
                 "created_at": now,
                 "updated_at": now,
             }
+            upload_job = None
             if algorithm_type == "truck_departure":
                 detail_row = detail_model(
                     **common,
@@ -843,7 +928,7 @@ class ElectronicSealStore:
                     )
                     count_row.updated_at = now
                 if enqueue_upload:
-                    self._create_upload_job_row(
+                    upload_job = self._create_upload_job_row(
                         session,
                         event_id,
                         str(payload.get("upload_target") or "supervision"),
@@ -853,7 +938,7 @@ class ElectronicSealStore:
             session.commit()
             session.refresh(index_row)
             session.refresh(detail_row)
-            return _indexed_event_dict(index_row, detail_row)
+            return _indexed_event_dict(index_row, detail_row, upload_job)
 
     def close_event(self, event_id: str, ended_at: datetime, duration_seconds: float) -> dict | None:
         with self.session_factory() as session:
@@ -891,14 +976,18 @@ class ElectronicSealStore:
                 legacy.updated_at = now
             session.commit()
             session.refresh(index_row)
-            return _indexed_event_dict(index_row, detail)
+            return _indexed_event_dict(index_row, detail, _upload_job_for_event(session, event_id))
 
     def get_event(self, event_id: str) -> dict | None:
         with self.session_factory() as session:
             index_row = session.query(ElectronicSealEventIndexMeta).filter(ElectronicSealEventIndexMeta.id == event_id).one_or_none()
             if index_row is not None:
                 _, detail_model = _event_detail_table(index_row.algorithm_type)
-                return _indexed_event_dict(index_row, session.get(detail_model, event_id))
+                return _indexed_event_dict(
+                    index_row,
+                    session.get(detail_model, event_id),
+                    _upload_job_for_event(session, event_id),
+                )
             row = session.query(ElectronicSealEventMeta).filter(ElectronicSealEventMeta.id == event_id).one_or_none()
             return _event_dict(row) if row else None
 
@@ -986,7 +1075,7 @@ class ElectronicSealStore:
             index_row.updated_at = now
             session.commit()
             session.refresh(index_row)
-            return _indexed_event_dict(index_row, detail)
+            return _indexed_event_dict(index_row, detail, _upload_job_for_event(session, event_id))
 
     def list_events(
         self,
@@ -1056,11 +1145,20 @@ class ElectronicSealStore:
             if rows:
                 last = rows[-1]
                 next_cursor = f"{last.created_at.isoformat()}|{last.id}"
+            upload_jobs = {}
+            if rows:
+                upload_jobs = {
+                    job.event_id: job
+                    for job in session.query(ElectronicSealUploadJobMeta)
+                    .filter(ElectronicSealUploadJobMeta.event_id.in_([row.id for row in rows]))
+                    .all()
+                }
             return {
                 "items": [
                     _indexed_event_dict(
                         row,
                         session.get(_event_detail_table(row.algorithm_type)[1], row.id),
+                        upload_jobs.get(row.id),
                     )
                     for row in rows
                 ],
