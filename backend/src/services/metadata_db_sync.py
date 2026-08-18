@@ -31,6 +31,14 @@ from src.db.models import (
 
 logger = logging.getLogger(__name__)
 
+AUTOMATIC_ALARM_LABELS_BY_SCENE = {
+    "sleep_on_duty": "sleep",
+    "helmet_detection": "no_helmet",
+    "reflective_vest_detection": "no_vest",
+    "smoke_alarm": "smoke",
+    "fire_alarm": "fire",
+}
+
 
 def _table_columns(session: Session, table_name: str) -> set[str]:
     inspector = inspect(session.bind)
@@ -311,7 +319,6 @@ def _cleanup_orphan_tasks(session: Session) -> None:
         return
 
     for task_id in orphan_task_ids:
-        session.query(TaskAlgorithmMetricHistoryMeta).filter(TaskAlgorithmMetricHistoryMeta.task_id == task_id).delete()
         session.query(TaskAlgorithmMetricMeta).filter(TaskAlgorithmMetricMeta.task_id == task_id).delete()
         session.query(AlgorithmRegionMeta).filter(AlgorithmRegionMeta.task_id == task_id).delete()
         session.query(TaskAlgorithmRegionMeta).filter(TaskAlgorithmRegionMeta.task_id == task_id).delete()
@@ -394,6 +401,63 @@ def _ensure_mysql_task_algorithm_model_fk(session: Session) -> None:
     )
 
 
+def _migrate_automatic_alarm_labels(session: Session) -> None:
+    rows = (
+        session.query(TaskAlgorithmMeta)
+        .filter(TaskAlgorithmMeta.scene_key.in_(list(AUTOMATIC_ALARM_LABELS_BY_SCENE)))
+        .all()
+    )
+    if not rows:
+        return
+
+    model_ids = {row.model_id for row in rows if row.model_id}
+    model_rows = (
+        session.query(ModelMetaRecord)
+        .filter(ModelMetaRecord.id.in_(model_ids))
+        .all()
+        if model_ids
+        else []
+    )
+    classes_by_model_id = {
+        row.id: {
+            str(label).strip()
+            for label in (_normalize_json_value(row.classes_json) or [])
+            if str(label).strip()
+        }
+        for row in model_rows
+    }
+
+    changed = 0
+    for row in rows:
+        label_source = str(row.label_source or "").strip().lower()
+        if label_source not in {"", "all"} and not bool(row.detect_all_classes):
+            continue
+
+        alarm_label = AUTOMATIC_ALARM_LABELS_BY_SCENE.get(str(row.scene_key))
+        if not alarm_label or alarm_label not in classes_by_model_id.get(row.model_id, set()):
+            logger.warning(
+                "[MetadataMigration] skip alarm label migration algorithm_id=%s scene_key=%s model_id=%s label=%s",
+                row.id,
+                row.scene_key,
+                row.model_id,
+                alarm_label,
+            )
+            continue
+
+        raw_json = copy.deepcopy(row.raw_json) if isinstance(row.raw_json, dict) else {}
+        raw_json["labels"] = [alarm_label]
+        raw_json["detect_all_classes"] = False
+        raw_json["label_source"] = "recommended"
+        row.labels_json = [alarm_label]
+        row.detect_all_classes = False
+        row.label_source = "recommended"
+        row.raw_json = raw_json
+        changed += 1
+
+    if changed:
+        logger.info("[MetadataMigration] migrated automatic alarm labels count=%s", changed)
+
+
 def migrate_metadata_database_schema() -> None:
     if not settings.METADATA_DB_ENABLED:
         return
@@ -407,6 +471,7 @@ def migrate_metadata_database_schema() -> None:
         _ensure_metric_tables_v2(session, dialect_name)
 
         if dialect_name == "sqlite":
+            _add_column_if_missing(session, "channels", "flv", "flv TEXT")
             _add_column_if_missing(session, "channels", "webrtc_api", "webrtc_api TEXT")
             _add_column_if_missing(session, "channels", "hls", "hls TEXT")
             _add_column_if_missing(session, "channels", "snapshot_path", "snapshot_path TEXT")
@@ -436,6 +501,7 @@ def migrate_metadata_database_schema() -> None:
             _add_column_if_missing(session, "recordings", "task_id", "task_id VARCHAR(64)")
             _add_column_if_missing(session, "recordings", "algorithm_id", "algorithm_id VARCHAR(64)")
         else:
+            _add_column_if_missing(session, "channels", "flv", "flv TEXT")
             _add_column_if_missing(session, "channels", "webrtc_api", "webrtc_api TEXT")
             _add_column_if_missing(session, "channels", "hls", "hls TEXT")
             _add_column_if_missing(session, "channels", "snapshot_path", "snapshot_path TEXT")
@@ -468,6 +534,11 @@ def migrate_metadata_database_schema() -> None:
                 _ensure_mysql_task_channel_fk(session)
                 _ensure_mysql_task_algorithm_model_fk(session)
 
+        _migrate_automatic_alarm_labels(session)
+        channel_rows = session.query(ChannelMeta).filter(ChannelMeta.flv.is_(None)).all()
+        for channel_row in channel_rows:
+            raw_json = channel_row.raw_json if isinstance(channel_row.raw_json, dict) else {}
+            channel_row.flv = str(raw_json.get("flv") or "").strip() or None
         session.execute(
             text(
                 """
@@ -585,10 +656,12 @@ def _sync_channel(session: Session, payload: dict) -> None:
         ChannelMeta(
             id=payload["id"],
             device_id=payload.get("device_id"),
+            gb_id=payload.get("gb_id"),
             media_node_id=payload.get("media_node_id"),
             name=payload.get("name"),
             type=payload.get("type"),
             source_url=payload.get("source_url"),
+            flv=payload.get("flv"),
             app=payload.get("app"),
             stream=payload.get("stream"),
             is_online=payload.get("is_online"),
@@ -903,7 +976,6 @@ def delete_json_document(path: Path, item_id: str | None) -> None:
         elif path.parent == settings.RECORDINGS_DIR:
             session.query(RecordingMeta).filter(RecordingMeta.id == item_id).delete()
         elif path.parent == settings.TASKS_DIR:
-            session.query(TaskAlgorithmMetricHistoryMeta).filter(TaskAlgorithmMetricHistoryMeta.task_id == item_id).delete()
             session.query(TaskAlgorithmMetricMeta).filter(TaskAlgorithmMetricMeta.task_id == item_id).delete()
             session.query(AlgorithmRegionMeta).filter(AlgorithmRegionMeta.task_id == item_id).delete()
             session.query(TaskAlgorithmRegionMeta).filter(TaskAlgorithmRegionMeta.task_id == item_id).delete()

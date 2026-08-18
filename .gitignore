@@ -15,4 +15,10 @@ docker/zlm
 yolo-images.tar
 .tmp/
 yolo-backend2.tar
-docs/
+docs/*
+!docs/electronic-seal-operations.md
+runs/*
+.tmp-spreadsheet-analysis/rendered/Sheet1.png
+.tmp-spreadsheet-analysis/inspect.mjs
+.ultralytics-settings/persistent_cache.json
+.ultralytics-settings/settings.json

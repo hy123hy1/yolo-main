@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+import logging
 import math
 from numbers import Real
 from typing import Any
@@ -13,10 +14,12 @@ from src.electronic_seal.algorithms.room_empty import (
 )
 from src.electronic_seal.algorithms.truck_departure import TruckDepartureDetector
 from src.electronic_seal.evidence import EvidenceService
+from src.electronic_seal.severity import event_severity
 
 
 DEFAULT_ROOM_EMPTY_HOLD_SECONDS = 600.0
 RULE_ALGORITHMS = frozenset({"truck_departure", "room_empty"})
+logger = logging.getLogger("uvicorn.error")
 
 
 def _timestamp_seconds(value: Real | datetime) -> float:
@@ -89,11 +92,13 @@ class ElectronicSealDetectionRunner:
         inference: Any,
         store: Any,
         evidence_service: EvidenceService | None = None,
+        runtime_owner_id: str | None = None,
     ) -> None:
         self.channel_id = str(channel_id)
         self.inference = inference
         self.store = store
         self.evidence_service = evidence_service
+        self.runtime_owner_id = runtime_owner_id
         self.configs: list[dict[str, Any]] = []
         self._detectors: dict[str, Any] = {}
         self._geometry_size: tuple[int, int] | None = None
@@ -185,6 +190,7 @@ class ElectronicSealDetectionRunner:
                         "last_metrics_json": {"detection_count": len(detections)},
                         "runtime_json": {"model_id": config["model_id"]},
                         "last_run_at": _event_datetime(timestamp),
+                        "runtime_owner_id": self.runtime_owner_id,
                     }
                 )
                 continue
@@ -205,7 +211,7 @@ class ElectronicSealDetectionRunner:
                 persisted_events.append(persisted)
                 active_event_id = persisted["id"]
             if update.recovered and active_event_id:
-                self.store.close_event(
+                close_args = (
                     active_event_id,
                     _event_datetime(timestamp),
                     max(
@@ -214,6 +220,13 @@ class ElectronicSealDetectionRunner:
                         0.0,
                     ),
                 )
+                if self.runtime_owner_id is None:
+                    self.store.close_event(*close_args)
+                else:
+                    self.store.close_event(
+                        *close_args,
+                        runtime_owner_id=self.runtime_owner_id,
+                    )
                 active_event_id = None
             self.store.save_state(
                 {
@@ -227,10 +240,15 @@ class ElectronicSealDetectionRunner:
                     },
                     "runtime_json": {
                         "model_id": config["model_id"],
-                        "empty_since": event.to_dict()["empty_since"] if update.events else None,
+                        "empty_since": (
+                            _event_datetime(update.empty_since).isoformat()
+                            if update.empty_since is not None
+                            else None
+                        ),
                     },
                     "bad_since": _event_datetime(update.empty_since) if update.active_empty and update.empty_since else None,
                     "last_event_id": active_event_id,
+                    "runtime_owner_id": self.runtime_owner_id,
                     "last_run_at": _event_datetime(timestamp),
                 }
             )
@@ -243,19 +261,14 @@ class ElectronicSealDetectionRunner:
         reason: str,
     ) -> dict[str, Any]:
         for config in configs:
-            save_state = getattr(self.store, "save_state", None)
-            if not callable(save_state):
-                continue
-            get_state = getattr(self.store, "get_state", None)
-            previous = (
-                get_state(self.channel_id, config["algorithm_type"])
-                if callable(get_state)
-                else None
+            previous = self.store.get_state(
+                self.channel_id,
+                config["algorithm_type"],
             )
             previous_reason = ((previous or {}).get("last_metrics_json") or {}).get("reason")
             if (previous or {}).get("status") == "waiting_config" and previous_reason == reason:
                 continue
-            save_state(
+            self.store.save_state(
                 {
                     "channel_id": self.channel_id,
                     "algorithm_type": config["algorithm_type"],
@@ -264,6 +277,7 @@ class ElectronicSealDetectionRunner:
                     "last_metrics_json": {"reason": reason},
                     "runtime_json": {"configuration_state": reason},
                     "last_run_at": _event_datetime(timestamp),
+                    "runtime_owner_id": self.runtime_owner_id,
                 }
             )
         return {"ran": False, "reason": "waiting_config", "detail": reason, "events": []}
@@ -276,12 +290,19 @@ class ElectronicSealDetectionRunner:
                 if algorithm_type == "truck_departure":
                     line = _geometry_points(config.get("line_config_json"), width, height, expected=2)
                     line_config = config.get("line_config_json") or {}
+                    threshold_config = config.get("threshold_config_json") or {}
+                    allowed_labels = config.get("allowed_labels")
+                    if allowed_labels is None:
+                        allowed_labels = line_config.get("allowed_labels")
+                    if allowed_labels is None:
+                        allowed_labels = threshold_config.get("allowed_labels")
                     self._detectors[algorithm_type] = TruckDepartureDetector(
                         line[0],
                         line[1],
                         line_id=str(line_config.get("line_id") or "departure-line"),
                         inside_side=str(line_config.get("inside_side") or "left"),
                         direction=line_config.get("direction") or "inside_to_outside",
+                        allowed_labels=allowed_labels,
                         cooldown_seconds=_config_value(config, "cooldown_seconds", 0.0),
                     )
                 elif algorithm_type == "room_empty":
@@ -322,7 +343,7 @@ class ElectronicSealDetectionRunner:
                 "channel_id": self.channel_id,
                 "algorithm_type": event_type,
                 "event_type": event_type,
-                "severity": "alarm",
+                "severity": event_severity(event_type),
                 "started_at": _event_datetime(timestamp),
                 "score": score,
                 "enqueue_upload": event_type == "truck_departure",
@@ -331,6 +352,7 @@ class ElectronicSealDetectionRunner:
                     "rule": rule_event,
                     "detections": detections,
                 },
+                "runtime_owner_id": self.runtime_owner_id,
             }
         )
         if (
@@ -338,22 +360,37 @@ class ElectronicSealDetectionRunner:
             and bool(config.get("need_snapshot", True))
         ):
             try:
+                snapshot_detections = detections
+                if event_type == "room_empty":
+                    room_detector = self._detectors.get("room_empty")
+                    if isinstance(room_detector, RoomEmptyDetector):
+                        snapshot_detections = room_detector.filter_person_detections(detections)
                 snapshot = self.evidence_service.create_snapshot(
                     channel_id=self.channel_id,
                     event_id=event["id"],
                     frame=self._current_frame,
                     annotations={
-                        "detections": detections,
+                        "detections": snapshot_detections,
                         "line": self._annotation_geometry(config, "line_config_json", expected=2),
                         "region": self._annotation_geometry(config, "region_config_json"),
                     },
                 )
-                updater = getattr(self.store, "update_event", None)
-                if callable(updater):
-                    event = updater(event["id"], {"evidence_snapshot_path": snapshot}) or event
+                update_payload = {"evidence_snapshot_path": snapshot}
+                if self.runtime_owner_id is None:
+                    event = self.store.update_event(event["id"], update_payload) or event
+                else:
+                    event = self.store.update_event(
+                        event["id"],
+                        update_payload,
+                        runtime_owner_id=self.runtime_owner_id,
+                    ) or event
             except Exception:
-                # Evidence failure must not discard the alarm event.
-                pass
+                logger.exception(
+                    "[ElectronicSeal] snapshot failed channel_id=%s event_id=%s algorithm_type=%s",
+                    self.channel_id,
+                    event.get("id"),
+                    event_type,
+                )
         return event
 
     def _annotation_geometry(

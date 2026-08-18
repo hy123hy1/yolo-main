@@ -50,8 +50,7 @@ class ElectronicSealUploader:
                 raise TimeoutError("upload deadline exceeded before request")
             event_payload = payload.get("event_payload")
             if not event_payload:
-                event_loader = getattr(self.store, "get_event", None)
-                event_payload = event_loader(event_id) if callable(event_loader) else None
+                event_payload = self.store.get_event(event_id)
             event_payload = event_payload or payload
             response = self.client.send_event(
                 event_payload,

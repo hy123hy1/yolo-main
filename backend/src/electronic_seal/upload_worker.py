@@ -47,7 +47,9 @@ class ElectronicSealUploadWorker:
         self.thread = None
 
     def run_once(self) -> list[dict[str, Any]]:
-        jobs = self.store.list_upload_jobs({"pending", "retry"}, limit=self.max_jobs)
+        # Include abandoned leases so a worker restart can recover uploads after
+        # the previous process died while the request was in flight.
+        jobs = self.store.list_upload_jobs({"pending", "retry", "uploading"}, limit=self.max_jobs)
         results: list[dict[str, Any]] = []
         for job in jobs:
             result = self.uploader.process(str(job["id"]))

@@ -12,7 +12,9 @@ from src.electronic_seal.evidence_buffer import EvidenceBuffer
 
 
 logger = logging.getLogger("uvicorn.error")
-VIDEO_ALGORITHMS = frozenset({"room_empty", "camera_occlusion", "camera_view_shift"})
+VIDEO_ALGORITHMS = frozenset(
+    {"truck_departure", "room_empty", "camera_occlusion", "camera_view_shift"}
+)
 
 
 @dataclass(frozen=True)
@@ -41,6 +43,7 @@ class EvidenceVideoCoordinator:
         buffer_max_bytes: int = 256 * 1024 * 1024,
         frame_quality: int = 75,
         executor: Executor | None = None,
+        runtime_owner_id: str | None = None,
     ) -> None:
         self.channel_id = str(channel_id)
         self.store = store
@@ -49,6 +52,7 @@ class EvidenceVideoCoordinator:
         self.after_seconds = max(float(after_seconds), 0.0)
         self.fps = max(float(fps), 1.0)
         self.frame_quality = min(max(int(frame_quality), 10), 95)
+        self.runtime_owner_id = runtime_owner_id
         buffer_seconds = self.before_seconds + self.after_seconds + 2.0
         capacity = max(
             int(math.ceil(self.fps * buffer_seconds)),
@@ -159,9 +163,15 @@ class EvidenceVideoCoordinator:
                 overlay_callback=overlay_callback,
                 preserve_duration=True,
             )
-            updater = getattr(self.store, "update_event", None)
-            if callable(updater):
-                updater(job.event_id, {"evidence_video_path": video_path})
+            update_payload = {"evidence_video_path": video_path}
+            if self.runtime_owner_id is None:
+                self.store.update_event(job.event_id, update_payload)
+            else:
+                self.store.update_event(
+                    job.event_id,
+                    update_payload,
+                    runtime_owner_id=self.runtime_owner_id,
+                )
         except Exception:
             logger.exception(
                 "[ElectronicSeal] evidence video failed channel_id=%s event_id=%s algorithm=%s",

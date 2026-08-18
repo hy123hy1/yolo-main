@@ -4,12 +4,15 @@ from datetime import datetime
 from pathlib import Path
 import math
 import re
+import subprocess
+import sys
 import time
 from typing import Any, Callable
 
 import cv2
 import numpy as np
 
+from src.core.settings import settings
 from src.electronic_seal.evidence_buffer import EvidenceBuffer
 
 
@@ -168,29 +171,121 @@ class EvidenceService:
             f"{self.analysis_type_code}"
             f"{event_time:%Y%m%d%H%M%S}.MP4"
         )
-        writer = cv2.VideoWriter(
-            str(path),
-            cv2.VideoWriter_fourcc(*"mp4v"),
-            float(fps),
-            (int(width), int(height)),
-        )
-        if not writer.isOpened():
-            writer.release()
-            raise RuntimeError(f"failed to open electronic-seal video writer: {path}")
         output_frames = self._resample_clip_frames(clip, fps) if preserve_duration else [
             (item, item.timestamp) for item in clip.frames
         ]
+        ffmpeg_bin = str(getattr(settings, "FFMPEG_BIN", "ffmpeg") or "ffmpeg")
+        command = [
+            ffmpeg_bin,
+            "-y",
+            "-loglevel",
+            "error",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "bgr24",
+            "-s",
+            f"{int(width)}x{int(height)}",
+            "-r",
+            f"{float(fps):.6f}",
+            "-i",
+            "pipe:0",
+            "-an",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "medium",
+            "-crf",
+            "23",
+            "-pix_fmt",
+            "yuv420p",
+            "-movflags",
+            "+faststart",
+            str(path),
+        ]
+        popen_kwargs: dict[str, Any] = {
+            "stdin": subprocess.PIPE,
+            "stdout": subprocess.DEVNULL,
+            "stderr": subprocess.PIPE,
+            "bufsize": 0,
+        }
+        if sys.platform == "win32":
+            popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+
+        process: subprocess.Popen | None = None
+        completed = False
         try:
+            process = subprocess.Popen(command, **popen_kwargs)
+            if process.stdin is None:
+                raise RuntimeError("FFmpeg stdin is unavailable")
             for item, output_timestamp in output_frames:
                 frame = self.decode_frame(item.frame)
                 if frame.shape[:2] != (height, width):
                     raise ValueError("all evidence frames must have the same dimensions")
                 if overlay_callback is not None:
                     frame = overlay_callback(frame, output_timestamp)
-                writer.write(frame)
+                if frame.ndim != 3 or frame.shape[2] != 3:
+                    raise ValueError("all evidence frames must be BGR images")
+                process.stdin.write(np.ascontiguousarray(frame, dtype=np.uint8).tobytes())
+            process.stdin.close()
+            # ``communicate()`` attempts to flush stdin on Python 3.12 even
+            # after it has been closed. Wait for FFmpeg directly, then read
+            # its small error pipe after the encoder exits.
+            process.wait()
+            stderr = process.stderr.read() if process.stderr is not None else b""
+            if process.returncode != 0:
+                detail = self._ffmpeg_stderr_text(stderr)
+                raise RuntimeError(
+                    f"FFmpeg failed to encode electronic-seal video: "
+                    f"{detail or f'exit code {process.returncode}'}"
+                )
+            completed = True
+        except BrokenPipeError as exc:
+            detail = self._read_ffmpeg_stderr(process)
+            raise RuntimeError(
+                f"FFmpeg stopped while encoding electronic-seal video: "
+                f"{detail or str(exc)}"
+            ) from exc
+        except OSError as exc:
+            raise RuntimeError(f"failed to start FFmpeg for electronic-seal video: {exc}") from exc
         finally:
-            writer.release()
+            if process is not None:
+                if process.stdin is not None and not process.stdin.closed:
+                    process.stdin.close()
+                if not completed:
+                    try:
+                        if process.poll() is None:
+                            process.kill()
+                    except (AttributeError, OSError):
+                        pass
+                try:
+                    process.wait()
+                except (OSError, subprocess.SubprocessError):
+                    pass
+                if process.stderr is not None and not process.stderr.closed:
+                    process.stderr.close()
+            if not completed:
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    pass
         return str(path)
+
+    @staticmethod
+    def _ffmpeg_stderr_text(stderr: Any) -> str:
+        if isinstance(stderr, bytes):
+            return stderr.decode("utf-8", errors="replace").strip()
+        return str(stderr or "").strip()
+
+    @classmethod
+    def _read_ffmpeg_stderr(cls, process: subprocess.Popen | None) -> str:
+        if process is None or process.stderr is None:
+            return ""
+        try:
+            _, stderr = process.communicate()
+        except (OSError, subprocess.SubprocessError):
+            return ""
+        return cls._ffmpeg_stderr_text(stderr)
 
     @staticmethod
     def _resample_clip_frames(clip, fps: float) -> list[tuple[Any, float]]:

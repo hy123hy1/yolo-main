@@ -7,9 +7,86 @@ from src.services.platform_storage import format_datetime
 
 REALTIME_UPDATE_INTERVAL_SECONDS = 1
 HISTORY_SAMPLE_INTERVAL_SECONDS = 60
+CUMULATIVE_METRIC_TYPES = frozenset({"count", "person_count", "vehicle_count"})
 
 
 class MetricService:
+    @staticmethod
+    def _is_cumulative_metric(metric_type: str) -> bool:
+        return str(metric_type or "").strip().lower() in CUMULATIVE_METRIC_TYPES
+
+    @staticmethod
+    def _parse_history_window_start(value: Any) -> datetime | None:
+        if not value:
+            return None
+        try:
+            return datetime.fromisoformat(str(value))
+        except (TypeError, ValueError):
+            return None
+
+    def _advance_cumulative_metric_window(
+        self,
+        session,
+        *,
+        row: TaskAlgorithmMetricMeta | None,
+        task_id: str,
+        algorithm_id: str,
+        metric_type: str,
+        region_id: str | None,
+        metric_value: float,
+        now: datetime,
+    ) -> tuple[dict[str, Any], dict[str, Any] | None]:
+        previous_raw = dict(row.raw_json or {}) if row else {}
+        window_start = self._parse_history_window_start(
+            previous_raw.get("history_window_started_at")
+        )
+        if window_start is None or now < window_start:
+            window_start = now
+            accumulated_value = 0.0
+            sample_count = 0
+        else:
+            accumulated_value = float(
+                previous_raw.get("history_accumulated_value", 0) or 0
+            )
+            sample_count = max(
+                int(previous_raw.get("history_sample_count", 0) or 0),
+                0,
+            )
+
+        pending_history: dict[str, Any] | None = None
+        window_elapsed = now - window_start
+        can_sample = sample_count > 0 and window_elapsed >= timedelta(
+            seconds=HISTORY_SAMPLE_INTERVAL_SECONDS
+        )
+        if can_sample and self._should_sample_history(
+            session,
+            task_id=task_id,
+            algorithm_id=algorithm_id,
+            metric_type=metric_type,
+            region_id=region_id,
+            now=now,
+        ):
+            pending_history = {
+                "metric_value": accumulated_value,
+                "window_started_at": window_start.isoformat(),
+                "window_ended_at": now.isoformat(),
+                "sample_count": sample_count,
+            }
+            window_start = now
+            accumulated_value = 0.0
+            sample_count = 0
+
+        accumulated_value += float(metric_value)
+        sample_count += 1
+        state = {
+            "history_aggregation": "sum_realtime_values",
+            "history_window_seconds": HISTORY_SAMPLE_INTERVAL_SECONDS,
+            "history_window_started_at": window_start.isoformat(),
+            "history_accumulated_value": accumulated_value,
+            "history_sample_count": sample_count,
+        }
+        return state, pending_history
+
     def _metric_from_row(self, row: TaskAlgorithmMetricMeta, algorithm_names: dict[str, str], model_names: dict[str, str]) -> dict[str, Any]:
         raw_json = dict(row.raw_json or {})
         return {
@@ -226,6 +303,7 @@ class MetricService:
                 .one_or_none()
             )
             should_update = self._should_update_realtime(row, now)
+            pending_history: dict[str, Any] | None = None
             if should_update:
                 if not row:
                     row = TaskAlgorithmMetricMeta()
@@ -240,22 +318,64 @@ class MetricService:
                 row.region_name = region_name
                 row.scope_key = scope_key
                 row.updated_at = now
-                row.raw_json = payload
+                runtime_raw_json = dict(payload)
+                if self._is_cumulative_metric(metric_type):
+                    history_state, pending_history = self._advance_cumulative_metric_window(
+                        session,
+                        row=row,
+                        task_id=task_id,
+                        algorithm_id=algorithm_id,
+                        metric_type=metric_type,
+                        region_id=region_id,
+                        metric_value=float(metric_value),
+                        now=now,
+                    )
+                    runtime_raw_json.update(history_state)
+                row.raw_json = runtime_raw_json
                 updated = True
 
-            history_sampled = self._add_history_sample(
-                session,
-                task_id=task_id,
-                algorithm_id=algorithm_id,
-                channel_id=channel_id,
-                model_id=model_id,
-                metric_type=metric_type,
-                metric_value=float(metric_value),
-                region_id=region_id,
-                region_name=region_name,
-                raw_json=payload,
-                now=now,
-            )
+            if self._is_cumulative_metric(metric_type):
+                if pending_history is not None:
+                    history_raw_json = dict(payload)
+                    history_raw_json.update(
+                        {
+                            "metric_value": pending_history["metric_value"],
+                            "history_aggregation": "sum_realtime_values",
+                            "history_window_seconds": HISTORY_SAMPLE_INTERVAL_SECONDS,
+                            "history_window_started_at": pending_history["window_started_at"],
+                            "history_window_ended_at": pending_history["window_ended_at"],
+                            "history_sample_count": pending_history["sample_count"],
+                        }
+                    )
+                    history_sampled = self._add_history_sample(
+                        session,
+                        task_id=task_id,
+                        algorithm_id=algorithm_id,
+                        channel_id=channel_id,
+                        model_id=model_id,
+                        metric_type=metric_type,
+                        metric_value=float(pending_history["metric_value"]),
+                        region_id=region_id,
+                        region_name=region_name,
+                        raw_json=history_raw_json,
+                        now=now,
+                    )
+                else:
+                    history_sampled = False
+            else:
+                history_sampled = self._add_history_sample(
+                    session,
+                    task_id=task_id,
+                    algorithm_id=algorithm_id,
+                    channel_id=channel_id,
+                    model_id=model_id,
+                    metric_type=metric_type,
+                    metric_value=float(metric_value),
+                    region_id=region_id,
+                    region_name=region_name,
+                    raw_json=payload,
+                    now=now,
+                )
             session.commit()
             current_id = int(row.id) if row and row.id is not None else None
             current_value = float(row.metric_value or 0) if row else float(metric_value)

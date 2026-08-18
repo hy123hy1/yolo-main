@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime
 import logging
 import time
 from copy import deepcopy
@@ -18,10 +19,8 @@ from src.services.metadata_db_sync import delete_json_document
 from src.services.metric_service import metric_service
 from src.services.platform_storage import format_datetime, generate_id, list_json_items, load_json, now_iso, save_json
 from src.services.model_service import ModelService
-from src.services.wvp_service import WVPService
 
 channel_service = ChannelService()
-wvp_service = WVPService()
 model_service = ModelService()
 logger = logging.getLogger("uvicorn.error")
 
@@ -44,7 +43,6 @@ class TaskService:
         self._preview_warmup_jobs: dict[str, asyncio.Task] = {}
         self._preview_warmup_semaphore: asyncio.Semaphore | None = None
         self._preview_warmup_semaphore_limit: int | None = None
-        self._source_refresh_jobs: dict[str, asyncio.Task] = {}
 
     def _assert_channel_not_owned_by_electronic_seal(self, channel_id: str | None) -> None:
         channel_id = str(channel_id or "").strip()
@@ -56,6 +54,8 @@ class TaskService:
                 raise ElectronicSealChannelOwnedError(channel_id)
             return
         try:
+            channel_loader = getattr(self.electronic_seal_store, "get_channel", None)
+            owned_channel = channel_loader(channel_id) if callable(channel_loader) else None
             profile = self.electronic_seal_store.get_channel_profile(channel_id)
         except Exception as exc:
             # A worker/database startup race must not make unrelated AI tasks
@@ -66,7 +66,7 @@ class TaskService:
                 exc,
             )
             return
-        if profile and bool(profile.get("bound")):
+        if owned_channel is not None or (profile and bool(profile.get("bound"))):
             raise ElectronicSealChannelOwnedError(channel_id)
 
     @staticmethod
@@ -103,8 +103,6 @@ class TaskService:
     async def _resolve_channel_for_task(
         self,
         channel_id: str | None,
-        *,
-        refresh_wvp_source: bool = True,
     ) -> dict[str, Any] | None:
         if not channel_id:
             return None
@@ -114,42 +112,37 @@ class TaskService:
             return None
         if not channel:
             return None
-        upstream = ((channel.get("ext") or {}).get("upstream") or {})
-        if refresh_wvp_source and upstream.get("platform") == "wvp":
-            try:
-                channel = await asyncio.to_thread(wvp_service.refresh_channel_source, channel)
-            except Exception:
-                pass
         return channel
 
     async def _hydrate_task_source_from_channel(
         self,
         payload: dict[str, Any],
-        *,
-        refresh_wvp_source: bool = True,
     ) -> dict[str, Any]:
         hydrated = dict(payload)
         channel_id = hydrated.get("channel_id")
-        channel = await self._resolve_channel_for_task(
-            channel_id,
-            refresh_wvp_source=refresh_wvp_source,
-        )
+        channel = await self._resolve_channel_for_task(channel_id)
         if not channel:
+            if channel_id:
+                hydrated["source_url"] = None
+                hydrated["source_type"] = "unknown"
             return hydrated
 
-        channel_source_url = channel.get("source_url")
-        if channel_source_url:
-            hydrated["source_url"] = channel_source_url
+        channel_source_url = str(channel.get("source_url") or "").strip() or None
+        hydrated["source_url"] = channel_source_url
+        hydrated["flv"] = str(channel.get("flv") or "").strip() or None
 
-        channel_source_type = self._normalize_source_type({
-            "source_type": channel.get("source_type"),
-            "source_url": channel_source_url,
-        })
+        channel_source_type = self._normalize_source_type({"source_url": channel_source_url})
         if channel_source_type == "unknown":
-            channel_source_type = channel.get("type") or "unknown"
+            channel_source_type = channel.get("source_type") or channel.get("type") or "unknown"
         hydrated["source_type"] = channel_source_type
         hydrated["channel_name"] = channel.get("name") or hydrated.get("channel_name")
         return hydrated
+
+    @staticmethod
+    def _require_detection_rtsp(task: dict[str, Any]) -> None:
+        source_url = str(task.get("source_url") or "").strip()
+        if not source_url.lower().startswith("rtsp://"):
+            raise ValueError("Task bound channel requires a valid RTSP source_url")
 
     @staticmethod
     def _default_video_before_seconds() -> int:
@@ -162,72 +155,6 @@ class TaskService:
     @staticmethod
     def _default_true_bool(value: Any) -> bool:
         return True if value is None else bool(value)
-
-    def _schedule_task_source_refresh(
-        self,
-        task_id: str,
-        *,
-        reason: str = "startup-restore",
-        delay_seconds: float = 0.0,
-    ) -> None:
-        task_id = str(task_id or "").strip()
-        if not task_id:
-            return
-        delay_seconds = max(float(delay_seconds or 0.0), 0.0)
-
-        async def _runner() -> None:
-            try:
-                if delay_seconds > 0:
-                    await asyncio.sleep(delay_seconds)
-                task = await self.get_task(task_id, prefer_metadata=True)
-                if not task or not task.get("channel_id"):
-                    return
-
-                refreshed_payload = await self._hydrate_task_source_from_channel(
-                    task,
-                    refresh_wvp_source=True,
-                )
-                if not refreshed_payload.get("source_url"):
-                    return
-                if (
-                    refreshed_payload.get("source_url") == task.get("source_url")
-                    and refreshed_payload.get("source_type") == task.get("source_type")
-                ):
-                    return
-
-                normalized = self._normalize_task(refreshed_payload, current=task)
-                normalized["id"] = task_id
-                await self._persist_task(normalized)
-                logger.info(
-                    "[TaskSourceRefresh] task_id=%s reason=%s source_url_updated=true",
-                    task_id,
-                    reason,
-                )
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                logger.warning(
-                    "[TaskSourceRefresh] task_id=%s reason=%s error=%s",
-                    task_id,
-                    reason,
-                    exc,
-                )
-            finally:
-                current = asyncio.current_task()
-                if self._source_refresh_jobs.get(task_id) is current:
-                    self._source_refresh_jobs.pop(task_id, None)
-
-        try:
-            existing = self._source_refresh_jobs.get(task_id)
-            if existing and not existing.done():
-                existing.cancel()
-            self._source_refresh_jobs[task_id] = asyncio.create_task(_runner())
-        except RuntimeError:
-            logger.warning(
-                "[TaskSourceRefresh] skipped task_id=%s reason=%s because no running loop",
-                task_id,
-                reason,
-            )
 
     async def _resolve_browser_play_url_for_task(self, task: dict[str, Any], algorithms: list[dict[str, Any]] | None = None) -> dict[str, str]:
         channel_id = task.get("channel_id")
@@ -414,23 +341,39 @@ class TaskService:
         if model_meta:
             enriched.setdefault("confidence", float(model_meta.get("confidence", 0.25) or 0.25))
             enriched.setdefault("alert_interval", int(model_meta.get("alert_interval", 60) or 60))
-        if enriched.get("scene_name") and enriched.get("scene_key") and enriched.get("rule_type") and enriched.get("model_name"):
-            return enriched
 
         scene_candidates = list((model_meta or {}).get("scene_candidates") or [])
-        if not scene_candidates:
-            return enriched
+        scene = scene_candidates[0] if scene_candidates else {}
+        recommended_labels = list(
+            scene.get("recommended_labels")
+            or (model_meta or {}).get("recommended_labels")
+            or []
+        )
+        scene_key = enriched.get("scene_key") or scene.get("scene_key")
 
-        scene = scene_candidates[0]
-        enriched.setdefault("scene_key", scene.get("scene_key"))
-        enriched.setdefault("scene_name", scene.get("scene_name"))
-        enriched.setdefault("rule_type", scene.get("rule_type") or enriched.get("algorithm_type") or "detection")
-        if not enriched.get("labels") and scene.get("recommended_labels"):
-            enriched["labels"] = list(scene.get("recommended_labels") or [])
-        enriched.setdefault("label_source", "recommended")
-        enriched.setdefault("need_snapshot", self._default_true_bool(scene.get("default_need_snapshot")))
-        enriched.setdefault("need_video_clip", self._default_true_bool(scene.get("default_need_video_clip")))
-        enriched.setdefault("requires_region", bool(scene.get("requires_region", False)))
+        # Smoke/fire models share classes, so never allow their alarms to fall
+        # back to all-class detection when a client omits or overrides labels.
+        forced_labels = {
+            "smoke_alarm": ["smoke"],
+            "fire_alarm": ["fire"],
+        }.get(str(scene_key or ""))
+        if forced_labels and all(label in recommended_labels for label in forced_labels):
+            enriched["labels"] = forced_labels
+            enriched["detect_all_classes"] = False
+            enriched["label_source"] = "recommended"
+        elif not enriched.get("labels") and recommended_labels:
+            enriched["labels"] = recommended_labels
+            enriched.setdefault("label_source", "recommended")
+            enriched.setdefault("detect_all_classes", False)
+
+        if scene_candidates:
+            enriched.setdefault("scene_key", scene.get("scene_key"))
+            enriched.setdefault("scene_name", scene.get("scene_name"))
+            enriched.setdefault("rule_type", scene.get("rule_type") or enriched.get("algorithm_type") or "detection")
+            enriched.setdefault("label_source", "recommended")
+            enriched.setdefault("need_snapshot", self._default_true_bool(scene.get("default_need_snapshot")))
+            enriched.setdefault("need_video_clip", self._default_true_bool(scene.get("default_need_video_clip")))
+            enriched.setdefault("requires_region", bool(scene.get("requires_region", False)))
         return enriched
 
     def _normalize_regions(self, regions: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
@@ -932,6 +875,7 @@ class TaskService:
             "id": current.get("id") or payload.get("id") or generate_id("task"),
             "name": payload.get("name", current.get("name") or "未命名任务"),
             "source_url": payload.get("source_url", current.get("source_url")),
+            "flv": payload.get("flv", current.get("flv")),
             "source_type": self._normalize_source_type({
                 "source_type": payload.get("source_type", current.get("source_type")),
                 "source_url": payload.get("source_url", current.get("source_url")),
@@ -1286,19 +1230,8 @@ class TaskService:
             task["algorithms"] = algorithms
             task["regions"] = self._derive_task_regions_from_algorithms(algorithms)
             task["updated_at"] = now_iso()
-            persisted_task = await self._persist_task(task)
-            result = {
-                "items": list(normalized_algorithm.get("regions") or []),
-                "playback_ready": False,
-            }
-            if not self._is_task_running(persisted_task):
-                return result
-
-            self._schedule_task_preview_warmup(persisted_task, reason="region-update")
-            return {
-                **result,
-                "preview_refresh_scheduled": True,
-            }
+            await self._persist_task(task)
+            return {"items": list(normalized_algorithm.get("regions") or [])}
 
         return None
 
@@ -1325,9 +1258,12 @@ class TaskService:
             raise ValueError(f"当前通道已有运行中任务: {running_name}")
         refreshed_payload = await self._hydrate_task_source_from_channel(task)
         _log_step("hydrate_source")
-        if task.get("channel_id") and not refreshed_payload.get("source_url"):
-            raise ValueError(f"Task bound channel not found: {task.get('channel_id')}")
-        if refreshed_payload.get("source_url") != task.get("source_url") or refreshed_payload.get("source_type") != task.get("source_type"):
+        self._require_detection_rtsp(refreshed_payload)
+        _log_step("validated_rtsp")
+        if any(
+            refreshed_payload.get(field) != task.get(field)
+            for field in ("source_url", "source_type", "flv")
+        ):
             task = self._normalize_task(refreshed_payload, current=task)
             task["id"] = task_id
             task = await self._persist_task(task)
@@ -1337,39 +1273,10 @@ class TaskService:
         _log_step("validated_algorithms")
         result = await analysis_service.start_task_analysis(task_id)
         _log_step("start_analysis")
-        if self._should_block_on_preview_warmup(task):
-            await self._warmup_task_preview(task)
-            _log_step("warmup_task_preview")
-        else:
-            self._schedule_task_preview_warmup(task, reason="task-start")
-            _log_step("schedule_preview_warmup")
         return result
 
     async def stop_task(self, task_id: str) -> dict[str, Any] | None:
-        task = await self.get_task(task_id, prefer_metadata=True)
-        if not task:
-            return None
-        result = await analysis_service.stop_task_analysis(task_id)
-        if task.get("channel_id") and self._has_overlay_algorithm(task):
-            try:
-                logger.info(
-                    "[TaskZonePreviewStop] task_id=%s channel_id=%s stop_zone_preview=true",
-                    task_id,
-                    task.get("channel_id"),
-                )
-                await channel_service.stop_zone_preview(task["channel_id"])
-            except Exception:
-                pass
-        if task.get("channel_id"):
-            try:
-                await channel_service.clear_task_preview_state(task["channel_id"], owner_task_id=task_id)
-            except Exception:
-                pass
-            try:
-                await channel_service.stop(task["channel_id"])
-            except Exception:
-                pass
-        return result
+        return await analysis_service.stop_task_analysis(task_id)
 
     async def restart_task(self, task_id: str) -> dict[str, Any] | None:
         task = await self.get_task(task_id, prefer_metadata=True)
@@ -1377,20 +1284,17 @@ class TaskService:
             return None
         self._assert_channel_not_owned_by_electronic_seal(task.get("channel_id"))
         refreshed_payload = await self._hydrate_task_source_from_channel(task)
-        if task.get("channel_id") and not refreshed_payload.get("source_url"):
-            raise ValueError(f"Task bound channel not found: {task.get('channel_id')}")
-        if refreshed_payload.get("source_url") != task.get("source_url") or refreshed_payload.get("source_type") != task.get("source_type"):
+        self._require_detection_rtsp(refreshed_payload)
+        if any(
+            refreshed_payload.get(field) != task.get(field)
+            for field in ("source_url", "source_type", "flv")
+        ):
             task = self._normalize_task(refreshed_payload, current=task)
             task["id"] = task_id
             task = await self._persist_task(task)
         if not self._has_runnable_algorithm(task):
             raise ValueError("Task has no enabled algorithms")
-        result = await analysis_service.restart_task_analysis(task_id)
-        if self._should_block_on_preview_warmup(task):
-            await self._warmup_task_preview(task)
-        else:
-            self._schedule_task_preview_warmup(task, reason="task-restart")
-        return result
+        return await analysis_service.restart_task_analysis(task_id)
 
     async def restore_running_tasks(self) -> dict[str, Any]:
         def _cleanup_stale_stopping_tasks() -> int:
@@ -1480,12 +1384,14 @@ class TaskService:
                 continue
 
             try:
-                refreshed_payload = await self._hydrate_task_source_from_channel(
-                    task,
-                    refresh_wvp_source=False,
-                )
+                refreshed_payload = await self._hydrate_task_source_from_channel(task)
                 _log_restore_step("hydrate_source")
-                if refreshed_payload.get("source_url") != task.get("source_url") or refreshed_payload.get("source_type") != task.get("source_type"):
+                self._require_detection_rtsp(refreshed_payload)
+                _log_restore_step("validated_rtsp")
+                if any(
+                    refreshed_payload.get(field) != task.get(field)
+                    for field in ("source_url", "source_type", "flv")
+                ):
                     task = self._normalize_task(refreshed_payload, current=task)
                     task["id"] = task_id
                     task = await self._persist_task(task)
@@ -1498,13 +1404,6 @@ class TaskService:
 
                 await analysis_service.start_task_analysis(task_id)
                 _log_restore_step("start_analysis")
-                self._schedule_task_source_refresh(task_id, reason="startup-restore")
-                self._schedule_task_preview_warmup(
-                    task,
-                    delay_seconds=float(getattr(settings, "TASK_PREVIEW_WARMUP_STARTUP_DELAY_SECONDS", 0.0) or 0.0),
-                    reason="startup-restore",
-                )
-                _log_restore_step("schedule_preview_warmup")
                 restored += 1
                 stagger_seconds = max(float(getattr(settings, "TASK_RESTORE_STARTUP_STAGGER_SECONDS", 0.0) or 0.0), 0.0)
                 if stagger_seconds > 0:
@@ -1881,6 +1780,7 @@ class TaskService:
             "id": task_row.id,
             "name": task_row.name,
             "source_url": task_row.source_url,
+            "flv": (task_row.raw_json or {}).get("flv"),
             "source_type": task_row.source_type,
             "channel_id": task_row.channel_id,
             "channel_name": task_row.channel_name or (task_row.raw_json or {}).get("channel_name"),
@@ -1944,6 +1844,7 @@ class TaskService:
             "id": task.get("id"),
             "name": task.get("name"),
             "source_url": task.get("source_url"),
+            "flv": task.get("flv"),
             "source_type": task.get("source_type"),
             "channel_id": task.get("channel_id"),
             "channel_name": task.get("channel_name"),
@@ -1964,7 +1865,7 @@ class TaskService:
 
         differences: list[str] = []
         if canonical_json != canonical_metadata:
-            for key in ["id", "name", "source_url", "source_type", "channel_id", "channel_name", "frame_interval", "status", "regions", "algorithms"]:
+            for key in ["id", "name", "source_url", "flv", "source_type", "channel_id", "channel_name", "frame_interval", "status", "regions", "algorithms"]:
                 if canonical_json.get(key) != canonical_metadata.get(key):
                     differences.append(key)
 

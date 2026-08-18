@@ -65,10 +65,12 @@ class ChannelMeta(Base):
 
     id: Mapped[str] = mapped_column(CHANNEL_ID_TYPE, primary_key=True)
     device_id: Mapped[str | None] = mapped_column(String(64), index=True)
+    gb_id: Mapped[str | None] = mapped_column(String(128), index=True)
     media_node_id: Mapped[str | None] = mapped_column(String(64), index=True)
     name: Mapped[str | None] = mapped_column(String(255))
     type: Mapped[str | None] = mapped_column(String(64), index=True)
     source_url: Mapped[str | None] = mapped_column(Text)
+    flv: Mapped[str | None] = mapped_column(Text)
     app: Mapped[str | None] = mapped_column(String(255), index=True)
     stream: Mapped[str | None] = mapped_column(String(255), index=True)
     is_online: Mapped[bool | None] = mapped_column(Boolean, index=True)
@@ -81,6 +83,69 @@ class ChannelMeta(Base):
     created_at: Mapped[DateTime | None] = mapped_column(DateTime(), index=True)
     updated_at: Mapped[DateTime | None] = mapped_column(DateTime(), index=True)
     raw_json: Mapped[dict | None] = mapped_column(JSON)
+
+
+class ElectronicSealChannelMeta(Base):
+    __tablename__ = "electronic_seal_channels"
+    __table_args__ = (
+        UniqueConstraint("stream", name="uq_electronic_seal_channels_stream"),
+        {
+            "mysql_engine": "InnoDB",
+            "mysql_charset": "utf8mb4",
+            "mysql_collate": "utf8mb4_0900_ai_ci",
+        },
+    )
+
+    id: Mapped[str] = mapped_column(CHANNEL_ID_TYPE, primary_key=True)
+    device_id: Mapped[str | None] = mapped_column(String(64), index=True)
+    gb_id: Mapped[str | None] = mapped_column(String(128), index=True)
+    media_node_id: Mapped[str | None] = mapped_column(String(64), index=True)
+    name: Mapped[str | None] = mapped_column(String(255))
+    type: Mapped[str | None] = mapped_column(String(64), index=True)
+    source_url: Mapped[str | None] = mapped_column(Text)
+    flv: Mapped[str | None] = mapped_column(Text)
+    app: Mapped[str | None] = mapped_column(String(255), index=True)
+    stream: Mapped[str | None] = mapped_column(String(255), index=True)
+    is_online: Mapped[bool | None] = mapped_column(Boolean, index=True)
+    is_playing: Mapped[bool | None] = mapped_column(Boolean, index=True)
+    record_mode: Mapped[str | None] = mapped_column(String(64), index=True)
+    snapshot_url: Mapped[str | None] = mapped_column(Text)
+    snapshot_path: Mapped[str | None] = mapped_column(Text)
+    webrtc_api: Mapped[str | None] = mapped_column(Text)
+    hls: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[DateTime | None] = mapped_column(DateTime(), index=True)
+    updated_at: Mapped[DateTime | None] = mapped_column(DateTime(), index=True)
+    raw_json: Mapped[dict | None] = mapped_column(JSON)
+
+
+class ElectronicSealChannelOnlineHistoryMeta(Base):
+    """Hourly online-state samples for electronic-seal-owned channels."""
+
+    __tablename__ = "electronic_seal_channel_online_history"
+    __table_args__ = (
+        Index(
+            "idx_electronic_seal_online_history_create_time",
+            "create_time",
+        ),
+        {
+            "mysql_engine": "InnoDB",
+            "mysql_charset": "utf8mb4",
+            "mysql_collate": "utf8mb4_0900_ai_ci",
+        },
+    )
+
+    id: Mapped[str] = mapped_column(CHANNEL_ID_TYPE, primary_key=True)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    is_online: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=False,
+        server_default=text("0"),
+    )
+    create_time: Mapped[DateTime] = mapped_column(
+        ELECTRONIC_SEAL_DATETIME_TYPE,
+        primary_key=True,
+    )
 
 
 class ElectronicSealChannelProfileMeta(Base):
@@ -98,7 +163,7 @@ class ElectronicSealChannelProfileMeta(Base):
 
     channel_id: Mapped[str] = mapped_column(
         CHANNEL_ID_TYPE,
-        ForeignKey("channels.id", ondelete="CASCADE"),
+        ForeignKey("electronic_seal_channels.id", ondelete="CASCADE"),
         primary_key=True,
     )
     role: Mapped[str] = mapped_column(String(64))
@@ -424,6 +489,7 @@ class EventMeta(Base):
     conf: Mapped[float | None] = mapped_column(Float)
     snapshot_path: Mapped[str | None] = mapped_column(Text)
     video_path: Mapped[str | None] = mapped_column(Text)
+    content: Mapped[str | None] = mapped_column(Text)
     handling_status: Mapped[int | None] = mapped_column(Integer, index=True)
     remark: Mapped[str | None] = mapped_column(Text)
     status: Mapped[str | None] = mapped_column(String(64), index=True)
@@ -468,7 +534,7 @@ class ElectronicSealConfigMeta(Base):
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     channel_id: Mapped[str] = mapped_column(
         CHANNEL_ID_TYPE,
-        ForeignKey("channels.id", ondelete="CASCADE"),
+        ForeignKey("electronic_seal_channels.id", ondelete="CASCADE"),
     )
     algorithm_type: Mapped[str] = mapped_column(String(64))
     model_id: Mapped[str | None] = mapped_column(
@@ -514,7 +580,7 @@ class ElectronicSealBaselineMeta(Base):
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     channel_id: Mapped[str] = mapped_column(
         CHANNEL_ID_TYPE,
-        ForeignKey("channels.id", ondelete="CASCADE"),
+        ForeignKey("electronic_seal_channels.id", ondelete="CASCADE"),
     )
     algorithm_type: Mapped[str] = mapped_column(String(64))
     image_path: Mapped[str] = mapped_column(Text)
@@ -546,7 +612,7 @@ class ElectronicSealStateMeta(Base):
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     channel_id: Mapped[str] = mapped_column(
         CHANNEL_ID_TYPE,
-        ForeignKey("channels.id", ondelete="CASCADE"),
+        ForeignKey("electronic_seal_channels.id", ondelete="CASCADE"),
     )
     algorithm_type: Mapped[str] = mapped_column(String(64))
     status: Mapped[str] = mapped_column(String(32))
@@ -573,13 +639,10 @@ class ElectronicSealEventMeta(Base):
     )
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
-    channel_id: Mapped[str] = mapped_column(
-        CHANNEL_ID_TYPE,
-        ForeignKey("channels.id", ondelete="CASCADE"),
-    )
+    channel_id: Mapped[str] = mapped_column(CHANNEL_ID_TYPE)
     algorithm_type: Mapped[str] = mapped_column(String(64))
     event_type: Mapped[str] = mapped_column(String(64))
-    severity: Mapped[str] = mapped_column(String(16), default="warning", server_default=text("'warning'"))
+    severity: Mapped[str | None] = mapped_column(String(16), nullable=True)
     started_at: Mapped[DateTime] = mapped_column(ELECTRONIC_SEAL_DATETIME_TYPE)
     ended_at: Mapped[DateTime | None] = mapped_column(ELECTRONIC_SEAL_DATETIME_TYPE)
     duration_seconds: Mapped[float | None] = mapped_column(ELECTRONIC_SEAL_FLOAT_TYPE)
@@ -609,10 +672,7 @@ class ElectronicSealEventIndexMeta(Base):
     )
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
-    channel_id: Mapped[str] = mapped_column(
-        CHANNEL_ID_TYPE,
-        ForeignKey("channels.id", ondelete="CASCADE"),
-    )
+    channel_id: Mapped[str] = mapped_column(CHANNEL_ID_TYPE)
     algorithm_type: Mapped[str] = mapped_column(String(64), index=True)
     event_type: Mapped[str] = mapped_column(String(64))
     detail_table: Mapped[str] = mapped_column(String(128))
@@ -621,7 +681,7 @@ class ElectronicSealEventIndexMeta(Base):
     ended_at: Mapped[DateTime | None] = mapped_column(ELECTRONIC_SEAL_DATETIME_TYPE)
     uploaded_at: Mapped[DateTime | None] = mapped_column(ELECTRONIC_SEAL_DATETIME_TYPE)
     upload_status: Mapped[str] = mapped_column(String(32), default="not_required", server_default=text("'not_required'"))
-    severity: Mapped[str] = mapped_column(String(16), default="warning", server_default=text("'warning'"))
+    severity: Mapped[str | None] = mapped_column(String(16), nullable=True)
     score: Mapped[float | None] = mapped_column(ELECTRONIC_SEAL_FLOAT_TYPE)
     handling_status: Mapped[int] = mapped_column(Integer, default=0, server_default=text("0"))
     status: Mapped[str] = mapped_column(String(32), default="new", server_default=text("'new'"))
@@ -646,11 +706,7 @@ class ElectronicSealTruckDepartureEventMeta(Base):
         ForeignKey("electronic_seal_event_index.id", ondelete="CASCADE"),
         primary_key=True,
     )
-    channel_id: Mapped[str] = mapped_column(
-        CHANNEL_ID_TYPE,
-        ForeignKey("channels.id", ondelete="CASCADE"),
-        index=True,
-    )
+    channel_id: Mapped[str] = mapped_column(CHANNEL_ID_TYPE, index=True)
     event_type: Mapped[str] = mapped_column(String(64), default="truck_departure", server_default=text("'truck_departure'"))
     direction: Mapped[str] = mapped_column(String(64))
     track_id: Mapped[str | None] = mapped_column(String(128), index=True)
@@ -663,7 +719,7 @@ class ElectronicSealTruckDepartureEventMeta(Base):
     started_at: Mapped[DateTime] = mapped_column(ELECTRONIC_SEAL_DATETIME_TYPE)
     ended_at: Mapped[DateTime | None] = mapped_column(ELECTRONIC_SEAL_DATETIME_TYPE)
     score: Mapped[float | None] = mapped_column(ELECTRONIC_SEAL_FLOAT_TYPE)
-    severity: Mapped[str] = mapped_column(String(16), default="alarm", server_default=text("'alarm'"))
+    severity: Mapped[str | None] = mapped_column(String(16), nullable=True, default=None)
     status: Mapped[str] = mapped_column(String(32), default="new", server_default=text("'new'"))
     handling_status: Mapped[int] = mapped_column(Integer, default=0, server_default=text("0"))
     evidence_snapshot_path: Mapped[str | None] = mapped_column(Text)
@@ -688,11 +744,7 @@ class ElectronicSealRoomEmptyEventMeta(Base):
         ForeignKey("electronic_seal_event_index.id", ondelete="CASCADE"),
         primary_key=True,
     )
-    channel_id: Mapped[str] = mapped_column(
-        CHANNEL_ID_TYPE,
-        ForeignKey("channels.id", ondelete="CASCADE"),
-        index=True,
-    )
+    channel_id: Mapped[str] = mapped_column(CHANNEL_ID_TYPE, index=True)
     event_type: Mapped[str] = mapped_column(String(64), default="room_empty", server_default=text("'room_empty'"))
     person_count: Mapped[int] = mapped_column(Integer, default=0, server_default=text("0"))
     empty_seconds: Mapped[float | None] = mapped_column(ELECTRONIC_SEAL_FLOAT_TYPE)
@@ -725,11 +777,7 @@ class ElectronicSealCameraOcclusionEventMeta(Base):
         ForeignKey("electronic_seal_event_index.id", ondelete="CASCADE"),
         primary_key=True,
     )
-    channel_id: Mapped[str] = mapped_column(
-        CHANNEL_ID_TYPE,
-        ForeignKey("channels.id", ondelete="CASCADE"),
-        index=True,
-    )
+    channel_id: Mapped[str] = mapped_column(CHANNEL_ID_TYPE, index=True)
     event_type: Mapped[str] = mapped_column(String(64), default="camera_occlusion", server_default=text("'camera_occlusion'"))
     metrics_json: Mapped[dict | None] = mapped_column(JSON)
     started_at: Mapped[DateTime] = mapped_column(ELECTRONIC_SEAL_DATETIME_TYPE)
@@ -760,11 +808,7 @@ class ElectronicSealCameraViewShiftEventMeta(Base):
         ForeignKey("electronic_seal_event_index.id", ondelete="CASCADE"),
         primary_key=True,
     )
-    channel_id: Mapped[str] = mapped_column(
-        CHANNEL_ID_TYPE,
-        ForeignKey("channels.id", ondelete="CASCADE"),
-        index=True,
-    )
+    channel_id: Mapped[str] = mapped_column(CHANNEL_ID_TYPE, index=True)
     event_type: Mapped[str] = mapped_column(String(64), default="camera_view_shift", server_default=text("'camera_view_shift'"))
     metrics_json: Mapped[dict | None] = mapped_column(JSON)
     started_at: Mapped[DateTime] = mapped_column(ELECTRONIC_SEAL_DATETIME_TYPE)
@@ -789,7 +833,7 @@ class ElectronicSealTruckCountMeta(Base):
 
     channel_id: Mapped[str] = mapped_column(
         CHANNEL_ID_TYPE,
-        ForeignKey("channels.id", ondelete="CASCADE"),
+        ForeignKey("electronic_seal_channels.id", ondelete="CASCADE"),
         primary_key=True,
     )
     out_count: Mapped[int] = mapped_column(BigInteger, default=0, server_default=text("0"))

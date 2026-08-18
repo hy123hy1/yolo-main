@@ -39,7 +39,7 @@
       <section class="status-strip">
         <div><span>worker</span><strong>{{ status.worker_status || 'stopped' }}</strong></div>
         <div><span>帧状态</span><strong>{{ status.frame?.status || 'offline' }}</strong></div>
-        <div><span>检测源</span><strong>{{ status.source_url || 'channels.source_url' }}</strong></div>
+        <div><span>检测源</span><strong>{{ status.source_url || 'electronic_seal_channels.source_url' }}</strong></div>
         <div><span>最近错误</span><strong>{{ status.frame?.last_error || '-' }}</strong></div>
       </section>
 
@@ -135,9 +135,9 @@
                 <td>{{ event.status || event.severity }}</td>
                 <td>{{ formatScore(event.score) }}</td>
                 <td class="evidence-links">
-                  <a v-if="event.evidence_snapshot_path" :href="evidenceUrl(event.id, 'snapshot')" target="_blank">截图</a>
-                  <a v-if="event.evidence_video_path" :href="evidenceUrl(event.id, 'video')" target="_blank">视频</a>
-                  <span v-if="!event.evidence_snapshot_path && !event.evidence_video_path">-</span>
+                  <a v-if="event.snapshot_url" :href="evidenceUrl(event.snapshot_url)" target="_blank">截图</a>
+                  <a v-if="event.video_url" :href="evidenceUrl(event.video_url)" target="_blank">视频</a>
+                  <span v-if="!event.snapshot_url && !event.video_url">-</span>
                 </td>
                 <td>
                   <button v-if="event.upload_job_id" class="mini-btn" type="button" @click="retryUpload(event.upload_job_id)">重试上传</button>
@@ -159,25 +159,27 @@
 
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
-import { listChannels, startChannelPlay } from '@/api/channels'
-import { listModels } from '@/api/models'
 import {
   ELECTRONIC_SEAL_ALGORITHMS,
   electronicSealEvidenceUrl,
   getElectronicSealStatus,
   listElectronicSealConfigs,
+  listElectronicSealChannels,
+  listElectronicSealModels,
   listElectronicSealProfiles,
   listElectronicSealEvents,
   recalibrateElectronicSeal,
   retryElectronicSealUpload,
+  startElectronicSealChannelPlay,
   updateElectronicSealConfig,
   type ElectronicSealAlgorithm,
   type ElectronicSealConfig,
   type ElectronicSealEvent,
+  type ElectronicSealModel,
   type ElectronicSealStatus,
 } from '@/api/electronicSeal'
 
-type Channel = { id: string; name?: string }
+type Channel = { id: string; name?: string | null }
 const algorithms = ELECTRONIC_SEAL_ALGORITHMS
 const roleAlgorithmKeys: Record<string, ElectronicSealAlgorithm[]> = {
   vehicle_entry: ['truck_departure', 'camera_occlusion', 'camera_view_shift'],
@@ -185,7 +187,7 @@ const roleAlgorithmKeys: Record<string, ElectronicSealAlgorithm[]> = {
 }
 const channels = ref<Channel[]>([])
 const profiles = reactive<Record<string, { role: string; bound: boolean }>>({})
-const models = ref<Array<{ model_id: string; name?: string; classes?: string[] }>>([])
+const models = ref<ElectronicSealModel[]>([])
 const selectedChannelId = ref('')
 const selectedAlgorithm = ref<ElectronicSealAlgorithm>('truck_departure')
 const configs = reactive<Record<string, ElectronicSealConfig>>({})
@@ -230,7 +232,7 @@ const drawingHint = computed(() => {
 })
 const labelFor = (key: string) => algorithms.find((item) => item.key === key)?.label || key
 const formatScore = (value?: number | null) => typeof value === 'number' ? value.toFixed(3) : '-'
-const evidenceUrl = (eventId: string, kind: 'snapshot' | 'video') => electronicSealEvidenceUrl(eventId, kind)
+const evidenceUrl = (eventUrl: string | null | undefined, kind?: 'snapshot' | 'video') => electronicSealEvidenceUrl(eventUrl, kind)
 
 const showMessage = (type: 'success' | 'error', text: string) => { messageType.value = type; message.value = text; window.setTimeout(() => { message.value = '' }, 3000) }
 const defaultConfig = (channelId: string, algorithm: ElectronicSealAlgorithm): ElectronicSealConfig => ({ channel_id: channelId, algorithm_type: algorithm, enabled: true, model_id: '', sample_interval_ms: 1000, camera_health_interval_seconds: 3600, alarm_hold_seconds: algorithm === 'room_empty' ? 600 : 10, recovery_hold_seconds: 15, line_config_json: {}, region_config_json: {}, threshold_config_json: {} })
@@ -255,26 +257,46 @@ const syncDraft = async () => {
 }
 
 const loadEvents = async () => {
-  const result = await listElectronicSealEvents({ channel_id: selectedChannelId.value || undefined, page: 1, page_size: 100 })
-  events.items = result.items || []
-  events.total = result.total || 0
+  try {
+    const result = await listElectronicSealEvents({ channel_id: selectedChannelId.value || undefined, page: 1, page_size: 100 })
+    events.items = result.items || []
+    events.total = result.total || 0
+  } catch {
+    events.items = []
+    events.total = 0
+  }
 }
 const refreshStatus = async () => {
   if (!selectedChannelId.value) return
-  Object.assign(status, await getElectronicSealStatus(selectedChannelId.value))
+  try {
+    Object.assign(status, await getElectronicSealStatus(selectedChannelId.value))
+  } catch {
+    Object.assign(status, {
+      channel_id: selectedChannelId.value,
+      running: false,
+      worker_status: 'unavailable',
+      frame: { status: 'offline', last_error: '电子封条 Worker 未连接' },
+    })
+  }
 }
 const selectChannel = async () => {
   stopPreview()
   const keys = visibleAlgorithms.value
   if (keys.length && !keys.some((item) => item.key === selectedAlgorithm.value)) selectedAlgorithm.value = keys[0].key
   await syncDraft()
-  await Promise.all([refreshStatus(), loadEvents()])
+  await Promise.allSettled([refreshStatus(), loadEvents()])
   await startPreview()
 }
 const load = async () => {
   loading.value = true
   try {
-    const [channelResult, configResult, profileResult, modelResult] = await Promise.all([listChannels(), listElectronicSealConfigs(), listElectronicSealProfiles(), listModels()])
+    const [channelResult, modelResult] = await Promise.all([
+      listElectronicSealChannels(),
+      listElectronicSealModels(),
+    ])
+    const workerResults = await Promise.allSettled([listElectronicSealConfigs(), listElectronicSealProfiles()])
+    const configResult = workerResults[0].status === 'fulfilled' ? workerResults[0].value : { items: [] }
+    const profileResult = workerResults[1].status === 'fulfilled' ? workerResults[1].value : { items: [] }
     channels.value = channelResult.items || []
     models.value = modelResult.models || []
     Object.keys(profiles).forEach((key) => delete profiles[key])
@@ -283,7 +305,7 @@ const load = async () => {
     for (const config of configResult.items || []) configs[configKey(config.channel_id, config.algorithm_type)] = config
     if (!selectedChannelId.value && channels.value[0]) selectedChannelId.value = channels.value[0].id
     await syncDraft()
-    await selectChannel()
+    void selectChannel()
   } catch (error: any) { showMessage('error', error?.response?.data?.detail || error?.message || '加载电子封条失败') }
   finally { loading.value = false }
 }
@@ -511,7 +533,7 @@ const browserPreviewUrlsFrom = (result: any) => (
 
 const ensureBrowserPreviewUrls = async (channelId: string) => {
   // Recreate the browser transcode session so a stale cached ZL URL cannot be reused.
-  const started = await startChannelPlay(channelId)
+  const started = await startElectronicSealChannelPlay(channelId)
   const urls = browserPreviewUrlsFrom(started)
   if (!hasBrowserPreviewUrls(urls)) {
     throw new Error('浏览器转码流未就绪，请检查原始 RTSP 流')

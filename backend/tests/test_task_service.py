@@ -776,6 +776,24 @@ class TaskServiceTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(task["source_url"], "rtsp://192.168.1.10/live/test")
         self.assertEqual(task["source_type"], "rtsp")
 
+    async def test_hydrate_task_source_carries_channel_flv_fallback(self):
+        channel = {
+            "id": "ch_wvp_flv",
+            "name": "WVP FLV channel",
+            "type": "wvp",
+            "source_url": "rtsp://192.168.1.10/live/test",
+            "flv": "http://192.168.1.10/live/test.live.flv",
+        }
+
+        with patch.object(self.service, "_resolve_channel_for_task", AsyncMock(return_value=channel)):
+            hydrated = await self.service._hydrate_task_source_from_channel(
+                {"channel_id": "ch_wvp_flv"}
+            )
+
+        self.assertEqual(hydrated["source_url"], channel["source_url"])
+        self.assertEqual(hydrated["flv"], channel["flv"])
+        self.assertEqual(hydrated["source_type"], "rtsp")
+
     async def test_start_task_rejects_missing_bound_channel(self):
         task = await self.service.create_task(
             {
@@ -2470,6 +2488,44 @@ class TaskServiceTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(row.scene_name, "睡岗检测")
         self.assertEqual(row.rule_type, "detection")
         self.assertEqual(row.labels_json, ["sleep"])
+
+    async def test_smoke_scene_candidate_forces_smoke_label(self):
+        with patch(
+            "src.services.task_service.model_service.get_model_summary",
+            AsyncMock(
+                return_value={
+                    "model_id": "model_smoke",
+                    "name": "烟雾检测",
+                    "classes": ["fire", "smoke"],
+                    "scene_key": "smoke_alarm",
+                    "scene_name": "烟雾报警",
+                    "rule_type": "detection",
+                    "recommended_labels": ["smoke"],
+                    "scene_candidates": [
+                        {
+                            "scene_key": "smoke_alarm",
+                            "scene_name": "烟雾报警",
+                            "recommended_labels": ["smoke"],
+                            "rule_type": "detection",
+                        }
+                    ],
+                }
+            ),
+        ):
+            algorithm = await self.service._apply_model_scene_defaults(
+                {
+                    "model_id": "model_smoke",
+                    "model_name": "烟雾检测",
+                    "scene_key": "smoke_alarm",
+                    "scene_name": "烟雾报警",
+                    "rule_type": "detection",
+                    "detect_all_classes": True,
+                }
+            )
+
+        self.assertEqual(algorithm["labels"], ["smoke"])
+        self.assertFalse(algorithm["detect_all_classes"])
+        self.assertEqual(algorithm["label_source"], "recommended")
 
     async def test_add_algorithm_rejects_duplicate_model_in_same_task(self):
         task = await self.service.create_task(

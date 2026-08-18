@@ -1160,7 +1160,6 @@ const startTaskDraft = async (payload: any) => {
     await startTask(payload.id)
     await loadTasksForCurrentChannel()
     await selectTask(payload.id)
-    await refreshFenceChannelState(payload.channel_id || selectedTask.value?.channel_id)
     showMessage('success', '任务已启动')
   } catch (error: any) {
     showMessage('error', error?.response?.data?.detail || error?.message || '启动任务失败')
@@ -1177,7 +1176,6 @@ const startTaskAction = async (taskId: string) => {
     await startTask(taskId)
     await loadTasksForCurrentChannel()
     await selectTask(taskId)
-    await refreshFenceChannelState(task?.channel_id || selectedTask.value?.channel_id)
     showMessage('success', '任务已启动')
   } catch (error: any) {
     showMessage('error', error?.response?.data?.detail || error?.message || '启动任务失败')
@@ -1186,11 +1184,9 @@ const startTaskAction = async (taskId: string) => {
 
 const stopTaskAction = async (taskId: string) => {
   try {
-    const task = tasks.value.find((item) => item.id === taskId)
     await stopTask(taskId)
     await loadTasksForCurrentChannel()
     await selectTask(taskId)
-    await refreshFenceChannelState(task?.channel_id || selectedTask.value?.channel_id)
     showMessage('success', '任务已停止')
   } catch (error: any) {
     showMessage('error', error?.response?.data?.detail || error?.message || '停止任务失败')
@@ -1640,17 +1636,6 @@ const fencePreviewMaskText = (channelId: string) => {
 
 const canManualPlayZonePreview = (channelId: string) => canManualPlayFencePreview(channelId)
 const zonePreviewMaskText = (channelId: string) => fencePreviewMaskText(channelId)
-
-const refreshFenceChannelState = async (channelId?: string) => {
-  if (!channelId) return
-  await loadZonePreviewStatus(channelId)
-  const status = zonePreviewStatuses.value[channelId]
-  if (status?.status === 'running') {
-    await ensureZonePreviewPlayInfo(channelId, true).catch(() => undefined)
-  } else {
-    await stopZonePreviewPlayer(channelId)
-  }
-}
 
 const loadZonePreviewStatus = async (channelId: string) => {
   try {

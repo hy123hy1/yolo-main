@@ -27,16 +27,16 @@ class ModelRecommendationTest(unittest.TestCase):
     def setUp(self):
         self.service = ModelService()
 
-    def test_small_class_model_defaults_to_all(self):
+    def test_mapped_small_class_model_uses_scene_mapping(self):
         model_meta = {
             "name": "安全帽检测",
-            "classes": ["helmet", "person"],
+            "classes": ["helmet", "no_helmet"],
         }
 
         result = self.service._apply_label_recommendation(model_meta)
 
-        self.assertEqual(result["auto_label_strategy"], "all")
-        self.assertEqual(result["recommended_labels"], ["helmet", "person"])
+        self.assertEqual(result["auto_label_strategy"], "recommended")
+        self.assertEqual(result["recommended_labels"], ["no_helmet"])
         self.assertTrue(
             any(item["scene_key"] == "helmet_detection" for item in result["scene_candidates"])
         )
@@ -66,6 +66,19 @@ class ModelRecommendationTest(unittest.TestCase):
         self.assertEqual(result["scene_candidates"][0]["scene_key"], "fire_alarm")
         self.assertEqual(result["scene_candidates"][0]["rule_type"], "detection")
 
+    def test_smoke_model_name_maps_to_smoke_only(self):
+        model_meta = {
+            "name": "烟雾检测",
+            "classes": ["fire", "smoke"],
+        }
+
+        result = self.service._apply_label_recommendation(model_meta)
+
+        self.assertEqual(result["auto_label_strategy"], "recommended")
+        self.assertEqual(result["recommended_labels"], ["smoke"])
+        self.assertEqual(result["scene_candidates"][0]["scene_key"], "smoke_alarm")
+        self.assertEqual(result["scene_candidates"][0]["rule_type"], "detection")
+
     def test_large_class_model_with_no_match_falls_back_to_manual(self):
         model_meta = {
             "name": "场景一",
@@ -87,8 +100,8 @@ class ModelRecommendationTest(unittest.TestCase):
 
         result = self.service._apply_label_recommendation(model_meta)
 
-        self.assertEqual(result["auto_label_strategy"], "all")
-        self.assertEqual(result["recommended_labels"], ["normal", "sleep"])
+        self.assertEqual(result["auto_label_strategy"], "recommended")
+        self.assertEqual(result["recommended_labels"], ["sleep"])
         self.assertEqual(result["scene_candidates"][0]["scene_key"], "sleep_on_duty")
         self.assertEqual(result["scene_candidates"][0]["scene_name"], "睡岗检测")
         self.assertEqual(result["scene_candidates"][0]["rule_type"], "detection")

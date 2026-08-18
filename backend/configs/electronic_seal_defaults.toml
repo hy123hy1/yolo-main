@@ -20,17 +20,18 @@ algorithms = ["truck_departure", "camera_occlusion", "camera_view_shift"]
 [roles.vehicle_entry.truck_departure]
 sample_interval_ms = 500
 confidence_threshold = 0.25
+threshold_config_json = { allowed_labels = ["car", "bus", "truck"] }
 # The current 40bcbc84 snapshot is the same indoor view as 8224, so the line is
 # intentionally empty until the real vehicle-entry source is restored and drawn.
 line_config_json = { coordinate_space = "normalized", points = [], direction = "inside_to_outside", inside_side = "left", line_id = "vehicle-entry-line" }
 
 [roles.vehicle_entry.camera_occlusion]
-camera_health_interval_seconds = 3600
+camera_health_interval_seconds = 1
 threshold_config_json = {}
 need_video_clip = true
 
 [roles.vehicle_entry.camera_view_shift]
-camera_health_interval_seconds = 3600
+camera_health_interval_seconds = 1
 threshold_config_json = {}
 need_video_clip = true
 
@@ -44,11 +45,11 @@ need_video_clip = true
 region_config_json = { coordinate_space = "normalized", polygon = [[0.28177, 0.24907], [0.76667, 0.4], [0.77604, 0.91296], [0.25521, 0.8713]], hold_seconds = 600, max_frame_gap_seconds = 5.0, region_id = "dispatch-room" }
 
 [roles.dispatch_room.camera_occlusion]
-camera_health_interval_seconds = 3600
+camera_health_interval_seconds = 1
 threshold_config_json = {}
 need_video_clip = true
 
 [roles.dispatch_room.camera_view_shift]
-camera_health_interval_seconds = 3600
+camera_health_interval_seconds = 1
 threshold_config_json = {}
 need_video_clip = true

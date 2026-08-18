@@ -43,12 +43,12 @@ class DetectionSceneMappingTest(unittest.TestCase):
         result = self.service._apply_label_recommendation(
             {
                 "name": "反光背心识别",
-                "classes": ["vest", "person", "car", "truck", "bus", "bicycle"],
+                "classes": ["vest", "no_vest"],
             }
         )
 
         self.assertEqual(result["auto_label_strategy"], "recommended")
-        self.assertEqual(result["recommended_labels"], ["vest"])
+        self.assertEqual(result["recommended_labels"], ["no_vest"])
         self.assertEqual(result["scene_key"], "reflective_vest_detection")
         self.assertEqual(result["scene_name"], "反光背心识别")
         self.assertEqual(result["rule_type"], "detection")
@@ -57,6 +57,39 @@ class DetectionSceneMappingTest(unittest.TestCase):
             "reflective_vest_detection",
         )
         self.assertEqual(result["scene_candidates"][0]["rule_type"], "detection")
+
+    def test_sleep_model_only_alarms_on_sleep(self):
+        result = self.service._apply_label_recommendation(
+            {
+                "name": "睡岗检测",
+                "classes": ["normal", "sleep"],
+            }
+        )
+
+        self.assertEqual(result["auto_label_strategy"], "recommended")
+        self.assertEqual(result["recommended_labels"], ["sleep"])
+
+    def test_helmet_model_only_alarms_on_no_helmet(self):
+        result = self.service._apply_label_recommendation(
+            {
+                "name": "安全帽检测",
+                "classes": ["helmet", "no_helmet"],
+            }
+        )
+
+        self.assertEqual(result["auto_label_strategy"], "recommended")
+        self.assertEqual(result["recommended_labels"], ["no_helmet"])
+
+    def test_unmapped_small_model_still_uses_all_classes(self):
+        result = self.service._apply_label_recommendation(
+            {
+                "name": "通用二分类模型",
+                "classes": ["left", "right"],
+            }
+        )
+
+        self.assertEqual(result["auto_label_strategy"], "all")
+        self.assertEqual(result["recommended_labels"], ["left", "right"])
 
 
 if __name__ == "__main__":

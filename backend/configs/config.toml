@@ -37,7 +37,7 @@
     #   ./data/metadata.db
     #   mysql+pymysql://root:root@192.168.1.58:3006/sp-ai-yolo?charset=utf8mb4
     #   postgresql+psycopg2://postgres:123456@127.0.0.1:5432/sp_ai_yolo
-    Dsn = "mysql+pymysql://root:root@192.168.1.58:3006/sp-ai-yolo?charset=utf8mb4"
+    Dsn = "mysql+pymysql://root:root@192.168.1.200:3007/sp-ai-yolo?charset=utf8mb4"
 
 [AI]
   # auto: use cuda:0 when CUDA is visible, otherwise CPU.
@@ -62,9 +62,12 @@
 
 [WVP]
   Enabled = true
-  APIBase = "http://192.168.1.58:18080"
+  APIBase = "http://192.168.1.36:18080"
+  #APIBase = "http://10rg9383km827.vicp.fun:18080"
   ChannelListPath = "/api/common/channel/list"
   ChannelPlayPath = "/api/common/channel/play"
+  PublicFLVBase = "http://192.168.1.36:80"
+  # PublicFLVBase = "http://10rg9383km827.vicp.fun:8008"
 
 [CameraHealth]
   Enabled = true

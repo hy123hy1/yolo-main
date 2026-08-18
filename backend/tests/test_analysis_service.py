@@ -172,6 +172,7 @@ class AnalysisServiceTest(unittest.TestCase):
             "id": "task_demo",
             "channel_id": "channel_demo",
             "source_url": "rtsp://example/live/task_demo",
+            "flv": "http://example/live/task_demo.live.flv",
             "runtime": {
                 "models": {
                     "algo_prev": {"last_event_at": "2026-07-11T10:00:00"},
@@ -189,8 +190,124 @@ class AnalysisServiceTest(unittest.TestCase):
         self.assertEqual(snapshot["task_id"], "task_demo")
         self.assertEqual(snapshot["channel_id"], "channel_demo")
         self.assertEqual(snapshot["source_url"], "rtsp://example/live/task_demo")
+        self.assertEqual(snapshot["flv"], "http://example/live/task_demo.live.flv")
         self.assertEqual([item["id"] for item in snapshot["algorithms"]], ["algo_enabled"])
         self.assertEqual(snapshot["runtime_models"], {"algo_prev": {"last_event_at": "2026-07-11T10:00:00"}})
+
+    def test_task_capture_source_falls_back_after_five_seconds_and_stays_on_flv(self):
+        state = analysis_service._TaskCaptureSourceState(
+            primary_source_url="rtsp://example/live/task_demo",
+            fallback_source_url="http://example/live/task_demo.live.flv",
+        )
+
+        self.assertFalse(state.note_no_frame(100.0))
+        self.assertFalse(state.note_no_frame(104.9))
+        self.assertTrue(state.note_no_frame(105.0))
+        self.assertEqual(state.active_source_url, "http://example/live/task_demo.live.flv")
+        self.assertTrue(state.fallback_active)
+
+        state.note_valid_frame()
+        self.assertFalse(state.note_no_frame(200.0))
+        self.assertFalse(state.note_no_frame(205.0))
+        self.assertEqual(state.active_source_url, "http://example/live/task_demo.live.flv")
+
+    def test_open_task_capture_switches_from_rtsp_to_flv_after_timeout(self):
+        service = AnalysisService()
+        state = analysis_service._TaskCaptureSourceState(
+            primary_source_url="rtsp://example/live/task_demo",
+            fallback_source_url="http://example/live/task_demo.live.flv",
+        )
+        capture = object()
+
+        with (
+            patch.object(
+                service,
+                "_build_task_capture",
+                side_effect=[ValueError("rtsp unavailable"), capture],
+            ) as build_capture,
+            patch.object(service, "_load_task", return_value=None),
+            patch.object(service, "_update_task_runtime"),
+            patch.object(service, "_log_task_capture_debug"),
+            patch.object(analysis_service.runtime_logger, "warning"),
+            patch.object(analysis_service.time, "time", side_effect=[100.0, 105.0, 105.0]),
+            patch.object(analysis_service.time, "sleep"),
+        ):
+            result = service._open_task_capture(
+                task_id="task_demo",
+                task={"id": "task_demo"},
+                source_state=state,
+                stop_event=threading.Event(),
+            )
+
+        self.assertIs(result, capture)
+        self.assertEqual(
+            [call.args[0] for call in build_capture.call_args_list],
+            [
+                "rtsp://example/live/task_demo",
+                "http://example/live/task_demo.live.flv",
+            ],
+        )
+        self.assertTrue(state.fallback_active)
+
+    def test_open_task_capture_retries_only_flv_after_fallback_is_active(self):
+        service = AnalysisService()
+        state = analysis_service._TaskCaptureSourceState(
+            primary_source_url="rtsp://example/live/task_demo",
+            fallback_source_url="http://example/live/task_demo.live.flv",
+        )
+        state.note_no_frame(100.0)
+        state.note_no_frame(105.0)
+        capture = object()
+
+        with (
+            patch.object(
+                service,
+                "_build_task_capture",
+                side_effect=[ValueError("flv unavailable"), capture],
+            ) as build_capture,
+            patch.object(service, "_load_task", return_value=None),
+            patch.object(service, "_update_task_runtime"),
+            patch.object(service, "_log_task_capture_debug"),
+            patch.object(analysis_service.time, "time", return_value=200.0),
+            patch.object(analysis_service.time, "sleep"),
+        ):
+            result = service._open_task_capture(
+                task_id="task_demo",
+                task={"id": "task_demo"},
+                source_state=state,
+                stop_event=threading.Event(),
+            )
+
+        self.assertIs(result, capture)
+        self.assertEqual(
+            [call.args[0] for call in build_capture.call_args_list],
+            [
+                "http://example/live/task_demo.live.flv",
+                "http://example/live/task_demo.live.flv",
+            ],
+        )
+
+    def test_task_capture_sources_use_latest_bound_channel_addresses(self):
+        service = AnalysisService()
+        task = {
+            "id": "task_demo",
+            "channel_id": "channel_demo",
+            "source_url": "rtsp://old.example/live/task_demo",
+            "flv": "http://old.example/live/task_demo.live.flv",
+        }
+
+        with patch.object(
+            service,
+            "_load_channel",
+            return_value={
+                "source_url": "rtsp://new.example/live/task_demo",
+                "flv": "http://new.example/live/task_demo.live.flv",
+            },
+        ):
+            primary, fallback = service._resolve_task_capture_sources(task)
+
+        self.assertEqual(primary, "rtsp://new.example/live/task_demo")
+        self.assertEqual(fallback, "http://new.example/live/task_demo.live.flv")
 
     def test_merge_task_runtime_models_overlays_latest_runtime_entries(self):
         service = AnalysisService()

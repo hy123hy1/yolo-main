@@ -81,23 +81,28 @@ async def sync_wvp_channels(
 ):
     try:
         result = await asyncio.to_thread(wvp_service.sync_channels, page, count, query)
-        refresh_channel_ids: list[str] = []
+        play_info_refresh_requests = list(
+            result.pop("_play_info_refresh_requests", []) or []
+        )
         for item in list(result.get("items") or []):
+            sync_owner = item.pop("_sync_owner", "video_ai")
             channel_id = str(item.get("id") or "").strip()
             if not channel_id:
                 continue
-            upstream = ((item.get("ext") or {}).get("upstream") or {})
-            if upstream.get("online"):
-                refresh_channel_ids.append(channel_id)
+            if sync_owner == "electronic_seal":
+                continue
             try:
                 channel_service.schedule_channel_snapshot(channel_id)
             except Exception:
                 logger.exception("[ChannelAutoSnapshot] schedule failed after WVP sync channel_id=%s", channel_id)
-        if refresh_channel_ids:
-            background_tasks.add_task(wvp_service.refresh_channel_sources, refresh_channel_ids)
+        if play_info_refresh_requests:
+            background_tasks.add_task(
+                wvp_service.refresh_play_info_requests,
+                play_info_refresh_requests,
+            )
         result["play_info_refresh"] = {
             "mode": "background",
-            "queued": len(refresh_channel_ids),
+            "queued": len(play_info_refresh_requests),
         }
         return result
     except Exception as e:

@@ -102,32 +102,21 @@ class MetricServiceTest(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0].metric_value, 3.0)
 
-    def test_history_metric_uses_numeric_auto_increment_id(self):
-        self.service.upsert_task_algorithm_metric_sync(
-            task_id="task_metric_history",
-            algorithm_id="algo_metric_history",
-            channel_id="ch_metric_history",
-            model_id="model_metric_history",
-            metric_type="person_count",
-            metric_value=1,
-            region_id=None,
-            region_name=None,
-            raw_json={"class_counts": {"person": 1}},
-            now=datetime(2026, 6, 24, 12, 2, 0),
-        )
-
-        self.service.upsert_task_algorithm_metric_sync(
-            task_id="task_metric_history",
-            algorithm_id="algo_metric_history",
-            channel_id="ch_metric_history",
-            model_id="model_metric_history",
-            metric_type="person_count",
-            metric_value=2,
-            region_id=None,
-            region_name=None,
-            raw_json={"class_counts": {"person": 2}},
-            now=datetime(2026, 6, 24, 12, 3, 1),
-        )
+    def test_history_metric_stores_60_second_cumulative_value(self):
+        base = datetime(2026, 6, 24, 12, 2, 0)
+        for offset, value in ((0, 1), (1, 2), (2, 3), (61, 4)):
+            self.service.upsert_task_algorithm_metric_sync(
+                task_id="task_metric_history",
+                algorithm_id="algo_metric_history",
+                channel_id="ch_metric_history",
+                model_id="model_metric_history",
+                metric_type="person_count",
+                metric_value=value,
+                region_id=None,
+                region_name=None,
+                raw_json={"class_counts": {"person": value}},
+                now=base + timedelta(seconds=offset),
+            )
 
         with self.session_local() as session:
             rows = session.execute(
@@ -136,7 +125,16 @@ class MetricServiceTest(unittest.TestCase):
                 ).order_by(TaskAlgorithmMetricHistoryMeta.sampled_at.asc())
             ).scalars().all()
 
-        self.assertGreaterEqual(len(rows), 2)
+            realtime_row = session.execute(
+                select(TaskAlgorithmMetricMeta).where(
+                    TaskAlgorithmMetricMeta.task_id == "task_metric_history"
+                )
+            ).scalar_one()
+
+        self.assertEqual(len(rows), 1)
         self.assertTrue(all(isinstance(row.id, int) for row in rows))
-        self.assertEqual(rows[-1].metric_value, 2.0)
+        self.assertEqual(rows[0].metric_value, 6.0)
+        self.assertEqual(rows[0].raw_json["history_aggregation"], "sum_realtime_values")
+        self.assertEqual(rows[0].raw_json["history_sample_count"], 3)
+        self.assertEqual(realtime_row.metric_value, 4.0)
 

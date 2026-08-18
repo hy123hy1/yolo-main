@@ -46,6 +46,7 @@ class RoomEmptyUpdate:
     recovered: bool
     recovery_timestamp: Any | None
     events: tuple[RoomEmptyEvent, ...]
+    discontinuity: bool = False
 
     @property
     def last_person_count(self) -> int:
@@ -60,6 +61,7 @@ class RoomEmptyUpdate:
             "recovered": self.recovered,
             "recovery_timestamp": _serialize_timestamp(self.recovery_timestamp),
             "events": [event.to_dict() for event in self.events],
+            "discontinuity": self.discontinuity,
         }
 
 
@@ -119,6 +121,30 @@ class RoomEmptyDetector:
         self._last_timestamp_seconds: float | None = None
         self._active_empty = False
 
+    def filter_person_detections(
+        self,
+        detections: Iterable[Mapping[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Return only configured person detections whose bottom center is in the region."""
+        if detections is None or isinstance(detections, (str, bytes)):
+            raise ValueError("detections must be an iterable")
+        try:
+            iterator = iter(detections)
+        except TypeError as exc:
+            raise ValueError("detections must be an iterable") from exc
+
+        person_detections: list[dict[str, Any]] = []
+        for detection in iterator:
+            if not isinstance(detection, Mapping):
+                raise ValueError("each detection must be dict-like")
+            labels = self._labels_for(detection)
+            if not any(label in self.person_labels for label in labels):
+                continue
+            bbox = self._validate_bbox(detection)
+            if self._point_in_polygon(self._bottom_center(bbox), self.polygon):
+                person_detections.append(dict(detection))
+        return person_detections
+
     def update(
         self,
         detections: Iterable[Mapping[str, Any]],
@@ -128,23 +154,7 @@ class RoomEmptyDetector:
         if self._last_timestamp_seconds is not None and timestamp_seconds < self._last_timestamp_seconds:
             raise ValueError("timestamp must be monotonic")
 
-        person_count = 0
-        if detections is None or isinstance(detections, (str, bytes)):
-            raise ValueError("detections must be an iterable")
-        try:
-            iterator = iter(detections)
-        except TypeError as exc:
-            raise ValueError("detections must be an iterable") from exc
-
-        for detection in iterator:
-            if not isinstance(detection, Mapping):
-                raise ValueError("each detection must be dict-like")
-            labels = self._labels_for(detection)
-            if not any(label in self.person_labels for label in labels):
-                continue
-            bbox = self._validate_bbox(detection)
-            if self._point_in_polygon(self._bottom_center(bbox), self.polygon):
-                person_count += 1
+        person_count = len(self.filter_person_detections(detections))
 
         discontinuity = (
             self._last_timestamp_seconds is not None
@@ -157,10 +167,8 @@ class RoomEmptyDetector:
         recovery_timestamp: Any | None = None
         events: tuple[RoomEmptyEvent, ...] = ()
 
-        if discontinuity:
-            self._empty_since = None
-            self._empty_since_seconds = None
-            self._active_empty = False
+        # A frame gap is diagnostic information only. Keep the original empty
+        # period so a recovered stream continues the same hold timer.
 
         if person_count > 0:
             if self._active_empty:
@@ -195,6 +203,7 @@ class RoomEmptyDetector:
             recovered=recovered,
             recovery_timestamp=recovery_timestamp,
             events=events,
+            discontinuity=discontinuity,
         )
 
     @staticmethod

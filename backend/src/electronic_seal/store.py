@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 from secrets import token_urlsafe
 import threading
 from typing import Callable
+from urllib.parse import urlsplit, urlunsplit
 from weakref import WeakValueDictionary
 
 from sqlalchemy import inspect, or_, text
@@ -12,16 +13,19 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from src.core.settings import settings
 from src.db.database import SessionLocal, engine as default_engine
 from src.db.models import (
     Base,
     ChannelMeta,
+    ChannelZoneMeta,
+    ElectronicSealChannelMeta,
+    ElectronicSealChannelOnlineHistoryMeta,
     ElectronicSealChannelProfileMeta,
     ElectronicSealBaselineMeta,
     ElectronicSealConfigMeta,
     ElectronicSealCameraOcclusionEventMeta,
     ElectronicSealCameraViewShiftEventMeta,
-    ElectronicSealEventMeta,
     ElectronicSealEventIndexMeta,
     ElectronicSealModelMetaRecord,
     ElectronicSealRoomEmptyEventMeta,
@@ -29,17 +33,20 @@ from src.db.models import (
     ElectronicSealTruckDepartureEventMeta,
     ElectronicSealStateMeta,
     ElectronicSealUploadJobMeta,
+    TaskMeta,
 )
+from src.electronic_seal.severity import event_severity
 from src.services.platform_storage import format_datetime, generate_id
 
 
 ELECTRONIC_SEAL_TABLES = [
     ElectronicSealModelMetaRecord.__table__,
+    ElectronicSealChannelMeta.__table__,
+    ElectronicSealChannelOnlineHistoryMeta.__table__,
     ElectronicSealChannelProfileMeta.__table__,
     ElectronicSealConfigMeta.__table__,
     ElectronicSealBaselineMeta.__table__,
     ElectronicSealStateMeta.__table__,
-    ElectronicSealEventMeta.__table__,
     ElectronicSealEventIndexMeta.__table__,
     ElectronicSealTruckDepartureEventMeta.__table__,
     ElectronicSealRoomEmptyEventMeta.__table__,
@@ -67,6 +74,14 @@ _CONFIG_PAYLOAD_FIELDS = (
     "threshold_config_json",
 )
 _CHANNEL_PROFILE_ROLES = frozenset({"vehicle_entry", "dispatch_room"})
+_HISTORICAL_CHANNEL_TABLES = (
+    "electronic_seal_events",
+    "electronic_seal_event_index",
+    "electronic_seal_truck_departure_events",
+    "electronic_seal_room_empty_events",
+    "electronic_seal_camera_occlusion_events",
+    "electronic_seal_camera_view_shift_events",
+)
 _STATE_PAYLOAD_FIELDS = (
     "status",
     "current_score",
@@ -77,6 +92,10 @@ _STATE_PAYLOAD_FIELDS = (
     "last_good_at",
     "last_event_id",
 )
+
+
+class StaleRuntimeOwnerError(RuntimeError):
+    pass
 
 
 def _channel_lock(channel_id: str) -> threading.RLock:
@@ -107,13 +126,42 @@ def _format_electronic_seal_datetime(value: datetime | str | None) -> str | None
     return format_datetime(value)
 
 
-def _lock_channel_row(session: Session, channel_id: str) -> ChannelMeta:
+def _lock_channel_row(session: Session, channel_id: str) -> ElectronicSealChannelMeta:
     return (
-        session.query(ChannelMeta)
-        .filter(ChannelMeta.id == channel_id)
+        session.query(ElectronicSealChannelMeta)
+        .filter(ElectronicSealChannelMeta.id == channel_id)
         .with_for_update()
         .one()
     )
+
+
+def _assert_runtime_owner(
+    session: Session,
+    channel_id: str,
+    runtime_owner_id: str | None,
+) -> None:
+    if runtime_owner_id is None:
+        return
+    channel = (
+        session.query(ElectronicSealChannelMeta.id)
+        .filter(ElectronicSealChannelMeta.id == str(channel_id))
+        .with_for_update()
+        .one_or_none()
+    )
+    if channel is None:
+        raise StaleRuntimeOwnerError(
+            f"stale electronic-seal runtime owner: channel_id={channel_id}"
+        )
+    profile = (
+        session.query(ElectronicSealChannelProfileMeta)
+        .filter(ElectronicSealChannelProfileMeta.channel_id == str(channel_id))
+        .with_for_update()
+        .one_or_none()
+    )
+    if profile is None or profile.runtime_owner_id != str(runtime_owner_id):
+        raise StaleRuntimeOwnerError(
+            f"stale electronic-seal runtime owner: channel_id={channel_id}"
+        )
 
 
 def _apply_payload_fields(row, payload: dict, fields: tuple[str, ...]) -> None:
@@ -128,6 +176,21 @@ def _merge_upload_payload(row: ElectronicSealUploadJobMeta, payload: dict) -> No
     merged_payload = deepcopy(row.payload_json) if isinstance(row.payload_json, dict) else {}
     merged_payload.update(deepcopy(payload))
     row.payload_json = merged_payload
+
+
+def _assert_history_channel_foreign_keys_removed(session: Session) -> None:
+    inspector = inspect(session.get_bind())
+    for table_name in _HISTORICAL_CHANNEL_TABLES:
+        for foreign_key in inspector.get_foreign_keys(table_name):
+            if (
+                foreign_key.get("referred_table")
+                in {"channels", "electronic_seal_channels"}
+                and "channel_id" in (foreign_key.get("constrained_columns") or [])
+            ):
+                raise ValueError(
+                    "electronic-seal history-preservation migration is required: "
+                    "apply 20260812_electronic_seal_history_channel_fk.sql"
+                )
 
 
 def ensure_electronic_seal_schema(bind: Engine | None = None) -> None:
@@ -217,6 +280,100 @@ def _channel_profile_dict(row: ElectronicSealChannelProfileMeta) -> dict:
     }
 
 
+def _extract_channel_flv(raw_json: dict | None) -> str | None:
+    payload = raw_json if isinstance(raw_json, dict) else {}
+    direct = str(payload.get("flv") or "").strip()
+    if direct:
+        return direct
+    upstream = (payload.get("ext") or {}).get("upstream") or {}
+    play_info = upstream.get("play_info") or {}
+    nested = str(play_info.get("flv") or "").strip()
+    return nested or None
+
+
+def _public_channel_flv(raw_json: dict | None) -> str | None:
+    value = _extract_channel_flv(raw_json)
+    public_base = str(settings.WVP_PUBLIC_FLV_BASE or "").strip()
+    if not value or not public_base:
+        return value
+    try:
+        source = urlsplit(value)
+        target = urlsplit(public_base)
+        if not target.scheme or not target.netloc:
+            return value
+        return urlunsplit(
+            (
+                target.scheme,
+                target.netloc,
+                source.path,
+                source.query,
+                source.fragment,
+            )
+        )
+    except ValueError:
+        return value
+
+
+def _video_ai_channel_dict(row: ChannelMeta) -> dict:
+    payload = deepcopy(row.raw_json) if isinstance(row.raw_json, dict) else {}
+    payload.update(
+        {
+            "id": row.id,
+            "device_id": row.device_id,
+            "media_node_id": row.media_node_id,
+            "name": row.name,
+            "type": row.type,
+            "source_url": row.source_url,
+            "app": row.app,
+            "stream": row.stream,
+            "is_online": bool(row.is_online),
+            "is_playing": bool(row.is_playing),
+            "record_mode": row.record_mode,
+            "snapshot_url": row.snapshot_url,
+            "snapshot_path": row.snapshot_path,
+            "webrtc_api": row.webrtc_api,
+            "hls": row.hls,
+            "created_at": _format_electronic_seal_datetime(row.created_at),
+            "updated_at": _format_electronic_seal_datetime(row.updated_at),
+        }
+    )
+    if row.gb_id is not None:
+        payload["gb_id"] = row.gb_id
+    flv = _extract_channel_flv(row.raw_json)
+    if flv is not None:
+        payload["flv"] = flv
+    return payload
+
+
+def _electronic_seal_channel_dict(row: ElectronicSealChannelMeta) -> dict:
+    payload = deepcopy(row.raw_json) if isinstance(row.raw_json, dict) else {}
+    payload.update(
+        {
+            "id": row.id,
+            "device_id": row.device_id,
+            "media_node_id": row.media_node_id,
+            "name": row.name,
+            "type": row.type,
+            "source_url": row.source_url,
+            "app": row.app,
+            "stream": row.stream,
+            "is_online": bool(row.is_online),
+            "is_playing": bool(row.is_playing),
+            "record_mode": row.record_mode,
+            "snapshot_url": row.snapshot_url,
+            "snapshot_path": row.snapshot_path,
+            "webrtc_api": row.webrtc_api,
+            "flv": row.flv,
+            "hls": row.hls,
+            "created_at": _format_electronic_seal_datetime(row.created_at),
+            "updated_at": _format_electronic_seal_datetime(row.updated_at),
+        }
+    )
+    if row.gb_id is not None:
+        payload["gb_id"] = row.gb_id
+    return payload
+
+
 def _baseline_dict(row: ElectronicSealBaselineMeta) -> dict:
     return {
         "id": row.id,
@@ -246,27 +403,6 @@ def _state_dict(row: ElectronicSealStateMeta) -> dict:
         "bad_since": _format_electronic_seal_datetime(row.bad_since),
         "last_good_at": _format_electronic_seal_datetime(row.last_good_at),
         "last_event_id": row.last_event_id,
-        "updated_at": _format_electronic_seal_datetime(row.updated_at),
-    }
-
-
-def _event_dict(row: ElectronicSealEventMeta) -> dict:
-    return {
-        "id": row.id,
-        "channel_id": row.channel_id,
-        "algorithm_type": row.algorithm_type,
-        "event_type": row.event_type,
-        "severity": row.severity,
-        "started_at": _format_electronic_seal_datetime(row.started_at),
-        "ended_at": _format_electronic_seal_datetime(row.ended_at),
-        "duration_seconds": row.duration_seconds,
-        "score": row.score,
-        "metrics_json": deepcopy(row.metrics_json or {}),
-        "evidence_snapshot_path": row.evidence_snapshot_path,
-        "evidence_video_path": row.evidence_video_path,
-        "handling_status": row.handling_status,
-        "status": row.status,
-        "created_at": _format_electronic_seal_datetime(row.created_at),
         "updated_at": _format_electronic_seal_datetime(row.updated_at),
     }
 
@@ -402,6 +538,401 @@ class ElectronicSealStore:
         with self.session_factory() as session:
             return session.get(ElectronicSealModelMetaRecord, str(model_id).strip()) is not None
 
+    def list_channels(self) -> list[dict]:
+        with self.session_factory() as session:
+            rows = (
+                session.query(ElectronicSealChannelMeta)
+                .order_by(
+                    ElectronicSealChannelMeta.created_at.desc(),
+                    ElectronicSealChannelMeta.id.asc(),
+                )
+                .all()
+            )
+            return [_electronic_seal_channel_dict(row) for row in rows]
+
+    def get_channel(self, channel_id: str) -> dict | None:
+        normalized_id = str(channel_id or "").strip()
+        if not normalized_id:
+            return None
+        with self.session_factory() as session:
+            row = session.get(ElectronicSealChannelMeta, normalized_id)
+            return _electronic_seal_channel_dict(row) if row else None
+
+    def get_channel_by_stream(self, stream: str) -> dict | None:
+        normalized_stream = str(stream or "").strip()
+        if not normalized_stream:
+            return None
+        with self.session_factory() as session:
+            row = (
+                session.query(ElectronicSealChannelMeta)
+                .filter(ElectronicSealChannelMeta.stream == normalized_stream)
+                .one_or_none()
+            )
+            return _electronic_seal_channel_dict(row) if row else None
+
+    def update_channel_snapshot(
+        self,
+        channel_id: str,
+        snapshot_url: str,
+        snapshot_path: str,
+    ) -> dict | None:
+        normalized_id = str(channel_id or "").strip()
+        with self.session_factory() as session:
+            row = session.get(ElectronicSealChannelMeta, normalized_id)
+            if row is None:
+                return None
+            row.snapshot_url = str(snapshot_url)
+            row.snapshot_path = str(snapshot_path)
+            row.updated_at = datetime.now()
+            session.commit()
+            session.refresh(row)
+            return _electronic_seal_channel_dict(row)
+
+    def record_online_status_samples(
+        self,
+        samples: list[dict],
+        create_time: datetime,
+    ) -> list[dict]:
+        normalized_time = create_time.replace(microsecond=0)
+        with self.session_factory() as session:
+            for sample in samples:
+                channel_id = str(sample.get("id") or "").strip()
+                if not channel_id:
+                    continue
+                row = session.get(
+                    ElectronicSealChannelOnlineHistoryMeta,
+                    (channel_id, normalized_time),
+                )
+                if row is None:
+                    row = ElectronicSealChannelOnlineHistoryMeta(
+                        id=channel_id,
+                        name=str(sample.get("name") or ""),
+                        is_online=bool(sample.get("is_online")),
+                        create_time=normalized_time,
+                    )
+                    session.add(row)
+                else:
+                    row.name = str(sample.get("name") or row.name or "")
+                    row.is_online = bool(sample.get("is_online"))
+            session.commit()
+            rows = (
+                session.query(ElectronicSealChannelOnlineHistoryMeta)
+                .filter(
+                    ElectronicSealChannelOnlineHistoryMeta.create_time == normalized_time,
+                )
+                .order_by(ElectronicSealChannelOnlineHistoryMeta.id.asc())
+                .all()
+            )
+            return [
+                {
+                    "id": row.id,
+                    "name": row.name,
+                    "is_online": bool(row.is_online),
+                    "create_time": _format_electronic_seal_datetime(row.create_time),
+                }
+                for row in rows
+            ]
+
+    def online_rates(
+        self,
+        start_time: datetime,
+        end_time: datetime,
+        channel_id: str | None = None,
+    ) -> list[dict]:
+        with self.session_factory() as session:
+            query = session.query(ElectronicSealChannelOnlineHistoryMeta).filter(
+                ElectronicSealChannelOnlineHistoryMeta.create_time >= start_time,
+                ElectronicSealChannelOnlineHistoryMeta.create_time < end_time,
+            )
+            if channel_id:
+                query = query.filter(
+                    ElectronicSealChannelOnlineHistoryMeta.id == str(channel_id).strip(),
+                )
+            rows = query.order_by(
+                ElectronicSealChannelOnlineHistoryMeta.id.asc(),
+                ElectronicSealChannelOnlineHistoryMeta.create_time.asc(),
+            ).all()
+
+        grouped: dict[str, dict] = {}
+        for row in rows:
+            item = grouped.setdefault(
+                row.id,
+                {
+                    "id": row.id,
+                    "name": row.name,
+                    "sample_count": 0,
+                    "online_count": 0,
+                    "offline_count": 0,
+                },
+            )
+            item["name"] = row.name
+            item["sample_count"] += 1
+            if bool(row.is_online):
+                item["online_count"] += 1
+            else:
+                item["offline_count"] += 1
+
+        result = []
+        for item in grouped.values():
+            sample_count = item["sample_count"]
+            item["online_rate"] = round(
+                item["online_count"] * 100 / sample_count,
+                2,
+            ) if sample_count else 0.0
+            result.append(item)
+        return result
+
+    def claim_channel(self, channel_id: str, role: str) -> dict:
+        normalized_id = str(channel_id or "").strip()
+        normalized_role = str(role or "").strip()
+        if not normalized_id:
+            raise ValueError("channel_id is required")
+        if normalized_role not in _CHANNEL_PROFILE_ROLES:
+            raise ValueError(
+                f"unsupported electronic-seal channel role: {normalized_role or '<empty>'}"
+            )
+
+        with _channel_lock(normalized_id):
+            with self.session_factory() as session:
+                source = (
+                    session.query(ChannelMeta)
+                    .filter(ChannelMeta.id == normalized_id)
+                    .with_for_update()
+                    .one_or_none()
+                )
+                existing = session.get(ElectronicSealChannelMeta, normalized_id)
+                if source is None and existing is None:
+                    raise ValueError(f"channel not found: {normalized_id}")
+                if source is not None:
+                    if session.query(TaskMeta.id).filter(TaskMeta.channel_id == normalized_id).first():
+                        raise ValueError("channel is referenced by a video-AI task")
+                    if session.query(ChannelZoneMeta.id).filter(
+                        ChannelZoneMeta.channel_id == normalized_id
+                    ).first():
+                        raise ValueError("channel is referenced by a video-AI zone")
+                    normalized_stream = str(source.stream or "").strip()
+                    if not normalized_stream:
+                        raise ValueError("electronic-seal WVP channel requires a non-empty stream")
+                    stream_owner = (
+                        session.query(ElectronicSealChannelMeta)
+                        .filter(ElectronicSealChannelMeta.stream == normalized_stream)
+                        .one_or_none()
+                    )
+                    if stream_owner is not None and stream_owner.id != normalized_id:
+                        raise ValueError(
+                            f"stream is already owned by electronic seal: {normalized_stream}"
+                        )
+                    if existing is None:
+                        existing = ElectronicSealChannelMeta(
+                            id=source.id,
+                            device_id=source.device_id,
+                            gb_id=source.gb_id,
+                            media_node_id=source.media_node_id,
+                            name=source.name,
+                            type=source.type,
+                            source_url=source.source_url,
+                            app=source.app,
+                            stream=normalized_stream,
+                            is_online=source.is_online,
+                            is_playing=source.is_playing,
+                            record_mode=source.record_mode,
+                            snapshot_url=source.snapshot_url,
+                            snapshot_path=source.snapshot_path,
+                            webrtc_api=source.webrtc_api,
+                            flv=_public_channel_flv(source.raw_json),
+                            hls=source.hls,
+                            created_at=source.created_at,
+                            updated_at=source.updated_at,
+                            raw_json=deepcopy(source.raw_json),
+                        )
+                        session.add(existing)
+                        session.flush()
+
+                now = datetime.now()
+                profile = session.get(ElectronicSealChannelProfileMeta, normalized_id)
+                if profile is None:
+                    profile = ElectronicSealChannelProfileMeta(
+                        channel_id=normalized_id,
+                        role=normalized_role,
+                        bound=True,
+                        profile_version="role-v1",
+                        created_at=now,
+                        updated_at=now,
+                    )
+                    session.add(profile)
+                else:
+                    profile.role = normalized_role
+                    profile.bound = True
+                    profile.updated_at = now
+
+                if source is not None:
+                    session.delete(source)
+                session.commit()
+                session.refresh(existing)
+                session.refresh(profile)
+                return {
+                    "channel": _electronic_seal_channel_dict(existing),
+                    "profile": _channel_profile_dict(profile),
+                }
+
+    def bind_channel_by_stream(self, stream: str) -> dict:
+        normalized_stream = str(stream or "").strip()
+        if not normalized_stream:
+            raise ValueError("stream is required")
+
+        with _channel_lock(normalized_stream):
+            with self.session_factory() as session:
+                source = (
+                    session.query(ChannelMeta)
+                    .filter(ChannelMeta.stream == normalized_stream)
+                    .with_for_update()
+                    .one_or_none()
+                )
+                existing = (
+                    session.query(ElectronicSealChannelMeta)
+                    .filter(ElectronicSealChannelMeta.stream == normalized_stream)
+                    .one_or_none()
+                )
+                if source is None and existing is None:
+                    raise ValueError(f"channel stream not found: {normalized_stream}")
+                if existing is not None:
+                    return {
+                        "status": "already_bound",
+                        "channel": _electronic_seal_channel_dict(existing),
+                        "profile": None,
+                    }
+
+                channel_id = str(source.id).strip()
+                if session.query(TaskMeta.id).filter(TaskMeta.channel_id == channel_id).first():
+                    raise ValueError("channel is referenced by a video-AI task")
+                if session.query(ChannelZoneMeta.id).filter(
+                    ChannelZoneMeta.channel_id == channel_id
+                ).first():
+                    raise ValueError("channel is referenced by a video-AI zone")
+
+                target = ElectronicSealChannelMeta(
+                    id=source.id,
+                    device_id=source.device_id,
+                    gb_id=source.gb_id,
+                    media_node_id=source.media_node_id,
+                    name=source.name,
+                    type=source.type,
+                    source_url=source.source_url,
+                    app=source.app,
+                    stream=normalized_stream,
+                    is_online=source.is_online,
+                    is_playing=source.is_playing,
+                    record_mode=source.record_mode,
+                    snapshot_url=source.snapshot_url,
+                    snapshot_path=source.snapshot_path,
+                    webrtc_api=source.webrtc_api,
+                    flv=_public_channel_flv(source.raw_json),
+                    hls=source.hls,
+                    created_at=source.created_at,
+                    updated_at=source.updated_at,
+                    raw_json=deepcopy(source.raw_json),
+                )
+                session.add(target)
+                session.flush()
+                session.delete(source)
+                session.commit()
+                session.refresh(target)
+                return {
+                    "status": "bound",
+                    "channel": _electronic_seal_channel_dict(target),
+                    "profile": None,
+                }
+
+    def release_channel(self, channel_id: str) -> dict:
+        normalized_id = str(channel_id or "").strip()
+        if not normalized_id:
+            raise ValueError("channel_id is required")
+
+        with _channel_lock(normalized_id):
+            with self.session_factory() as session:
+                source = (
+                    session.query(ElectronicSealChannelMeta)
+                    .filter(ElectronicSealChannelMeta.id == normalized_id)
+                    .with_for_update()
+                    .one_or_none()
+                )
+                if source is None:
+                    raise ValueError(
+                        f"electronic-seal channel not found: {normalized_id}"
+                    )
+                _assert_history_channel_foreign_keys_removed(session)
+                if session.get(ChannelMeta, normalized_id) is not None:
+                    raise ValueError(
+                        f"video-AI channel id already exists: {normalized_id}"
+                    )
+
+                normalized_stream = str(source.stream or "").strip()
+                if normalized_stream:
+                    stream_owner = (
+                        session.query(ChannelMeta.id)
+                        .filter(ChannelMeta.stream == normalized_stream)
+                        .first()
+                    )
+                    if stream_owner is not None:
+                        raise ValueError(
+                            f"video-AI channel stream already exists: {normalized_stream}"
+                        )
+
+                raw_json = (
+                    deepcopy(source.raw_json)
+                    if isinstance(source.raw_json, dict)
+                    else {}
+                )
+                if source.flv and not _extract_channel_flv(raw_json):
+                    raw_json["flv"] = source.flv
+                target = ChannelMeta(
+                    id=source.id,
+                    device_id=source.device_id,
+                    gb_id=source.gb_id,
+                    media_node_id=source.media_node_id,
+                    name=source.name,
+                    type=source.type,
+                    source_url=source.source_url,
+                    app=source.app,
+                    stream=source.stream,
+                    is_online=source.is_online,
+                    is_playing=source.is_playing,
+                    record_mode=source.record_mode,
+                    snapshot_url=source.snapshot_url,
+                    snapshot_path=source.snapshot_path,
+                    webrtc_api=source.webrtc_api,
+                    hls=source.hls,
+                    created_at=source.created_at,
+                    updated_at=source.updated_at,
+                    raw_json=raw_json,
+                )
+                session.add(target)
+                session.flush()
+
+                runtime_models = (
+                    ElectronicSealChannelProfileMeta,
+                    ElectronicSealConfigMeta,
+                    ElectronicSealBaselineMeta,
+                    ElectronicSealStateMeta,
+                    ElectronicSealTruckCountMeta,
+                )
+                for model in runtime_models:
+                    session.query(model).filter(
+                        model.channel_id == normalized_id
+                    ).delete(synchronize_session=False)
+                session.delete(source)
+                session.commit()
+                session.refresh(target)
+                return {
+                    "status": "unbound",
+                    "channel": _video_ai_channel_dict(target),
+                    "preserved": {
+                        "events": True,
+                        "evidence": True,
+                        "online_history": True,
+                    },
+                }
+
     def get_channel_profile(self, channel_id: str) -> dict | None:
         with self.session_factory() as session:
             row = (
@@ -458,17 +989,43 @@ class ElectronicSealStore:
                     )
                     session.add(row)
                 else:
-                    row.role = role
+                    changed = False
+                    values = {"role": role}
                     if "bound" in payload:
-                        row.bound = bool(payload["bound"])
+                        values["bound"] = bool(payload["bound"])
                     if payload.get("profile_version"):
-                        row.profile_version = str(payload["profile_version"])
+                        values["profile_version"] = str(payload["profile_version"])
                     if "initialized_at" in payload:
-                        row.initialized_at = payload["initialized_at"]
-                    row.updated_at = now
-                session.commit()
+                        values["initialized_at"] = payload["initialized_at"]
+                    for key, value in values.items():
+                        if getattr(row, key) != value:
+                            setattr(row, key, value)
+                            changed = True
+                    if changed:
+                        row.updated_at = now
+                if session.new or session.dirty:
+                    session.commit()
                 session.refresh(row)
                 return _channel_profile_dict(row)
+
+    def claim_runtime(self, channel_id: str, runtime_owner_id: str) -> None:
+        normalized_id = str(channel_id or "").strip()
+        normalized_owner_id = str(runtime_owner_id or "").strip()
+        if not normalized_owner_id:
+            raise ValueError("runtime_owner_id is required")
+        with _channel_lock(normalized_id):
+            with self.session_factory() as session:
+                _lock_channel_row(session, normalized_id)
+                profile = (
+                    session.query(ElectronicSealChannelProfileMeta)
+                    .filter(ElectronicSealChannelProfileMeta.channel_id == normalized_id)
+                    .with_for_update()
+                    .one()
+                )
+                profile.runtime_owner = "worker"
+                profile.runtime_owner_id = normalized_owner_id
+                profile.updated_at = datetime.now()
+                session.commit()
 
     def ensure_default_configs(
         self,
@@ -485,17 +1042,18 @@ class ElectronicSealStore:
                 _lock_channel_row(session, channel_id)
                 now = datetime.now()
                 result: list[dict] = []
+                _validate_model_id(session, model_id)
+                algorithm_types = [str(item["algorithm_type"]) for item in defaults]
+                existing_rows = {
+                    row.algorithm_type: row
+                    for row in session.query(ElectronicSealConfigMeta).filter(
+                        ElectronicSealConfigMeta.channel_id == channel_id,
+                        ElectronicSealConfigMeta.algorithm_type.in_(algorithm_types),
+                    ).all()
+                }
                 for default in defaults:
                     algorithm_type = str(default["algorithm_type"])
-                    _validate_model_id(session, model_id)
-                    row = (
-                        session.query(ElectronicSealConfigMeta)
-                        .filter(
-                            ElectronicSealConfigMeta.channel_id == channel_id,
-                            ElectronicSealConfigMeta.algorithm_type == algorithm_type,
-                        )
-                        .one_or_none()
-                    )
+                    row = existing_rows.get(algorithm_type)
                     created = row is None
                     if created:
                         row = ElectronicSealConfigMeta(
@@ -509,7 +1067,7 @@ class ElectronicSealStore:
                             alarm_hold_seconds=10,
                             recovery_hold_seconds=15,
                             need_snapshot=True,
-                            need_video_clip=False,
+                            need_video_clip=algorithm_type == "room_empty",
                             line_config_json={},
                             region_config_json={},
                             threshold_config_json={},
@@ -518,18 +1076,52 @@ class ElectronicSealStore:
                         )
                         session.add(row)
                     else:
+                        changed = False
                         if not row.model_id and model_id:
                             row.model_id = model_id
+                            changed = True
                         if not preserve_existing:
-                            _apply_payload_fields(row, default, _CONFIG_PAYLOAD_FIELDS)
-                        row.updated_at = now
+                            for key in _CONFIG_PAYLOAD_FIELDS:
+                                if key in default and getattr(row, key) != default[key]:
+                                    setattr(row, key, deepcopy(default[key]))
+                                    changed = True
+                        if changed:
+                            row.updated_at = now
                     if created:
                         _apply_payload_fields(row, default, _CONFIG_PAYLOAD_FIELDS)
                         if model_id and not row.model_id:
                             row.model_id = model_id
                     result.append(row)
-                session.commit()
+                if session.new or session.dirty:
+                    session.commit()
                 return [_config_dict(row) for row in result]
+
+    def prune_channel_configs(
+        self,
+        channel_id: str,
+        allowed_algorithms: set[str] | frozenset[str],
+    ) -> int:
+        channel_id = str(channel_id).strip()
+        allowed = {
+            str(algorithm_type).strip()
+            for algorithm_type in allowed_algorithms
+            if str(algorithm_type).strip()
+        }
+        if not channel_id or not allowed:
+            return 0
+        with _channel_lock(channel_id):
+            with self.session_factory() as session:
+                deleted = (
+                    session.query(ElectronicSealConfigMeta)
+                    .filter(
+                        ElectronicSealConfigMeta.channel_id == channel_id,
+                        ~ElectronicSealConfigMeta.algorithm_type.in_(allowed),
+                    )
+                    .delete(synchronize_session=False)
+                )
+                if deleted:
+                    session.commit()
+                return int(deleted or 0)
 
     def list_configs(self, channel_id: str | None = None) -> list[dict]:
         with self.session_factory() as session:
@@ -582,7 +1174,7 @@ class ElectronicSealStore:
                         alarm_hold_seconds=10,
                         recovery_hold_seconds=15,
                         need_snapshot=True,
-                        need_video_clip=False,
+                        need_video_clip=algorithm_type == "room_empty",
                         line_config_json={},
                         region_config_json={},
                         threshold_config_json={},
@@ -691,6 +1283,7 @@ class ElectronicSealStore:
         with _channel_lock(channel_id):
             with self.session_factory() as session:
                 _lock_channel_row(session, channel_id)
+                _assert_runtime_owner(session, channel_id, payload.get("runtime_owner_id"))
                 now = datetime.now()
                 row = (
                     session.query(ElectronicSealStateMeta)
@@ -787,8 +1380,8 @@ class ElectronicSealStore:
         event_id = str(payload.get("id") or payload.get("event_id") or generate_id("ese"))
         enqueue_upload = bool(payload.get("enqueue_upload", False))
         with self.session_factory() as session:
-            if session.query(ChannelMeta.id).filter(ChannelMeta.id == channel_id).one_or_none() is not None:
-                _lock_channel_row(session, channel_id)
+            _lock_channel_row(session, channel_id)
+            _assert_runtime_owner(session, channel_id, payload.get("runtime_owner_id"))
             existing = (
                 session.query(ElectronicSealEventIndexMeta)
                 .filter(ElectronicSealEventIndexMeta.id == event_id)
@@ -804,7 +1397,7 @@ class ElectronicSealStore:
             if ended_at is not None:
                 ended_at = _event_datetime_value(ended_at, detected_at)
             event_type = str(payload.get("event_type") or algorithm_type)
-            severity = str(payload.get("severity") or "warning")
+            severity = event_severity(algorithm_type)
             status = str(payload.get("status") or "new")
             handling_status = int(payload.get("handling_status") or 0)
             score = payload.get("score")
@@ -878,28 +1471,6 @@ class ElectronicSealStore:
                 detail_row = detail_model(**common, metrics_json=metrics)
             session.add(detail_row)
 
-            # Keep the previous table populated during the migration window so
-            # old readers and existing upload-job rows remain usable.
-            session.add(
-                ElectronicSealEventMeta(
-                    id=event_id,
-                    channel_id=channel_id,
-                    algorithm_type=algorithm_type,
-                    event_type=event_type,
-                    severity=severity,
-                    started_at=started_at,
-                    ended_at=ended_at,
-                    duration_seconds=payload.get("duration_seconds"),
-                    score=score,
-                    metrics_json=metrics,
-                    evidence_snapshot_path=payload.get("evidence_snapshot_path"),
-                    evidence_video_path=payload.get("evidence_video_path"),
-                    handling_status=handling_status,
-                    status=status,
-                    created_at=now,
-                    updated_at=now,
-                )
-            )
             if algorithm_type == "truck_departure":
                 count_row = (
                     session.query(ElectronicSealTruckCountMeta)
@@ -940,7 +1511,14 @@ class ElectronicSealStore:
             session.refresh(detail_row)
             return _indexed_event_dict(index_row, detail_row, upload_job)
 
-    def close_event(self, event_id: str, ended_at: datetime, duration_seconds: float) -> dict | None:
+    def close_event(
+        self,
+        event_id: str,
+        ended_at: datetime,
+        duration_seconds: float,
+        *,
+        runtime_owner_id: str | None = None,
+    ) -> dict | None:
         with self.session_factory() as session:
             index_row = (
                 session.query(ElectronicSealEventIndexMeta)
@@ -948,16 +1526,8 @@ class ElectronicSealStore:
                 .one_or_none()
             )
             if index_row is None:
-                row = session.query(ElectronicSealEventMeta).filter(ElectronicSealEventMeta.id == event_id).one_or_none()
-                if row is None:
-                    return None
-                row.ended_at = ended_at
-                row.duration_seconds = float(duration_seconds)
-                row.status = "closed"
-                row.updated_at = datetime.now()
-                session.commit()
-                session.refresh(row)
-                return _event_dict(row)
+                return None
+            _assert_runtime_owner(session, index_row.channel_id, runtime_owner_id)
             detail_table, detail_model = _event_detail_table(index_row.algorithm_type)
             detail = session.get(detail_model, event_id)
             now = datetime.now()
@@ -968,12 +1538,6 @@ class ElectronicSealStore:
                 detail.ended_at = ended_at
                 detail.status = "closed"
                 detail.updated_at = now
-            legacy = session.get(ElectronicSealEventMeta, event_id)
-            if legacy is not None:
-                legacy.ended_at = ended_at
-                legacy.duration_seconds = float(duration_seconds)
-                legacy.status = "closed"
-                legacy.updated_at = now
             session.commit()
             session.refresh(index_row)
             return _indexed_event_dict(index_row, detail, _upload_job_for_event(session, event_id))
@@ -988,33 +1552,21 @@ class ElectronicSealStore:
                     session.get(detail_model, event_id),
                     _upload_job_for_event(session, event_id),
                 )
-            row = session.query(ElectronicSealEventMeta).filter(ElectronicSealEventMeta.id == event_id).one_or_none()
-            return _event_dict(row) if row else None
+            return None
 
-    def update_event(self, event_id: str, payload: dict) -> dict | None:
+    def update_event(
+        self,
+        event_id: str,
+        payload: dict,
+        *,
+        runtime_owner_id: str | None = None,
+    ) -> dict | None:
         with self.session_factory() as session:
             index_row = session.query(ElectronicSealEventIndexMeta).filter(ElectronicSealEventIndexMeta.id == event_id).one_or_none()
             if index_row is None:
-                row = session.query(ElectronicSealEventMeta).filter(ElectronicSealEventMeta.id == event_id).one_or_none()
-                if row is None:
-                    return None
-                for key in (
-                    "ended_at",
-                    "duration_seconds",
-                    "score",
-                    "metrics_json",
-                    "evidence_snapshot_path",
-                    "evidence_video_path",
-                    "handling_status",
-                    "status",
-                ):
-                    if key in payload:
-                        setattr(row, key, deepcopy(payload[key]))
-                row.updated_at = datetime.now()
-                session.commit()
-                session.refresh(row)
-                return _event_dict(row)
+                return None
 
+            _assert_runtime_owner(session, index_row.channel_id, runtime_owner_id)
             _, detail_model = _event_detail_table(index_row.algorithm_type)
             detail = session.get(detail_model, event_id)
             now = datetime.now()
@@ -1039,21 +1591,6 @@ class ElectronicSealStore:
                     if key in payload and hasattr(detail, key):
                         setattr(detail, key, deepcopy(payload[key]))
                 detail.updated_at = now
-            legacy = session.get(ElectronicSealEventMeta, event_id)
-            if legacy is not None:
-                for key in (
-                    "ended_at",
-                    "duration_seconds",
-                    "score",
-                    "metrics_json",
-                    "evidence_snapshot_path",
-                    "evidence_video_path",
-                    "handling_status",
-                    "status",
-                ):
-                    if key in payload:
-                        setattr(legacy, key, deepcopy(payload[key]))
-                legacy.updated_at = now
             if "evidence_snapshot_path" in payload or "evidence_video_path" in payload:
                 job_rows = (
                     session.query(ElectronicSealUploadJobMeta)
@@ -1122,25 +1659,6 @@ class ElectronicSealStore:
                 .limit(safe_page_size)
                 .all()
             )
-            if not rows and total == 0:
-                legacy_query = session.query(ElectronicSealEventMeta)
-                if channel_id:
-                    legacy_query = legacy_query.filter(ElectronicSealEventMeta.channel_id == channel_id)
-                if algorithm_type:
-                    legacy_query = legacy_query.filter(ElectronicSealEventMeta.algorithm_type == algorithm_type)
-                total = legacy_query.count()
-                legacy_rows = (
-                    legacy_query.order_by(ElectronicSealEventMeta.created_at.desc(), ElectronicSealEventMeta.id.desc())
-                    .offset((safe_page - 1) * safe_page_size)
-                    .limit(safe_page_size)
-                    .all()
-                )
-                return {
-                    "items": [_event_dict(row) for row in legacy_rows],
-                    "total": total,
-                    "page": safe_page,
-                    "page_size": safe_page_size,
-                }
             next_cursor = None
             if rows:
                 last = rows[-1]
@@ -1219,7 +1737,11 @@ class ElectronicSealStore:
         now = datetime.now()
         idempotency_key = f"{event_id}:{target}"
         with self.session_factory() as session:
-            event = session.query(ElectronicSealEventMeta).filter(ElectronicSealEventMeta.id == event_id).one()
+            event = (
+                session.query(ElectronicSealEventIndexMeta)
+                .filter(ElectronicSealEventIndexMeta.id == event_id)
+                .one()
+            )
             with _channel_lock(event.channel_id):
                 _lock_channel_row(session, event.channel_id)
                 row = (
@@ -1392,7 +1914,9 @@ class ElectronicSealStore:
 
     def get_truck_count(self, channel_id: str) -> dict | None:
         with self.session_factory() as session:
-            if session.query(ChannelMeta.id).filter(ChannelMeta.id == str(channel_id)).one_or_none() is None:
+            if session.query(ElectronicSealChannelMeta.id).filter(
+                ElectronicSealChannelMeta.id == str(channel_id)
+            ).one_or_none() is None:
                 return None
             row = session.query(ElectronicSealTruckCountMeta).filter(
                 ElectronicSealTruckCountMeta.channel_id == str(channel_id)
@@ -1425,7 +1949,9 @@ class ElectronicSealStore:
         safe_page = max(int(page or 1), 1)
         safe_page_size = min(max(int(page_size or 100), 1), 1000)
         with self.session_factory() as session:
-            if session.query(ChannelMeta.id).filter(ChannelMeta.id == str(channel_id)).one_or_none() is None:
+            if session.query(ElectronicSealChannelMeta.id).filter(
+                ElectronicSealChannelMeta.id == str(channel_id)
+            ).one_or_none() is None:
                 return None
             query = session.query(ElectronicSealTruckDepartureEventMeta).filter(
                 ElectronicSealTruckDepartureEventMeta.channel_id == str(channel_id),

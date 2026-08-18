@@ -18,6 +18,7 @@ Successful response:
 ```json
 {
   "status": "unbound",
+  "runtime_stop": "scheduled",
   "channel": {
     "id": "channel-1",
     "stream": "stream-1"
@@ -64,8 +65,10 @@ processing for the channel:
 - `electronic_seal_states`
 - `electronic_seal_truck_counts`
 
-Any in-memory worker for the channel is stopped as part of manager-level
-orchestration. Snapshot and evidence files are not removed from disk.
+Any in-memory worker for the channel is prevented from accepting new frames or
+persisting new runtime output before the database transaction starts. Waiting
+for worker threads and FFmpeg resources to exit is deferred to background
+cleanup. Snapshot and evidence files are not removed from disk.
 
 ### Preserved historical data
 
@@ -111,6 +114,49 @@ integrity to a table that represents current ownership. `channel_id` remains
 required and indexed, so historical queries retain their current shape and
 performance characteristics.
 
+## Two-Phase Runtime Stop
+
+Worker shutdown is split into two operations with different latency guarantees:
+
+- `request_stop()` performs only fast, non-blocking actions: set the stop event,
+  unsubscribe from the frame broker, invalidate the worker's in-memory runtime
+  token, and prevent new detection and health work from starting.
+- `wait_and_close()` waits for the detection and main worker threads, stops the
+  health scheduler, closes the evidence-video coordinator, and releases frame
+  and FFmpeg resources. It runs in a manager-owned background executor.
+
+The manager removes the worker from `_workers` before calling `request_stop()`.
+That prevents `reconcile()` or API status lookups from treating a draining
+worker as active. Background cleanup logs completion, timeout, and failure with
+the channel ID, but its result does not change the already committed ownership
+transfer.
+
+Shutdown cleanup is intentionally an in-process best-effort task rather than a
+durable database job. If the process exits while cleanup is running, process
+termination releases its threads and FFmpeg handles; channel ownership remains
+correct because the database transaction has already committed.
+
+## Runtime Write Guard
+
+Each worker receives an opaque runtime token when it starts. The current token
+is kept in the channel profile's existing `runtime_owner_id` field. Event,
+state, health-transition, evidence-update, and upload-enqueue writes originating
+from a worker must include this token and are accepted only while both conditions
+remain true:
+
+- the channel still exists in `electronic_seal_channels`;
+- its bound profile still contains the same `runtime_owner_id`.
+
+The token check and the business write occur in the same database transaction,
+with the profile row locked for update. `request_stop()` invalidates the worker's
+in-memory token immediately, and the release transaction deletes the persisted
+profile. An inference that acquired the profile lock before release may commit
+before the ownership migration; the release transaction waits for it. An
+inference that reaches persistence after profile deletion is rejected and cannot
+write after the ownership transfer. A rejected stale write is logged at debug or
+info level and is not retried. Administrative API writes that are not produced
+by a worker retain their existing behavior and do not require a runtime token.
+
 ## Transaction And Concurrency
 
 `ElectronicSealStore.release_channel(channel_id)` performs the database work:
@@ -124,15 +170,26 @@ performance characteristics.
 7. Insert and flush the `channels` row.
 8. Explicitly delete runtime rows for deterministic SQLite and MySQL behavior.
 9. Delete the `electronic_seal_channels` row and commit.
-10. Return the serialized video-AI channel.
+10. Return the serialized video-AI channel to the manager.
 
 Insert and delete occur in one transaction. Any failure rolls back both sides,
 so the channel cannot disappear from both ownership tables.
 
-The manager removes and stops the in-memory worker before calling the store.
-If the store operation fails, it runs `reconcile()` to restore processing from
-the unchanged database state. After success, it also reconciles so schedulers
-and pending state reflect the new ownership.
+The complete manager sequence is:
+
+1. Under the manager lock, remove the worker from `_workers`.
+2. Call `request_stop()` without joining any thread.
+3. Call `ElectronicSealStore.release_channel(channel_id)` synchronously.
+4. On commit, submit `wait_and_close()` to the background executor and add
+   `runtime_stop=scheduled` to the API response.
+5. If the store operation fails, finish cleanup of the old worker and call
+   `reconcile()` to create a fresh worker from the unchanged database state.
+
+The database migration remains synchronous because the API must not report
+success before ownership has actually moved back to video AI. Only resource
+cleanup is asynchronous. After a successful migration, no full `reconcile()` is
+required on the response path because the worker has already been removed and
+the released channel no longer appears in the desired electronic-seal set.
 
 ## Rebinding Behavior
 
@@ -152,8 +209,9 @@ Store integration tests using SQLite with foreign keys enabled cover:
 - rejection of missing channels, duplicate IDs, and duplicate streams;
 - transaction rollback when a conflict or database error occurs.
 
-Manager tests cover worker shutdown, successful reconciliation, and recovery
-reconciliation after a store failure.
+Manager tests cover non-blocking stop requests, immediate response without
+waiting for worker joins, asynchronous cleanup completion, stale runtime-write
+rejection, and recovery reconciliation after a store failure.
 
 API tests cover the success response and `404`/`409` mappings. Schema tests
 verify that historical model metadata no longer defines channel foreign keys
@@ -166,3 +224,4 @@ and that the rerunnable migration targets all six constraints.
 - Moving video-AI tasks or zones between ownership domains.
 - A bulk-unbind endpoint.
 - A separate archived-channel table.
+- Persisting background cleanup jobs across process restarts.

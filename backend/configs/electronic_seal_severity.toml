@@ -1,0 +1,6 @@
+# Event risk levels exposed to electronic-seal integrations.
+[events]
+truck_departure = "none"
+room_empty = "yellow"
+camera_occlusion = "red"
+camera_view_shift = "red"

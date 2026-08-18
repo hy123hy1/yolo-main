@@ -39,6 +39,10 @@ class FrameEnvelope:
 class _ChannelState:
     channel_id: str
     source_url: str
+    primary_source_url: str = ""
+    fallback_source_url: str = ""
+    fallback_active: bool = False
+    fallback_reason: str | None = None
     subscriptions: dict[str, "FrameSubscription"] = field(default_factory=dict)
     latest: FrameEnvelope | None = None
     sequence: int = 0
@@ -47,6 +51,7 @@ class _ChannelState:
     last_success_monotonic: float | None = None
     last_error: str | None = None
     capture: Any = None
+    capture_started_monotonic: float | None = None
     capture_creations: int = 0
     stop_event: threading.Event = field(default_factory=threading.Event)
     next_reconnect_monotonic: float = 0.0
@@ -100,6 +105,8 @@ class FrameBroker:
         height: int = 720,
         init_wait: float = 0.0,
         stale_grace_seconds: float = 5.0,
+        first_frame_grace_seconds: float | None = None,
+        fallback_grace_seconds: float = 5.0,
         reconnect_delay_seconds: float = 1.0,
         read_retry: int = 1,
         start_reader: bool = True,
@@ -111,6 +118,10 @@ class FrameBroker:
             raise ValueError("width and height must be positive")
         if stale_grace_seconds < 0:
             raise ValueError("stale_grace_seconds must be non-negative")
+        if first_frame_grace_seconds is not None and first_frame_grace_seconds <= 0:
+            raise ValueError("first_frame_grace_seconds must be positive")
+        if fallback_grace_seconds <= 0:
+            raise ValueError("fallback_grace_seconds must be positive")
         if reconnect_delay_seconds < 0:
             raise ValueError("reconnect_delay_seconds must be non-negative")
         if reader_join_timeout < 0:
@@ -121,6 +132,12 @@ class FrameBroker:
         self.height = height
         self.init_wait = init_wait
         self.stale_grace_seconds = float(stale_grace_seconds)
+        self.first_frame_grace_seconds = float(
+            stale_grace_seconds
+            if first_frame_grace_seconds is None
+            else first_frame_grace_seconds
+        )
+        self.fallback_grace_seconds = float(fallback_grace_seconds)
         self.reconnect_delay_seconds = float(reconnect_delay_seconds)
         self.read_retry = max(1, int(read_retry))
         self.start_reader = bool(start_reader)
@@ -133,9 +150,16 @@ class FrameBroker:
         self._channels: dict[str, _ChannelState] = {}
         self._shutdown = False
 
-    def subscribe(self, channel_id: str, source_url: str) -> FrameSubscription:
+    def subscribe(
+        self,
+        channel_id: str,
+        source_url: str,
+        *,
+        fallback_source_url: str = "",
+    ) -> FrameSubscription:
         channel_id = str(channel_id).strip()
         source_url = str(source_url).strip()
+        fallback_source_url = str(fallback_source_url or "").strip()
         if not channel_id:
             raise ValueError("channel_id is required")
         if not source_url:
@@ -151,11 +175,20 @@ class FrameBroker:
                     state = _ChannelState(
                         channel_id=channel_id,
                         source_url=source_url,
+                        primary_source_url=source_url,
+                        fallback_source_url=fallback_source_url,
                         last_success_monotonic=self._monotonic(),
                     )
                     self._channels[channel_id] = state
-                elif state.source_url != source_url:
-                    cleanup = self._restart_source_locked(state, source_url)
+                elif (
+                    state.primary_source_url != source_url
+                    or state.fallback_source_url != fallback_source_url
+                ):
+                    cleanup = self._restart_source_locked(
+                        state,
+                        source_url,
+                        fallback_source_url,
+                    )
 
             if cleanup is not None:
                 timed_out = self._cleanup_handles(cleanup)
@@ -258,6 +291,10 @@ class FrameBroker:
                     "channel_id": channel_id,
                     "status": "offline",
                     "source_url": None,
+                    "primary_source_url": None,
+                    "fallback_source_url": None,
+                    "fallback_active": False,
+                    "fallback_reason": None,
                     "last_frame_timestamp": None,
                     "last_error": None,
                     "subscriber_count": 0,
@@ -281,6 +318,10 @@ class FrameBroker:
                 "channel_id": channel_id,
                 "status": state.status,
                 "source_url": state.source_url or None,
+                "primary_source_url": state.primary_source_url or None,
+                "fallback_source_url": state.fallback_source_url or None,
+                "fallback_active": state.fallback_active,
+                "fallback_reason": state.fallback_reason,
                 "last_frame_timestamp": state.last_frame_timestamp,
                 "last_error": state.last_error,
                 "subscriber_count": len(state.subscriptions),
@@ -388,6 +429,7 @@ class FrameBroker:
                 and not state.draining
             ):
                 state.capture = capture
+                state.capture_started_monotonic = self._monotonic()
                 state.capture_creations += 1
                 state.next_reconnect_monotonic = 0.0
                 state.last_error = None
@@ -469,7 +511,13 @@ class FrameBroker:
                 capture = state.capture
                 if capture is None:
                     now = self._monotonic()
+                    if self._should_activate_fallback_locked(state, now):
+                        self._activate_fallback_locked(state, now)
+                        source_url = state.source_url
+                        should_open = True
                     if (
+                        not should_open
+                        and
                         not state.draining
                         and now >= state.next_reconnect_monotonic
                     ):
@@ -546,6 +594,7 @@ class FrameBroker:
                     self._capture_diagnostics(capture),
                 )
             stale_capture = None
+            fallback_capture = None
             with self._condition:
                 if (
                     self._shutdown
@@ -556,21 +605,44 @@ class FrameBroker:
                 ):
                     return
                 now = self._monotonic()
-                last_success = state.last_success_monotonic or now
-                if now - last_success >= self.stale_grace_seconds:
-                    state.status = "offline"
-                    state.last_error = state.last_error or "frame read failed or stale"
-                    stale_capture = self._detach_capture_locked(state, capture)
-                    state.next_reconnect_monotonic = now + self.reconnect_delay_seconds
+                if self._should_activate_fallback_locked(state, now):
+                    fallback_capture = self._activate_fallback_locked(state, now)
                     logger.warning(
-                        "[ElectronicSealFrame] capture_stale channel=%s failures=%s stale_seconds=%.3f diagnostics=%s",
+                        "[ElectronicSealFrame] fallback_to_flv channel=%s source=%s failures=%s",
                         state.channel_id,
+                        state.source_url,
                         read_failures,
-                        now - last_success,
-                        self._capture_diagnostics(capture),
                     )
                 else:
-                    state.status = "connecting"
+                    grace_started = max(
+                        value
+                        for value in (
+                            state.last_success_monotonic,
+                            state.capture_started_monotonic,
+                        )
+                        if value is not None
+                    )
+                    grace_seconds = (
+                        self.first_frame_grace_seconds
+                        if state.latest is None
+                        else self.stale_grace_seconds
+                    )
+                    if now - grace_started >= grace_seconds:
+                        state.status = "offline"
+                        state.last_error = state.last_error or "frame read failed or stale"
+                        stale_capture = self._detach_capture_locked(state, capture)
+                        state.next_reconnect_monotonic = now + self.reconnect_delay_seconds
+                        logger.warning(
+                            "[ElectronicSealFrame] capture_stale channel=%s failures=%s stale_seconds=%.3f diagnostics=%s",
+                            state.channel_id,
+                            read_failures,
+                            now - grace_started,
+                            self._capture_diagnostics(capture),
+                        )
+                    else:
+                        state.status = "connecting"
+            if fallback_capture is not None:
+                self._release_capture(fallback_capture)
             if stale_capture is not None:
                 self._release_capture(stale_capture)
             stop_event.wait(0.01)
@@ -594,8 +666,37 @@ class FrameBroker:
         self._condition.notify_all()
         return envelope
 
+    def _should_activate_fallback_locked(
+        self,
+        state: _ChannelState,
+        now: float,
+    ) -> bool:
+        return bool(
+            not state.fallback_active
+            and state.source_url.lower().startswith("rtsp://")
+            and state.fallback_source_url
+            and state.last_success_monotonic is not None
+            and now - state.last_success_monotonic >= self.fallback_grace_seconds
+        )
+
+    def _activate_fallback_locked(self, state: _ChannelState, now: float) -> Any:
+        capture = self._detach_capture_locked(state)
+        state.source_url = state.fallback_source_url
+        state.fallback_active = True
+        state.fallback_reason = "rtsp_no_valid_frame_for_grace_period"
+        state.latest = None
+        state.last_frame_timestamp = None
+        state.last_success_monotonic = now
+        state.status = "connecting"
+        state.last_error = None
+        state.next_reconnect_monotonic = now
+        return capture
+
     def _restart_source_locked(
-        self, state: _ChannelState, source_url: str
+        self,
+        state: _ChannelState,
+        source_url: str,
+        fallback_source_url: str = "",
     ) -> _CleanupHandles:
         state.generation += 1
         state.stop_event.set()
@@ -613,6 +714,10 @@ class FrameBroker:
         state.draining = state.reader_thread is not None
         state.stop_event = threading.Event()
         state.source_url = source_url
+        state.primary_source_url = source_url
+        state.fallback_source_url = fallback_source_url
+        state.fallback_active = False
+        state.fallback_reason = None
         state.latest = None
         state.last_frame_timestamp = None
         state.last_success_monotonic = self._monotonic()
@@ -627,6 +732,7 @@ class FrameBroker:
             return None
         capture = state.capture
         state.capture = None
+        state.capture_started_monotonic = None
         return capture
 
     def _close_state_locked(self, state: _ChannelState) -> _CleanupHandles:

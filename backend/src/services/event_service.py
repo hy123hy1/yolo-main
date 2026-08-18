@@ -6,7 +6,7 @@ from pathlib import Path
 
 from src.core.settings import settings
 from src.db.database import SessionLocal
-from src.db.models import EventMeta, RecordingMeta
+from src.db.models import ChannelMeta, EventMeta, ModelMetaRecord, RecordingMeta
 from src.services.metadata_db_sync import delete_json_document
 from src.services.platform_storage import (
     format_datetime,
@@ -20,6 +20,10 @@ from src.services.platform_storage import (
 logger = logging.getLogger(__name__)
 
 
+def _clean_text(value) -> str:
+    return str(value or "").strip()
+
+
 class EventService:
     def __init__(self):
         self.events_dir: Path = settings.EVENTS_DIR
@@ -30,6 +34,55 @@ class EventService:
 
     def _get_recording_path(self, recording_id: str) -> Path:
         return self.recordings_dir / f"{recording_id}.json"
+
+    @staticmethod
+    def _algorithm_display_name(model_name: str | None, model_id: str | None) -> str:
+        label = _clean_text(model_name) or _clean_text(model_id) or "未知算法"
+        if "算法" in label:
+            return label
+        return f"{label}"
+
+    @classmethod
+    def _build_event_content(
+        cls,
+        item: dict,
+        *,
+        channel_name: str | None = None,
+        model_name: str | None = None,
+    ) -> str:
+        explicit_content = _clean_text(item.get("content"))
+        if explicit_content:
+            return explicit_content
+
+        created_at = _clean_text(item.get("created_at")) or format_datetime(datetime.now())
+        channel_label = _clean_text(channel_name) or _clean_text(item.get("channel_id")) or "未知通道"
+        algorithm_label = cls._algorithm_display_name(model_name, item.get("model_id"))
+        return f"{created_at}，{channel_label}检测到{algorithm_label}，请核实处理"
+
+    def _lookup_event_display_names(self, session, item: dict) -> tuple[str | None, str | None]:
+        channel_name = None
+        model_name = None
+        channel_id = _clean_text(item.get("channel_id"))
+        model_id = _clean_text(item.get("model_id"))
+
+        try:
+            if channel_id:
+                row = session.query(ChannelMeta.name).filter(ChannelMeta.id == channel_id).one_or_none()
+                if row:
+                    channel_name = row[0]
+            if model_id:
+                row = session.query(ModelMetaRecord.name).filter(ModelMetaRecord.id == model_id).one_or_none()
+                if row:
+                    model_name = row[0]
+        except Exception:
+            logger.warning(
+                "Failed to resolve event content names channel_id=%s model_id=%s",
+                channel_id,
+                model_id,
+                exc_info=True,
+            )
+
+        return channel_name, model_name
 
     @staticmethod
     def _build_event_item(payload: dict, *, event_id: str | None = None, created_at: datetime | None = None) -> dict:
@@ -45,6 +98,7 @@ class EventService:
             "conf": payload.get("conf", 0),
             "snapshot_path": payload.get("snapshot_path"),
             "video_path": payload.get("video_path"),
+            "content": payload.get("content"),
             "handling_status": payload.get("handling_status", 0),
             "remark": payload.get("remark"),
             "status": payload.get("status", "new"),
@@ -64,6 +118,7 @@ class EventService:
             "conf": row.conf,
             "snapshot_path": row.snapshot_path,
             "video_path": row.video_path,
+            "content": row.content,
             "handling_status": row.handling_status,
             "remark": row.remark,
             "status": row.status,
@@ -85,6 +140,7 @@ class EventService:
             "conf": row.conf,
             "snapshot_path": row.snapshot_path,
             "video_path": row.video_path,
+            "content": row.content,
             "handling_status": row.handling_status,
             "remark": row.remark,
             "status": row.status,
@@ -219,6 +275,7 @@ class EventService:
     async def create_event(self, payload: dict):
         def _create_to_json():
             item = self._build_event_item(payload)
+            item["content"] = self._build_event_content(item)
             save_json(self._get_path(item["id"]), item, sync_metadata=False)
             return item
 
@@ -230,6 +287,12 @@ class EventService:
                     created_at=now_dt,
                 )
                 with SessionLocal() as session:
+                    channel_name, model_name = self._lookup_event_display_names(session, item)
+                    item["content"] = self._build_event_content(
+                        item,
+                        channel_name=channel_name,
+                        model_name=model_name,
+                    )
                     session.add(
                         EventMeta(
                             id=item["id"],
@@ -242,6 +305,7 @@ class EventService:
                             conf=item["conf"],
                             snapshot_path=item["snapshot_path"],
                             video_path=item["video_path"],
+                            content=item["content"],
                             handling_status=item["handling_status"],
                             remark=item["remark"],
                             status=item["status"],

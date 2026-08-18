@@ -13,6 +13,20 @@ test('electronic seal api uses an independent port proxy and exposes required op
   assert.match(source, /recalibrate/)
   assert.match(source, /evidence/)
   assert.match(source, /retry/)
+  assert.match(source, /upload_job_id/)
+  assert.match(source, /listElectronicSealChannels/)
+  assert.match(source, /startElectronicSealChannelPlay/)
+  assert.match(source, /\/electronic-seal\/channels/)
+  assert.match(source, /\/play/)
+})
+
+test('electronic seal page uses its isolated model api instead of video ai models', () => {
+  const apiSource = fs.readFileSync(path.join(root, 'src/api/electronicSeal.ts'), 'utf8')
+  const pageSource = fs.readFileSync(path.join(root, 'src/pages/ElectronicSeal.vue'), 'utf8')
+  assert.match(apiSource, /listElectronicSealModels/)
+  assert.match(apiSource, /\/electronic-seal\/models/)
+  assert.match(pageSource, /listElectronicSealModels/)
+  assert.doesNotMatch(pageSource, /import \{ listModels \} from '@\/api\/models'/)
 })
 
 test('electronic seal page renders line, region, status, evidence, and upload controls', () => {
@@ -21,6 +35,10 @@ test('electronic seal page renders line, region, status, evidence, and upload co
   assert.match(source, /虚拟线配置/)
   assert.match(source, /区域配置/)
   assert.match(source, /证据|截图|视频/)
+  assert.match(source, /event\.snapshot_url/)
+  assert.match(source, /event\.video_url/)
+  assert.match(source, /evidenceUrl\(event\.snapshot_url\)/)
+  assert.match(source, /evidenceUrl\(event\.video_url\)/)
   assert.match(source, /重试上传/)
   assert.match(source, /canvas/)
   assert.match(source, /coordinate_space: 'normalized'/)
@@ -44,7 +62,8 @@ test('electronic seal preview uses WebRTC and waits for the first frame', () => 
 
 test('electronic seal preview refreshes the browser stream before using cached play urls', () => {
   const source = fs.readFileSync(path.join(root, 'src/pages/ElectronicSeal.vue'), 'utf8')
-  assert.match(source, /startChannelPlay/)
+  assert.match(source, /startElectronicSealChannelPlay/)
+  assert.doesNotMatch(source, /from '@\/api\/channels'/)
   assert.match(source, /browser_urls|browser_play_urls/)
 })
 
@@ -61,7 +80,7 @@ test('electronic seal overlay stays above the browser video layer', () => {
 
 test('electronic seal auto-loads preview after selecting a channel and keeps retry control', () => {
   const source = fs.readFileSync(path.join(root, 'src/pages/ElectronicSeal.vue'), 'utf8')
-  assert.match(source, /await Promise\.all\(\[refreshStatus\(\), loadEvents\(\)\]\)\s*await startPreview\(\)/)
+  assert.match(source, /await Promise\.allSettled\(\[refreshStatus\(\), loadEvents\(\)\]\)\s*await startPreview\(\)/)
   assert.match(source, /重新加载预览|加载原始流/)
 })
 
@@ -98,4 +117,15 @@ test('frontend routes and proxies include the isolated electronic seal module', 
   assert.match(app, /电子封条/)
   assert.match(vite, /ELECTRONIC_SEAL_API_TARGET|electronic-seal-api/)
   assert.match(nginx, /electronic-seal-worker:9001/)
+})
+
+test('preview loading does not depend on electronic-seal worker availability', () => {
+  const page = fs.readFileSync(path.join(root, 'src/pages/ElectronicSeal.vue'), 'utf8')
+  assert.match(page, /Promise\.allSettled\(\[refreshStatus\(\), loadEvents\(\)\]\)/)
+  assert.match(page, /const workerResults = await Promise\.allSettled\(\[/)
+})
+
+test('initial preview failure does not block selecting another channel', () => {
+  const page = fs.readFileSync(path.join(root, 'src/pages/ElectronicSeal.vue'), 'utf8')
+  assert.match(page, /await syncDraft\(\)\s*void selectChannel\(\)/)
 })

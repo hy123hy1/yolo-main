@@ -20,6 +20,8 @@ from src.db.models import (
     ChannelZoneMeta,
     ModelMetaRecord,
     TaskAlgorithmMeta,
+    TaskAlgorithmMetricHistoryMeta,
+    TaskAlgorithmMetricMeta,
     TaskMeta,
 )
 from src.services import metadata_db_sync
@@ -68,6 +70,7 @@ class MetadataDbSyncTest(unittest.TestCase):
             "name": "sync-parent-first",
             "type": "rtsp",
             "source_url": "rtsp://example/live/channel",
+            "flv": "http://example/live/channel.live.flv",
             "app": "live",
             "stream": "channel",
             "is_online": True,
@@ -110,6 +113,7 @@ class MetadataDbSyncTest(unittest.TestCase):
             ).scalar_one()
 
         self.assertEqual(channel_row.name, "sync-parent-first")
+        self.assertEqual(channel_row.flv, "http://example/live/channel.live.flv")
         self.assertEqual(channel_row.snapshot_path, "G:/data/snapshots/ch_sync_parent_first.jpg")
         self.assertNotIn("ai_enabled", channel_row.raw_json)
         self.assertNotIn("ai_config", (channel_row.raw_json.get("ext") or {}))
@@ -370,6 +374,77 @@ class MetadataDbSyncTest(unittest.TestCase):
             with self.assertRaises(Exception):
                 session.query(ModelMetaRecord).filter(ModelMetaRecord.id == "model_fk_restrict").delete()
                 session.commit()
+
+    def test_task_delete_keeps_history_metric_but_removes_realtime_metric(self):
+        with self.session_local() as session:
+            session.add(TaskMeta(id="task_delete_history", name="history task"))
+            session.flush()
+            session.add(
+                TaskAlgorithmMeta(
+                    id="algo_delete_history",
+                    task_id="task_delete_history",
+                    algorithm_type="detection",
+                )
+            )
+            session.add(
+                TaskAlgorithmMetricMeta(
+                    task_id="task_delete_history",
+                    algorithm_id="algo_delete_history",
+                    metric_type="person_count",
+                    metric_value=3,
+                    scope_key="global",
+                )
+            )
+            session.add(
+                TaskAlgorithmMetricHistoryMeta(
+                    task_id="task_delete_history",
+                    algorithm_id="algo_delete_history",
+                    metric_type="person_count",
+                    metric_value=3,
+                )
+            )
+            session.commit()
+
+            session.query(TaskMeta).filter(TaskMeta.id == "task_delete_history").delete()
+            session.commit()
+
+            self.assertEqual(
+                session.query(TaskAlgorithmMetricMeta)
+                .filter_by(task_id="task_delete_history")
+                .count(),
+                0,
+            )
+            history = (
+                session.query(TaskAlgorithmMetricHistoryMeta)
+                .filter_by(task_id="task_delete_history")
+                .one()
+            )
+            self.assertEqual(history.task_id, "task_delete_history")
+
+    def test_cleanup_orphan_task_keeps_metric_history(self):
+        with self.session_local() as session:
+            session.connection().exec_driver_sql("PRAGMA foreign_keys=OFF")
+            session.add(TaskMeta(id="orphan_history_task", channel_id="missing-channel"))
+            session.add(
+                TaskAlgorithmMetricHistoryMeta(
+                    task_id="orphan_history_task",
+                    algorithm_id="orphan-history-algorithm",
+                    metric_type="person_count",
+                    metric_value=7,
+                )
+            )
+            session.commit()
+
+            metadata_db_sync._cleanup_orphan_tasks(session)
+            session.commit()
+
+            self.assertIsNone(session.get(TaskMeta, "orphan_history_task"))
+            history = (
+                session.query(TaskAlgorithmMetricHistoryMeta)
+                .filter_by(task_id="orphan_history_task")
+                .one()
+            )
+            self.assertEqual(history.metric_value, 7)
 
     def test_migrate_metric_tables_to_numeric_ids_and_scope_key(self):
         with self.engine.begin() as connection:

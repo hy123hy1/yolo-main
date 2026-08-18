@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import time
+from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
@@ -10,13 +11,13 @@ import cv2
 
 from src.core.settings import settings
 from src.db.database import SessionLocal
-from src.db.models import ChannelMeta, TaskMeta
+from src.db.models import ChannelMeta, ChannelZoneMeta, TaskMeta
 from src.services.event_service import EventService
 from src.services.analysis_service import analysis_service
 from src.services.media_node_service import MediaNodeService
 from src.services.metadata_db_sync import delete_json_document
 from src.services.model_service import ModelService
-from src.services.platform_storage import format_datetime, generate_id, list_json_items, load_json, now_iso, save_json
+from src.services.platform_storage import format_datetime, generate_id, list_json_items, load_json, now_iso
 from src.services.wvp_service import WVPService
 from src.services.zlm_adapter import ZLMAdapter
 from src.services.zone_preview_service import zone_preview_service
@@ -858,15 +859,75 @@ class ChannelService:
         browser.pop("ffmpeg_key", None)
         return browser
 
-    def _get_path(self, channel_id: str) -> Path:
-        return self.channels_dir / f"{channel_id}.json"
-
     def _save_channel_item(self, item: dict) -> None:
         channel_id = str(item.get("id") or "").strip()
         if not channel_id:
             raise ValueError("Channel id is required")
         item.setdefault("ext", {})
-        save_json(self._get_path(channel_id), item)
+        now = datetime.now()
+
+        def _datetime_value(value, fallback):
+            if isinstance(value, datetime):
+                return value
+            if isinstance(value, str) and value.strip():
+                try:
+                    return datetime.fromisoformat(value.replace("Z", "+00:00")).replace(
+                        tzinfo=None
+                    )
+                except ValueError:
+                    pass
+            return fallback
+
+        with SessionLocal() as session:
+            row = session.get(ChannelMeta, channel_id)
+            if row is None:
+                row = ChannelMeta(id=channel_id)
+                session.add(row)
+            for field in (
+                "device_id",
+                "gb_id",
+                "media_node_id",
+                "name",
+                "type",
+                "source_url",
+                "flv",
+                "app",
+                "stream",
+                "is_online",
+                "is_playing",
+                "record_mode",
+                "snapshot_url",
+                "snapshot_path",
+                "webrtc_api",
+                "hls",
+            ):
+                setattr(row, field, deepcopy(item.get(field)))
+            row.created_at = _datetime_value(
+                item.get("created_at"),
+                row.created_at or now,
+            )
+            row.updated_at = _datetime_value(item.get("updated_at"), now)
+            row.raw_json = deepcopy(item)
+
+            session.query(ChannelZoneMeta).filter(
+                ChannelZoneMeta.channel_id == channel_id
+            ).delete(synchronize_session=False)
+            for zone in item.get("ext", {}).get("zones", []) or []:
+                zone_id = str(zone.get("id") or "").strip()
+                if not zone_id:
+                    continue
+                session.add(
+                    ChannelZoneMeta(
+                        id=zone_id,
+                        channel_id=channel_id,
+                        name=zone.get("name"),
+                        color=zone.get("color"),
+                        labels_json=deepcopy(zone.get("labels") or []),
+                        coordinates_json=deepcopy(zone.get("coordinates") or []),
+                        raw_json=deepcopy(zone),
+                    )
+                )
+            session.commit()
 
     def _clear_stale_preview_runtime(self, payload: dict) -> bool:
         changed = False
@@ -899,12 +960,6 @@ class ChannelService:
                 return None
             return self._build_channel_from_metadata_row(row)
 
-    def _load_channel_from_legacy_json(self, channel_id: str) -> dict | None:
-        path = self._get_path(channel_id)
-        if not path.exists():
-            return None
-        return load_json(path)
-
     def _is_task_running(self, task: dict) -> bool:
         runtime = (task or {}).get("runtime") or {}
         status = str(runtime.get("status") or task.get("status") or "").lower()
@@ -914,77 +969,25 @@ class ChannelService:
         restored = 0
         reset = 0
         failed: list[dict] = []
-        if settings.METADATA_DB_ENABLED:
-            with SessionLocal() as session:
-                rows = [
-                    str(row[0])
-                    for row in (
-                        session.query(ChannelMeta.id)
-                        .filter(ChannelMeta.is_playing.is_(True))
-                        .order_by(ChannelMeta.updated_at.desc(), ChannelMeta.id.desc())
-                        .all()
-                    )
-                    if row and row[0]
-                ]
-                for channel_id in rows:
-                    row = session.query(ChannelMeta).filter(ChannelMeta.id == channel_id).one_or_none()
-                    if not row:
-                        continue
-                    payload = dict(row.raw_json or {})
-                    payload["is_playing"] = False
-                    payload["is_online"] = False
-                    payload["updated_at"] = now_iso()
-                    row.is_playing = False
-                    row.is_online = False
-                    row.updated_at = datetime.now()
-                    row.raw_json = payload
-                    reset += 1
-                session.commit()
-
-            with SessionLocal() as session:
-                all_rows = session.query(ChannelMeta).all()
-                for row in all_rows:
-                    payload = dict(row.raw_json or {})
-                    if not self._clear_stale_preview_runtime(payload):
-                        continue
-                    payload["updated_at"] = now_iso()
-                    row.webrtc_api = payload.get("webrtc_api")
-                    row.hls = payload.get("hls")
-                    row.updated_at = datetime.now()
-                    row.raw_json = payload
-                    reset += 1
-                session.commit()
-            return {
-                "restored": restored,
-                "reset": reset,
-                "failed": failed,
-            }
-
-        items = await asyncio.to_thread(list_json_items, self.channels_dir)
-        channel_ids = [
-            str(item.get("id"))
-            for item in items
-            if item.get("id") and item.get("is_playing")
-        ]
-
-        for channel_id in channel_ids:
-            if not channel_id:
-                continue
-            try:
-                channel = await self.get_channel_runtime(channel_id)
-                if not channel:
+        with SessionLocal() as session:
+            rows = session.query(ChannelMeta).all()
+            for row in rows:
+                payload = self._build_channel_from_metadata_row(row)
+                changed = bool(row.is_playing or row.is_online)
+                payload["is_playing"] = False
+                payload["is_online"] = False
+                changed = self._clear_stale_preview_runtime(payload) or changed
+                if not changed:
                     continue
-                channel["is_playing"] = False
-                channel["is_online"] = False
-                self._clear_stale_preview_runtime(channel)
-                channel["updated_at"] = now_iso()
-                await asyncio.to_thread(self._save_channel_item, channel)
+                payload["updated_at"] = now_iso()
+                row.is_playing = False
+                row.is_online = False
+                row.webrtc_api = payload.get("webrtc_api")
+                row.hls = payload.get("hls")
+                row.updated_at = datetime.now()
+                row.raw_json = deepcopy(payload)
                 reset += 1
-            except Exception as exc:
-                failed.append({
-                    "channel_id": channel_id,
-                    "error": str(exc),
-                })
+            session.commit()
         return {
             "restored": restored,
             "reset": reset,
@@ -1034,10 +1037,13 @@ class ChannelService:
         payload = dict(row.raw_json or {})
         payload.setdefault("id", row.id)
         payload["device_id"] = row.device_id
+        if row.gb_id is not None:
+            payload["gb_id"] = row.gb_id
         payload["media_node_id"] = row.media_node_id
         payload["name"] = row.name
         payload["type"] = row.type
         payload["source_url"] = row.source_url
+        payload["flv"] = row.flv
         payload["app"] = row.app
         payload["stream"] = row.stream
         if str(row.type or "").lower() == "wvp":
@@ -1082,64 +1088,9 @@ class ChannelService:
 
     async def list_channels(self, device_id: str | None = None, type_filter: str | None = None, key: str | None = None):
         started_at = time.perf_counter()
-        if settings.METADATA_DB_ENABLED:
-            with SessionLocal() as session:
-                rows = session.query(ChannelMeta).order_by(ChannelMeta.created_at.desc(), ChannelMeta.id.desc()).all()
-            items = [self._build_channel_from_metadata_row(row) for row in rows]
-            if device_id:
-                items = [item for item in items if item.get("device_id") == device_id]
-            if type_filter:
-                items = [item for item in items if item.get("type") == type_filter]
-            if key:
-                items = [item for item in items if key.lower() in str(item).lower()]
-            result = {
-                "items": sorted(
-                    items,
-                    key=lambda x: (
-                        str(x.get("created_at") or ""),
-                        str(x.get("id") or ""),
-                    ),
-                    reverse=True,
-                )
-            }
-            logger.info(
-                "[ChannelListTiming] source=metadata count=%s elapsed_ms=%s",
-                len(result["items"]),
-                round((time.perf_counter() - started_at) * 1000, 2),
-            )
-            return result
-
-        node_cache: dict[str, dict | None] = {}
-
-        async def _resolve_node(node_id: str | None):
-            if not node_id:
-                return None
-            if node_id not in node_cache:
-                node_cache[node_id] = await self.media_node_service.get_node(node_id)
-            return node_cache[node_id]
-
-        def _list(items: list[dict]):
-            return {
-                "items": sorted(
-                    items,
-                    key=lambda x: (
-                        str(x.get("created_at") or ""),
-                        str(x.get("id") or ""),
-                    ),
-                    reverse=True,
-                )
-            }
-
         with SessionLocal() as session:
             rows = session.query(ChannelMeta).order_by(ChannelMeta.created_at.desc(), ChannelMeta.id.desc()).all()
-
-        if rows:
-            items = [
-                self._build_channel_from_metadata_row(row)
-                for row in rows
-            ]
-        else:
-            items = await asyncio.to_thread(list_json_items, self.channels_dir)
+        items = [self._build_channel_from_metadata_row(row) for row in rows]
         if device_id:
             items = [item for item in items if item.get("device_id") == device_id]
         if type_filter:
@@ -1147,50 +1098,18 @@ class ChannelService:
         if key:
             items = [item for item in items if key.lower() in str(item).lower()]
 
-        changed_items: list[tuple[Path, dict]] = []
-        refreshed_items: list[dict] = []
-        for item in items:
-            path = self._get_path(item.get("id"))
-            refreshed = dict(item)
-            try:
-                node = await _resolve_node(refreshed.get("media_node_id"))
-                adapter = self._build_adapter(node)
-                is_online, inspect_result = await asyncio.to_thread(self._inspect_channel_online_state, adapter, refreshed)
-                upstream = ((refreshed.get("ext") or {}).get("upstream") or {})
-                if not is_online and upstream.get("platform") == "wvp" and upstream.get("online") is True:
-                    # WVP 通道在未建立本地代理前，也应展示为上游在线，便于前端自动拉起浏览器播放。
-                    is_online = True
-                refreshed["is_online"] = is_online
-                refreshed.setdefault("ext", {})["last_media_probe"] = inspect_result
-
-                if not is_online and refreshed.get("is_playing"):
-                    refreshed["is_playing"] = False
-                runtime_exists = path.exists()
-                if runtime_exists and (
-                    refreshed.get("is_online") != item.get("is_online") or refreshed.get("is_playing") != item.get("is_playing")
-                ):
-                    refreshed["updated_at"] = now_iso()
-                    changed_items.append((path, refreshed))
-            except Exception as exc:
-                refreshed.setdefault("ext", {})["last_media_probe_error"] = str(exc)
-            refreshed_items.append(refreshed)
-
-        if changed_items:
-            items = list_json_items(self.channels_dir)
-            latest_map = {entry.get("id"): entry for entry in items}
-            for path, changed in changed_items:
-                latest = latest_map.get(changed.get("id"), changed)
-                latest.update({
-                    "is_online": changed.get("is_online", latest.get("is_online")),
-                    "is_playing": changed.get("is_playing", latest.get("is_playing")),
-                    "updated_at": changed.get("updated_at", latest.get("updated_at")),
-                })
-                latest.setdefault("ext", {}).update(changed.get("ext", {}))
-                await asyncio.to_thread(save_json, path, latest)
-
-        result = await asyncio.to_thread(_list, refreshed_items)
+        result = {
+            "items": sorted(
+                items,
+                key=lambda x: (
+                    str(x.get("created_at") or ""),
+                    str(x.get("id") or ""),
+                ),
+                reverse=True,
+            )
+        }
         logger.info(
-            "[ChannelListTiming] source=runtime count=%s elapsed_ms=%s",
+            "[ChannelListTiming] source=mysql count=%s elapsed_ms=%s",
             len(result["items"]),
             round((time.perf_counter() - started_at) * 1000, 2),
         )
@@ -1203,28 +1122,11 @@ class ChannelService:
         with SessionLocal() as session:
             task_rows = session.query(TaskMeta.channel_id).filter(TaskMeta.channel_id.is_not(None)).all()
 
-        if settings.METADATA_DB_ENABLED:
-            occupied_channel_ids = {
-                str(row[0])
-                for row in task_rows
-                if row and row[0]
-            }
-        elif task_rows:
-            occupied_channel_ids = {
-                str(row[0])
-                for row in task_rows
-                if row and row[0]
-            }
-        else:
-            tasks_dir = settings.TASKS_DIR
-            task_items = await asyncio.to_thread(list_json_items, tasks_dir)
-            for task in task_items:
-                if not isinstance(task, dict):
-                    continue
-                channel_id = task.get("channel_id")
-                if not channel_id:
-                    continue
-                occupied_channel_ids.add(str(channel_id))
+        occupied_channel_ids = {
+            str(row[0])
+            for row in task_rows
+            if row and row[0]
+        }
 
         available_items = [
             item for item in items
@@ -1233,30 +1135,10 @@ class ChannelService:
         return {"items": available_items}
 
     async def get_channel(self, channel_id: str):
-        if settings.METADATA_DB_ENABLED:
-            return await asyncio.to_thread(self._load_channel_from_db, channel_id)
-
-        path = self._get_path(channel_id)
-        json_channel = None
-        if await asyncio.to_thread(path.exists):
-            json_channel = await asyncio.to_thread(load_json, path)
-
-        with SessionLocal() as session:
-            row = session.query(ChannelMeta).filter(ChannelMeta.id == channel_id).one_or_none()
-
-        if row:
-            return self._build_channel_from_metadata_row(row)
-
-        return json_channel
+        return await asyncio.to_thread(self._load_channel_from_db, channel_id)
 
     async def get_channel_runtime(self, channel_id: str):
-        if settings.METADATA_DB_ENABLED:
-            return await asyncio.to_thread(self._load_channel_from_db, channel_id)
-
-        path = self._get_path(channel_id)
-        if not await asyncio.to_thread(path.exists):
-            return None
-        return await asyncio.to_thread(load_json, path)
+        return await asyncio.to_thread(self._load_channel_from_db, channel_id)
 
     def _has_valid_snapshot(self, channel: dict) -> bool:
         snapshot_path = str(channel.get("snapshot_path") or "").strip()
@@ -1280,7 +1162,7 @@ class ChannelService:
         output_path = self.snapshots_dir / filename
         cv2.imwrite(str(output_path), frame)
 
-        item = self._load_channel_from_db(channel_id) if settings.METADATA_DB_ENABLED else self._load_channel_from_legacy_json(channel_id)
+        item = self._load_channel_from_db(channel_id)
         if not item:
             raise ValueError("Channel not found")
         item["snapshot_url"] = f"/static/snapshots/{filename}"
@@ -1415,10 +1297,8 @@ class ChannelService:
             await self.play(channel_id)
             return await self.get_channel(channel_id)
         except Exception as exc:
-            path = self._get_path(channel_id)
-
             def _mark_error():
-                latest = self._load_channel_from_db(channel_id) if settings.METADATA_DB_ENABLED else self._load_channel_from_legacy_json(channel_id)
+                latest = self._load_channel_from_db(channel_id)
                 if not latest:
                     latest = dict(item)
                 latest.setdefault("ext", {})["auto_play_error"] = str(exc)
@@ -1449,7 +1329,6 @@ class ChannelService:
         return await self.get_channel(channel_id)
 
     async def delete_channel(self, channel_id: str):
-        path = self._get_path(channel_id)
         channel_view = await self.get_channel(channel_id)
         if not channel_view:
             return None
@@ -1480,9 +1359,16 @@ class ChannelService:
             for task_id in task_ids_to_delete:
                 delete_json_document(settings.TASKS_DIR / f"{task_id}.json", task_id)
 
-            if path.exists():
-                path.unlink()
-            delete_json_document(path, item.get("id"))
+            (self.channels_dir / f"{channel_id}.json").unlink(missing_ok=True)
+
+            with SessionLocal() as session:
+                session.query(ChannelZoneMeta).filter(
+                    ChannelZoneMeta.channel_id == channel_id
+                ).delete(synchronize_session=False)
+                session.query(ChannelMeta).filter(
+                    ChannelMeta.id == channel_id
+                ).delete(synchronize_session=False)
+                session.commit()
             return item
 
         deleted = await asyncio.to_thread(_delete)
@@ -1503,7 +1389,7 @@ class ChannelService:
         adapter = self._build_adapter(node)
 
         def _play():
-            item = self._load_channel_from_db(channel_id) if settings.METADATA_DB_ENABLED else self._load_channel_from_legacy_json(channel_id)
+            item = self._load_channel_from_db(channel_id)
             if not item:
                 raise ValueError("Channel not found")
             try:
@@ -1560,6 +1446,50 @@ class ChannelService:
 
         return await asyncio.to_thread(_play)
 
+    async def play_channel_payload(self, channel: dict):
+        """Start browser playback for an owner-supplied channel without persisting it."""
+        item = deepcopy(channel)
+        channel_id = str(item.get("id") or "").strip()
+        if not channel_id:
+            raise ValueError("Channel id is required")
+        for field in ("app", "stream", "source_url"):
+            if not str(item.get(field) or "").strip():
+                raise ValueError(f"Channel {field} is not configured")
+
+        node = await self.media_node_service.get_node(item.get("media_node_id")) if item.get("media_node_id") else None
+        adapter = self._build_adapter(node)
+
+        def _play_payload():
+            try:
+                zlm_result = adapter.add_stream_proxy(item["app"], item["stream"], item["source_url"])
+                zlm_code = zlm_result.get("code")
+                zlm_msg = str(zlm_result.get("msg") or zlm_result.get("message") or "")
+                if zlm_code != 0:
+                    if "already exists" not in zlm_msg.lower():
+                        raise ValueError(zlm_msg or str(zlm_result))
+                    zlm_result = {**zlm_result, "already_exists": True}
+
+                browser_transcode = self._start_browser_transcode(node, item)
+                browser_urls = None
+                browser_ready = bool((browser_transcode.get("inspect_rtmp") or {}).get("data")) and not browser_transcode.get("error")
+                if browser_transcode.get("enabled") and browser_transcode.get("stream") and browser_ready:
+                    browser_urls = adapter.build_play_urls(
+                        browser_transcode.get("app", item["app"]),
+                        browser_transcode.get("stream"),
+                        item.get("media_node_id"),
+                    )
+                return {
+                    "channel_id": channel_id,
+                    "status": "playing",
+                    "zlm_result": zlm_result,
+                    "urls": adapter.build_play_urls(item["app"], item["stream"], item.get("media_node_id")),
+                    "browser_urls": browser_urls,
+                }
+            except Exception as exc:
+                raise ValueError(f"Failed to start stream proxy: {exc}") from exc
+
+        return await asyncio.to_thread(_play_payload)
+
     async def stop(self, channel_id: str):
         channel = await self.get_channel_runtime(channel_id)
         if not channel:
@@ -1569,7 +1499,7 @@ class ChannelService:
         adapter = self._build_adapter(node)
 
         def _stop():
-            item = self._load_channel_from_db(channel_id) if settings.METADATA_DB_ENABLED else self._load_channel_from_legacy_json(channel_id)
+            item = self._load_channel_from_db(channel_id)
             if not item:
                 raise ValueError("Channel not found")
             try:

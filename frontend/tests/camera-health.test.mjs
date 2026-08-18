@@ -22,3 +22,10 @@ test('camera health page is independent from task algorithm configuration', () =
   assert.match(source, /摄像头扭转角度识别/)
   assert.doesNotMatch(source, /task_algorithms|TaskEditorModal|算法区域/)
 })
+
+test('camera health menu is controlled by a disabled-by-default feature flag', () => {
+  const appSource = fs.readFileSync(path.join(root, 'src/App.vue'), 'utf8')
+
+  assert.match(appSource, /cameraHealth: import\.meta\.env\.VITE_SHOW_CAMERA_HEALTH_MENU === 'true'/)
+  assert.match(appSource, /v-if="menuVisibility\[item\.key\]"/)
+})

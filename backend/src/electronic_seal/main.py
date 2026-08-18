@@ -49,6 +49,7 @@ upload_worker = _build_upload_worker()
 async def startup_electronic_seal_worker():
     await asyncio.to_thread(ensure_electronic_seal_schema)
     await asyncio.to_thread(electronic_seal_manager.restore_enabled_channels)
+    await asyncio.to_thread(electronic_seal_manager.start_online_status_scheduler)
     if upload_worker is not None:
         upload_worker.start()
 

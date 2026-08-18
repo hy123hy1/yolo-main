@@ -43,6 +43,17 @@ export interface ElectronicSealStatus {
   configs?: Array<ElectronicSealConfig & { state?: { status?: string } | null }>
 }
 
+export interface ElectronicSealChannel {
+  id: string
+  name?: string | null
+  type?: string | null
+  source_url?: string | null
+  app?: string | null
+  stream?: string | null
+  is_online?: boolean
+  is_playing?: boolean
+}
+
 export interface ElectronicSealProfile {
   channel_id: string
   role: 'vehicle_entry' | 'dispatch_room'
@@ -51,12 +62,30 @@ export interface ElectronicSealProfile {
   initialized_at?: string | null
 }
 
+export interface ElectronicSealModel {
+  model_id: string
+  name?: string | null
+  version?: string | null
+  source?: string | null
+  description?: string | null
+  tags?: string[]
+  classes?: string[]
+  weights_path?: string | null
+  file_size?: number | null
+  file_size_mb?: number | null
+  job_id?: string | null
+  confidence?: number | null
+  alert_interval?: number | null
+  created_at?: string | null
+  updated_at?: string | null
+}
+
 export interface ElectronicSealEvent {
   id: string
   channel_id: string
   algorithm_type: ElectronicSealAlgorithm
   event_type: string
-  severity: string
+  severity: string | null
   started_at?: string
   ended_at?: string | null
   duration_seconds?: number | null
@@ -64,6 +93,9 @@ export interface ElectronicSealEvent {
   status?: string
   upload_status?: string
   upload_job_id?: string | null
+  upload_target?: string | null
+  snapshot_url?: string | null
+  video_url?: string | null
   evidence_snapshot_path?: string | null
   evidence_video_path?: string | null
   metrics_json?: Record<string, unknown>
@@ -76,11 +108,26 @@ export const listElectronicSealConfigs = async (channelId?: string) => {
   return data as { items: ElectronicSealConfig[]; profiles?: ElectronicSealProfile[] }
 }
 
+export const listElectronicSealChannels = async () => {
+  const { data } = await electronicSealApi.get('/electronic-seal/channels')
+  return data as { items: ElectronicSealChannel[] }
+}
+
+export const startElectronicSealChannelPlay = async (channelId: string) => {
+  const { data } = await electronicSealApi.post(`/electronic-seal/channels/${channelId}/play`)
+  return data
+}
+
 export const listElectronicSealProfiles = async (channelId?: string) => {
   const { data } = await electronicSealApi.get('/electronic-seal/profiles', {
     params: channelId ? { channel_id: channelId } : undefined,
   })
   return data as { items: ElectronicSealProfile[] }
+}
+
+export const listElectronicSealModels = async () => {
+  const { data } = await electronicSealApi.get('/electronic-seal/models')
+  return data as { models: ElectronicSealModel[] }
 }
 
 export const getElectronicSealOverview = async () => {
@@ -129,5 +176,13 @@ export const retryElectronicSealUpload = async (jobId: string) => {
   return data
 }
 
-export const electronicSealEvidenceUrl = (eventId: string, kind: 'snapshot' | 'video') =>
-  `${electronicSealApi.defaults.baseURL}/electronic-seal/events/${eventId}/evidence?kind=${kind}`
+export const electronicSealEvidenceUrl = (
+  eventIdOrUrl: string | null | undefined,
+  kind?: 'snapshot' | 'video',
+) => {
+  if (!eventIdOrUrl) return ''
+  const path = kind
+    ? `/electronic-seal/events/${eventIdOrUrl}/evidence?kind=${kind}`
+    : eventIdOrUrl
+  return `${electronicSealApi.defaults.baseURL}${path.startsWith('/') ? path : `/${path}`}`
+}

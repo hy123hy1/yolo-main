@@ -14,7 +14,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from src.core.settings import settings
-from src.db.models import Base, ChannelMeta, TaskMeta
+from src.db.models import Base, ChannelMeta, ElectronicSealChannelMeta, TaskMeta
 from src.services import metadata_db_sync
 from src.services import wvp_service as wvp_service_module
 from src.services.platform_storage import save_json
@@ -135,6 +135,7 @@ class WVPServiceTest(unittest.TestCase):
                             "app": "rtp",
                             "stream": stream_id,
                             "rtsp": f"rtsp://192.168.1.36:554/rtp/{stream_id}?videoCodec=H264",
+                            "flv": f"http://192.168.1.36/rtp/{stream_id}.live.flv",
                             "mediaInfo": {"online": True, "videoCodec": "H264", "stream": stream_id},
                         },
                     }
@@ -148,19 +149,22 @@ class WVPServiceTest(unittest.TestCase):
         self.assertEqual(refreshed["source_url"], recorder_source)
         self.assertEqual(refreshed["source_type"], "rtsp")
         self.assertEqual(refreshed["stream"], stream_id)
+        self.assertEqual(refreshed["flv"], f"http://192.168.1.36/rtp/{stream_id}.live.flv")
         self.assertEqual(
             refreshed["ext"]["upstream"]["play_info"]["rtsp"],
             f"rtsp://192.168.1.36:554/rtp/{stream_id}?videoCodec=H264",
         )
 
     @patch("src.services.wvp_service.urlopen")
-    def test_sync_channels_hydrates_missing_online_channel_play_info(self, mock_urlopen):
+    def test_sync_channels_defers_missing_online_channel_play_info(self, mock_urlopen):
         from src.services.wvp_service import WVPService
 
         stream_id = "34020000001110000121_34020000001320000002"
+        requested_urls: list[str] = []
 
         def fake_urlopen(request, timeout=0):
             url = request.full_url
+            requested_urls.append(url)
             if "channel/list" in url:
                 return _FakeHTTPResponse(
                     {
@@ -174,6 +178,7 @@ class WVPServiceTest(unittest.TestCase):
                                     "gbName": "Gate",
                                     "gbDeviceId": "34020000001320000002",
                                     "gbStatus": "ON",
+                                    "streamId": stream_id,
                                 }
                             ],
                         },
@@ -201,10 +206,22 @@ class WVPServiceTest(unittest.TestCase):
         service = WVPService()
         result = service.sync_channels(page=1, count=20)
 
+        self.assertEqual(len(requested_urls), 1)
+        self.assertIn("channel/list", requested_urls[0])
         self.assertEqual(result["synced"], 1)
         self.assertEqual(result["items"][0]["id"], stream_id)
-        self.assertEqual(result["items"][0]["source_url"], f"rtsp://192.168.1.36:554/rtp/{stream_id}")
+        self.assertIsNone(result["items"][0]["source_url"])
         self.assertEqual(result["items"][0]["stream"], stream_id)
+        self.assertEqual(result["items"][0]["gb_id"], "1")
+        self.assertEqual(len(result["_play_info_refresh_requests"]), 1)
+
+        refresh_result = service.refresh_play_info_requests(
+            result["_play_info_refresh_requests"]
+        )
+
+        self.assertEqual(refresh_result, {"refreshed": 1, "failed": 0, "skipped": 0})
+        self.assertEqual(len(requested_urls), 2)
+        self.assertIn("channel/play", requested_urls[1])
 
         channel_file = self.channels_dir / f"{stream_id}.json"
         self.assertTrue(channel_file.exists())
@@ -214,6 +231,7 @@ class WVPServiceTest(unittest.TestCase):
         self.assertEqual(payload["stream"], stream_id)
         self.assertEqual(payload["name"], "Gate")
         self.assertEqual(payload["type"], "wvp")
+        self.assertEqual(payload["gb_id"], "1")
         self.assertEqual(payload["ext"]["upstream"]["channel_db_id"], "1")
         self.assertEqual(payload["ext"]["upstream"]["play_info"]["stream"], stream_id)
 
@@ -274,6 +292,7 @@ class WVPServiceTest(unittest.TestCase):
                                     "gbName": "Gate",
                                     "gbDeviceId": "34020000001320000002",
                                     "gbStatus": "ON",
+                                    "stream": stream_id,
                                 }
                             ],
                         },
@@ -1361,6 +1380,394 @@ class WVPServiceMetadataDBTest(unittest.TestCase):
                 )
             )
             session.commit()
+
+    def _insert_electronic_seal_channel(
+        self,
+        channel_id: str,
+        stream: str,
+        upstream_channel_id: str,
+        *,
+        is_online: bool = True,
+        snapshot_url: str | None = None,
+        snapshot_path: str | None = None,
+    ) -> None:
+        source_url = f"rtsp://192.168.1.36:554/rtp/{stream}"
+        payload = {
+            "id": channel_id,
+            "device_id": f"device-{channel_id}",
+            "name": f"seal-{channel_id}",
+            "type": "wvp",
+            "source_url": source_url,
+            "app": "rtp",
+            "stream": stream,
+            "media_node_id": None,
+            "is_online": is_online,
+            "is_playing": False,
+            "record_mode": "none",
+            "snapshot_url": snapshot_url,
+            "snapshot_path": snapshot_path,
+            "created_at": "2026-08-10 09:00:00",
+            "updated_at": "2026-08-10 09:00:00",
+            "ext": {
+                "zones": [],
+                "upstream": {
+                    "platform": "wvp",
+                    "channel_db_id": upstream_channel_id,
+                    "source_type": "rtsp",
+                    "online": is_online,
+                    "play_info": {
+                        "stream": stream,
+                        "rtsp": source_url,
+                    },
+                },
+            },
+        }
+        with self.session_local() as session:
+            session.add(
+                ElectronicSealChannelMeta(
+                    id=channel_id,
+                    device_id=payload["device_id"],
+                    name=payload["name"],
+                    type="wvp",
+                    source_url=source_url,
+                    app="rtp",
+                    stream=stream,
+                    is_online=is_online,
+                    is_playing=False,
+                    record_mode="none",
+                    snapshot_url=snapshot_url,
+                    snapshot_path=snapshot_path,
+                    raw_json=payload,
+                )
+            )
+            session.commit()
+
+    def test_wvp_update_does_not_overwrite_electronic_seal_snapshot_fields(self):
+        from src.services.wvp_service import WVPService
+
+        channel_id = "seal-channel"
+        stream = "34020000001110000121_34020000001320000002"
+        snapshot_url = "/electronic-seal/channels/seal-channel/snapshot/image?v=456"
+        snapshot_path = "/app/data/electronic_seal/snapshots/channel_seal.jpg"
+        self._insert_electronic_seal_channel(
+            channel_id,
+            stream,
+            "seal-upstream",
+            snapshot_url=snapshot_url,
+            snapshot_path=snapshot_path,
+        )
+
+        result = WVPService()._update_electronic_seal_channel(
+            channel_id,
+            {
+                "id": channel_id,
+                "stream": stream,
+                "name": "seal-updated",
+                "snapshot_url": "/static/snapshots/stale.jpg",
+                "snapshot_path": "/app/data/snapshots/stale.jpg",
+                "ext": {"upstream": {"platform": "wvp"}},
+            },
+        )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result["snapshot_url"], snapshot_url)
+        self.assertEqual(result["snapshot_path"], snapshot_path)
+        with self.session_local() as session:
+            row = session.get(ElectronicSealChannelMeta, channel_id)
+            self.assertEqual(row.snapshot_url, snapshot_url)
+            self.assertEqual(row.snapshot_path, snapshot_path)
+
+    def test_wvp_update_persists_electronic_seal_flv_column(self):
+        from src.services.wvp_service import WVPService
+
+        channel_id = "seal-channel"
+        stream = "34020000001110000121_34020000001320000002"
+        flv = f"http://media.example/rtp/{stream}.live.flv"
+        self._insert_electronic_seal_channel(channel_id, stream, "seal-upstream")
+
+        result = WVPService()._update_electronic_seal_channel(
+            channel_id,
+            {
+                "id": channel_id,
+                "stream": stream,
+                "flv": flv,
+                "ext": {"upstream": {"platform": "wvp"}},
+            },
+        )
+
+        self.assertEqual(result["flv"], flv)
+        with self.session_local() as session:
+            row = session.get(ElectronicSealChannelMeta, channel_id)
+            self.assertEqual(row.flv, flv)
+
+    def test_wvp_update_does_not_overwrite_configured_electronic_seal_flv(self):
+        from src.services.wvp_service import WVPService
+
+        channel_id = "seal-channel"
+        stream = "34020000001110000001_34020000001320000024"
+        configured_flv = f"http://public.example:8008/rtp/{stream}.live.flv"
+        wvp_flv = f"http://192.168.60.61:80/rtp/{stream}.live.flv"
+        self._insert_electronic_seal_channel(channel_id, stream, "seal-upstream")
+        with self.session_local() as session:
+            row = session.get(ElectronicSealChannelMeta, channel_id)
+            row.flv = configured_flv
+            session.commit()
+
+        result = WVPService()._update_electronic_seal_channel(
+            channel_id,
+            {
+                "id": channel_id,
+                "stream": stream,
+                "flv": wvp_flv,
+                "ext": {"upstream": {"platform": "wvp"}},
+            },
+        )
+
+        self.assertEqual(result["flv"], configured_flv)
+        with self.session_local() as session:
+            row = session.get(ElectronicSealChannelMeta, channel_id)
+            self.assertEqual(row.flv, configured_flv)
+
+    @patch("src.services.wvp_service.urlopen")
+    def test_sync_channels_routes_resolved_stream_to_its_owner_table(self, mock_urlopen):
+        from src.services.wvp_service import WVPService
+
+        seal_stream = "34020000001110000121_34020000001320000002"
+        ai_stream = "34020000001110000121_34020000001320000003"
+        seal_snapshot_url = "/electronic-seal/channels/seal-channel/snapshot/image?v=123"
+        seal_snapshot_path = "/app/data/electronic_seal/snapshots/channel_seal.jpg"
+        self._insert_electronic_seal_channel(
+            "seal-channel",
+            seal_stream,
+            "old-seal-upstream",
+            snapshot_url=seal_snapshot_url,
+            snapshot_path=seal_snapshot_path,
+        )
+
+        def fake_urlopen(request, timeout=0):
+            url = request.full_url
+            if "channel/list" in url:
+                return _FakeHTTPResponse(
+                    {
+                        "data": {
+                            "total": 2,
+                            "list": [
+                                {
+                                    "gbId": "seal-upstream",
+                                    "gbName": "seal-updated",
+                                    "gbDeviceId": "seal-device",
+                                    "gbStatus": "ON",
+                                },
+                                {
+                                    "gbId": "ai-upstream",
+                                    "gbName": "video-ai",
+                                    "gbDeviceId": "ai-device",
+                                    "gbStatus": "ON",
+                                },
+                            ],
+                        }
+                    }
+                )
+            if "channel/play" in url:
+                stream = seal_stream if "seal-upstream" in url else ai_stream
+                return _FakeHTTPResponse(
+                    {
+                        "data": {
+                            "app": "rtp",
+                            "stream": stream,
+                            "rtsp": f"rtsp://192.168.1.36:554/rtp/{stream}",
+                            "mediaInfo": {"online": True, "stream": stream},
+                        }
+                    }
+                )
+            raise AssertionError(f"Unexpected URL: {url}")
+
+        mock_urlopen.side_effect = fake_urlopen
+
+        service = WVPService()
+        result = service.sync_channels(page=1, count=20)
+
+        self.assertEqual(result["synced"], 0)
+        self.assertEqual(len(result["_play_info_refresh_requests"]), 2)
+        self.assertEqual(mock_urlopen.call_count, 1)
+
+        refresh_result = service.refresh_play_info_requests(
+            result["_play_info_refresh_requests"]
+        )
+
+        self.assertEqual(refresh_result, {"refreshed": 2, "failed": 0, "skipped": 0})
+        with self.session_local() as session:
+            seal_row = session.get(ElectronicSealChannelMeta, "seal-channel")
+            seal_duplicate = (
+                session.query(ChannelMeta).filter(ChannelMeta.stream == seal_stream).one_or_none()
+            )
+            ai_row = session.query(ChannelMeta).filter(ChannelMeta.stream == ai_stream).one_or_none()
+
+        self.assertIsNotNone(seal_row)
+        self.assertEqual(seal_row.name, "seal-updated")
+        self.assertEqual(seal_row.snapshot_url, seal_snapshot_url)
+        self.assertEqual(seal_row.snapshot_path, seal_snapshot_path)
+        self.assertIsNone(seal_duplicate)
+        self.assertIsNotNone(ai_row)
+        self.assertFalse((self.channels_dir / "seal-channel.json").exists())
+        self.assertTrue((self.channels_dir / f"{ai_stream}.json").exists())
+
+    @patch("src.services.wvp_service.urlopen")
+    def test_sync_channels_skips_unknown_channel_when_play_has_no_stream(self, mock_urlopen):
+        from src.services.wvp_service import WVPService
+
+        def fake_urlopen(request, timeout=0):
+            if "channel/list" in request.full_url:
+                return _FakeHTTPResponse(
+                    {
+                        "data": {
+                            "total": 1,
+                            "list": [
+                                {
+                                    "gbId": "unresolved-upstream",
+                                    "gbName": "unresolved",
+                                    "gbDeviceId": "unresolved-device",
+                                    "gbStatus": "ON",
+                                }
+                            ],
+                        }
+                    }
+                )
+            if "channel/play" in request.full_url:
+                raise AssertionError("sync_channels must not request play info")
+            raise AssertionError(f"Unexpected URL: {request.full_url}")
+
+        mock_urlopen.side_effect = fake_urlopen
+
+        result = WVPService().sync_channels(page=1, count=20)
+
+        self.assertEqual(result["synced"], 0)
+        self.assertEqual(result["items"], [])
+        self.assertEqual(len(result["_play_info_refresh_requests"]), 1)
+        self.assertEqual(
+            result["_play_info_refresh_requests"][0]["upstream_channel_id"],
+            "unresolved-upstream",
+        )
+        self.assertEqual(result["missing_cleanup"], {"deleted": 0, "marked_offline": 0})
+        with self.session_local() as session:
+            self.assertEqual(session.query(ChannelMeta).count(), 0)
+            self.assertEqual(session.query(ElectronicSealChannelMeta).count(), 0)
+        self.assertEqual(list(self.channels_dir.glob("*.json")), [])
+
+    @patch("src.services.wvp_service.urlopen")
+    def test_sync_channels_keeps_electronic_seal_stream_when_offline_play_is_empty(self, mock_urlopen):
+        from src.services.wvp_service import WVPService
+
+        seal_stream = "34020000001110000121_34020000001320000002"
+        self._insert_electronic_seal_channel(
+            "seal-channel",
+            seal_stream,
+            "seal-upstream",
+        )
+
+        def fake_urlopen(request, timeout=0):
+            if "channel/list" in request.full_url:
+                return _FakeHTTPResponse(
+                    {
+                        "data": {
+                            "total": 1,
+                            "list": [
+                                {
+                                    "gbId": "seal-upstream",
+                                    "gbName": "seal-offline",
+                                    "gbDeviceId": "seal-device",
+                                    "gbStatus": "OFF",
+                                }
+                            ],
+                        }
+                    }
+                )
+            if "channel/play" in request.full_url:
+                return _FakeHTTPResponse({"data": {}})
+            raise AssertionError(f"Unexpected URL: {request.full_url}")
+
+        mock_urlopen.side_effect = fake_urlopen
+
+        result = WVPService().sync_channels(page=1, count=20)
+
+        self.assertEqual(result["synced"], 1)
+        self.assertEqual(result["items"][0]["_sync_owner"], "electronic_seal")
+        self.assertEqual(result["items"][0]["stream"], seal_stream)
+        with self.session_local() as session:
+            seal_row = session.get(ElectronicSealChannelMeta, "seal-channel")
+            self.assertFalse(seal_row.is_online)
+            self.assertEqual(seal_row.stream, seal_stream)
+            self.assertEqual(session.query(ChannelMeta).count(), 0)
+
+    @patch("src.services.wvp_service.urlopen")
+    def test_resolved_stream_does_not_use_stale_electronic_seal_upstream_binding(self, mock_urlopen):
+        from src.services.wvp_service import WVPService
+
+        old_seal_stream = "34020000001110000121_34020000001320000002"
+        new_video_ai_stream = "34020000001110000121_34020000001320000099"
+        self._insert_electronic_seal_channel(
+            "seal-channel",
+            old_seal_stream,
+            "reused-upstream",
+        )
+        with self.session_local() as session:
+            row = session.get(ElectronicSealChannelMeta, "seal-channel")
+            row.source_url = None
+            row.raw_json = {**(row.raw_json or {}), "source_url": None}
+            session.commit()
+
+        def fake_urlopen(request, timeout=0):
+            if "channel/list" in request.full_url:
+                return _FakeHTTPResponse(
+                    {
+                        "data": {
+                            "total": 1,
+                            "list": [
+                                {
+                                    "gbId": "reused-upstream",
+                                    "gbName": "reassigned-video-ai",
+                                    "gbDeviceId": "new-device",
+                                    "gbStatus": "ON",
+                                }
+                            ],
+                        }
+                    }
+                )
+            if "channel/play" in request.full_url:
+                return _FakeHTTPResponse(
+                    {
+                        "data": {
+                            "app": "rtp",
+                            "stream": new_video_ai_stream,
+                            "rtsp": f"rtsp://192.168.1.36:554/rtp/{new_video_ai_stream}",
+                            "mediaInfo": {"online": True, "stream": new_video_ai_stream},
+                        }
+                    }
+                )
+            raise AssertionError(f"Unexpected URL: {request.full_url}")
+
+        mock_urlopen.side_effect = fake_urlopen
+
+        service = WVPService()
+        result = service.sync_channels(page=1, count=20)
+
+        self.assertEqual(result["items"], [])
+        self.assertEqual(len(result["_play_info_refresh_requests"]), 1)
+
+        refresh_result = service.refresh_play_info_requests(
+            result["_play_info_refresh_requests"]
+        )
+
+        self.assertEqual(refresh_result, {"refreshed": 1, "failed": 0, "skipped": 0})
+        with self.session_local() as session:
+            seal_row = session.get(ElectronicSealChannelMeta, "seal-channel")
+            video_ai_row = (
+                session.query(ChannelMeta)
+                .filter(ChannelMeta.stream == new_video_ai_stream)
+                .one_or_none()
+            )
+        self.assertEqual(seal_row.stream, old_seal_stream)
+        self.assertIsNotNone(video_ai_row)
 
     @patch("src.services.wvp_service.urlopen")
     def test_sync_channels_rebinds_metadata_bound_duplicate_tasks_and_removes_duplicate_channel(self, mock_urlopen):

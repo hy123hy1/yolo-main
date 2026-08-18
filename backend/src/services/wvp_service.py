@@ -7,12 +7,14 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode
+from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
 from src.core.settings import settings
 from src.db.database import SessionLocal
 from src.db.models import (
     ChannelMeta,
+    ElectronicSealChannelMeta,
     EventMeta,
     RecordingMeta,
     TaskAlgorithmMetricHistoryMeta,
@@ -87,8 +89,11 @@ class WVPService:
         item = dict(row.raw_json or {})
         item.setdefault("id", row.id)
         item.pop("ai_enabled", None)
+        if row.gb_id is not None:
+            item["gb_id"] = row.gb_id
         item["stream"] = row.stream
         item["source_url"] = row.source_url
+        item["flv"] = getattr(row, "flv", None)
         item["name"] = row.name
         item["type"] = row.type
         item["is_online"] = row.is_online
@@ -97,6 +102,8 @@ class WVPService:
         item["snapshot_url"] = row.snapshot_url
         item["snapshot_path"] = row.snapshot_path
         item["media_node_id"] = row.media_node_id
+        if isinstance(row, ElectronicSealChannelMeta):
+            item["flv"] = row.flv
         item.setdefault("ext", {})
         item["ext"].pop("ai_config", None)
         return item
@@ -108,6 +115,53 @@ class WVPService:
             return [self._build_channel_item_from_row(row) for row in rows]
 
         return [item for item in list_json_items(self.channels_dir) if item.get("type") == "wvp"]
+
+    def _list_existing_electronic_seal_channels(self) -> list[dict[str, Any]]:
+        if not settings.METADATA_DB_ENABLED:
+            return []
+        with SessionLocal() as session:
+            rows = session.query(ElectronicSealChannelMeta).all()
+        return [self._build_channel_item_from_row(row) for row in rows]
+
+    def _update_electronic_seal_channel(
+        self,
+        channel_id: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        if not settings.METADATA_DB_ENABLED:
+            return None
+        with SessionLocal() as session:
+            row = session.get(ElectronicSealChannelMeta, str(channel_id).strip())
+            if row is None:
+                return None
+            for field in [
+                "device_id",
+                "gb_id",
+                "media_node_id",
+                "name",
+                "type",
+                "source_url",
+                "app",
+                "stream",
+                "is_online",
+                "is_playing",
+                "record_mode",
+                "webrtc_api",
+                "flv",
+                "hls",
+            ]:
+                if field in payload:
+                    if field == "flv" and row.flv:
+                        continue
+                    setattr(row, field, copy.deepcopy(payload[field]))
+            row.updated_at = datetime.now()
+            raw_payload = copy.deepcopy(payload)
+            raw_payload["snapshot_url"] = row.snapshot_url
+            raw_payload["snapshot_path"] = row.snapshot_path
+            row.raw_json = raw_payload
+            session.commit()
+            session.refresh(row)
+            return self._build_channel_item_from_row(row)
 
     def _normalize_match_text(self, value: Any) -> str:
         return str(value or "").strip().casefold()
@@ -423,10 +477,16 @@ class WVPService:
         source_url, _ = self._pick_source_url(play_info)
         return bool(source_url)
 
-    def _clear_offline_playback_fields(self, payload: dict[str, Any]) -> dict[str, Any]:
+    def _clear_offline_playback_fields(
+        self,
+        payload: dict[str, Any],
+        *,
+        preserve_stream: bool = False,
+    ) -> dict[str, Any]:
         payload["source_url"] = None
         payload["source_type"] = "unknown"
-        payload["stream"] = ""
+        if not preserve_stream:
+            payload["stream"] = ""
         payload["is_online"] = False
         payload["is_playing"] = False
         payload["webrtc_api"] = None
@@ -455,22 +515,15 @@ class WVPService:
                     return True
         return False
 
-    def _get_play_info_safely(self, upstream_channel_id: str) -> dict[str, Any]:
-        try:
-            return self.get_play_info(upstream_channel_id)
-        except Exception as exc:
-            logger.warning(
-                "[WVPSync] play info probe failed channel_db_id=%s error=%s",
-                upstream_channel_id,
-                exc,
-            )
-            return {}
-
     def _extract_stream_id(self, play_info: dict[str, Any], existing: dict[str, Any] | None = None) -> str:
         media_info = play_info.get("mediaInfo") or {}
         return str(
             play_info.get("stream")
+            or play_info.get("streamId")
+            or play_info.get("stream_id")
             or media_info.get("stream")
+            or media_info.get("streamId")
+            or media_info.get("stream_id")
             or (existing or {}).get("stream")
             or ""
         ).strip()
@@ -500,7 +553,15 @@ class WVPService:
                 return True
         return False
 
-    def _build_channel_payload(self, remote_item: dict[str, Any], play_info: dict[str, Any], existing: dict[str, Any] | None) -> dict[str, Any]:
+    def _build_channel_payload(
+        self,
+        remote_item: dict[str, Any],
+        play_info: dict[str, Any],
+        existing: dict[str, Any] | None,
+        *,
+        preserve_stream_on_offline: bool = False,
+        stream_hint: str = "",
+    ) -> dict[str, Any]:
         upstream_channel_id = self._extract_upstream_channel_id(remote_item)
         media_info = play_info.get("mediaInfo") or {}
         explicit_offline = self._is_remote_status_off(remote_item, play_info)
@@ -509,7 +570,10 @@ class WVPService:
         )
         effective_play_info = play_info if online else {}
         source_url, source_type = self._pick_source_url(effective_play_info)
-        stream = self._extract_stream_id(effective_play_info, existing if online else None)
+        stream = self._extract_stream_id(
+            effective_play_info,
+            existing if (online or preserve_stream_on_offline) else None,
+        ) or str(stream_hint or "").strip()
         existing_channel_id = str((existing or {}).get("id") or "").strip()
         channel_id = existing_channel_id or stream or upstream_channel_id or generate_id("ch")
         current_time = now_iso()
@@ -525,6 +589,7 @@ class WVPService:
         payload = {
             "id": channel_id,
             "device_id": str(remote_item.get("deviceId") or remote_item.get("gbDeviceId") or remote_item.get("device_id") or "") or None,
+            "gb_id": upstream_channel_id or None,
             "name": channel_name,
             "type": "wvp",
             "source_url": resolved_source_url,
@@ -536,6 +601,7 @@ class WVPService:
             "record_mode": (existing or {}).get("record_mode", "none"),
             "snapshot_url": (existing or {}).get("snapshot_url"),
             "snapshot_path": (existing or {}).get("snapshot_path"),
+            "flv": effective_play_info.get("flv") or (existing or {}).get("flv"),
             "created_at": (existing or {}).get("created_at") or current_time,
             "updated_at": current_time,
             "ext": {
@@ -555,7 +621,10 @@ class WVPService:
             },
         }
         if not online:
-            payload = self._clear_offline_playback_fields(payload)
+            payload = self._clear_offline_playback_fields(
+                payload,
+                preserve_stream=preserve_stream_on_offline,
+            )
         return payload
 
     def _sync_result_can_cleanup_missing_channels(self, remote: dict[str, Any], page: int, query: str | None) -> bool:
@@ -624,30 +693,24 @@ class WVPService:
             "marked_offline": marked_offline,
         }
 
-    def _is_missing_play_source(self, item: dict[str, Any] | None) -> bool:
-        if not item:
-            return True
-        return not str(item.get("source_url") or "").strip() or not str(item.get("stream") or "").strip()
-
-    def _should_hydrate_play_info(
-        self,
-        remote_item: dict[str, Any],
-        existing: dict[str, Any] | None,
-        play_info: dict[str, Any],
-    ) -> bool:
-        if play_info:
-            return False
-        if self._is_remote_status_off(remote_item):
-            return True
-        if not self._is_remote_online(remote_item, {}):
-            return False
-        return self._is_missing_play_source(existing)
-
     def sync_channels(self, page: int = 1, count: int = 100, query: str | None = None) -> dict[str, Any]:
         remote = self.list_remote_channels(page=page, count=count, query=query)
         synced_items: list[dict[str, Any]] = []
+        play_info_refresh_requests: list[dict[str, Any]] = []
         existing_wvp_channels = self._list_existing_wvp_channels()
         original_existing_wvp_channels = list(existing_wvp_channels)
+        existing_electronic_seal_channels = self._list_existing_electronic_seal_channels()
+        electronic_seal_by_stream = {
+            str(item.get("stream") or "").strip(): item
+            for item in existing_electronic_seal_channels
+            if str(item.get("stream") or "").strip()
+        }
+        electronic_seal_by_upstream_id: dict[str, dict[str, Any]] = {}
+        for item in existing_electronic_seal_channels:
+            upstream = ((item.get("ext") or {}).get("upstream") or {})
+            upstream_id = str(upstream.get("channel_db_id") or "").strip()
+            if upstream_id:
+                electronic_seal_by_upstream_id.setdefault(upstream_id, item)
         remote_items = list(remote.get("items") or [])
         remote_upstream_channel_ids: set[str] = set()
         synced_channel_ids: set[str] = set()
@@ -660,12 +723,9 @@ class WVPService:
             if not upstream_channel_id:
                 continue
             remote_upstream_channel_ids.add(str(upstream_channel_id).strip())
-            play_info: dict[str, Any] = (
-                self._get_play_info_safely(upstream_channel_id)
-                if self._is_remote_status_off(remote_item)
-                else {}
-            )
-            stream_id = self._extract_stream_id(play_info)
+            remote_stream_id = self._extract_stream_id(remote_item)
+            play_info: dict[str, Any] = {}
+            stream_id = remote_stream_id
             device_id = str(
                 remote_item.get("deviceId")
                 or remote_item.get("gbDeviceId")
@@ -692,26 +752,76 @@ class WVPService:
             }
             existing = self._select_canonical_existing_channel(candidates, stream_id, bound_channel_ids)
             existing = self._merge_existing_candidate_data(existing, candidates)
-            if self._should_hydrate_play_info(remote_item, existing, play_info):
-                play_info = self._get_play_info_safely(upstream_channel_id)
-                hydrated_stream_id = self._extract_stream_id(play_info)
-                if hydrated_stream_id and hydrated_stream_id != stream_id:
-                    stream_id = hydrated_stream_id
-                    candidates = self._find_existing_wvp_candidates(
-                        stream_id,
-                        upstream_channel_id,
-                        device_id,
-                        channel_name,
-                        existing_wvp_channels,
+            seal_existing = electronic_seal_by_stream.get(stream_id) if stream_id else None
+            if seal_existing is None and self._is_remote_status_off(remote_item):
+                seal_existing = electronic_seal_by_upstream_id.get(
+                    str(upstream_channel_id).strip()
+                )
+
+            resolved_stream_id = (
+                stream_id
+                or str((existing or {}).get("stream") or "").strip()
+                or str((seal_existing or {}).get("stream") or "").strip()
+            )
+            resolved_seal = electronic_seal_by_stream.get(resolved_stream_id) if resolved_stream_id else None
+
+            if resolved_seal is not None:
+                payload = self._build_channel_payload(
+                    remote_item,
+                    play_info,
+                    resolved_seal,
+                    preserve_stream_on_offline=True,
+                    stream_hint=resolved_stream_id,
+                )
+                updated_seal = self._update_electronic_seal_channel(
+                    str(resolved_seal.get("id") or "").strip(),
+                    payload,
+                )
+                if updated_seal is None:
+                    logger.warning(
+                        "[WVPSync] electronic-seal owner disappeared channel_id=%s stream=%s",
+                        resolved_seal.get("id"),
+                        resolved_stream_id,
                     )
-                    bound_channel_ids = {
-                        str(item.get("id") or "").strip()
-                        for item in candidates
-                        if str(item.get("id") or "").strip() in bound_existing_channel_ids
-                    }
-                    existing = self._select_canonical_existing_channel(candidates, stream_id, bound_channel_ids)
-                    existing = self._merge_existing_candidate_data(existing, candidates)
-            payload = self._build_channel_payload(remote_item, play_info, existing)
+                    continue
+                electronic_seal_by_stream[resolved_stream_id] = updated_seal
+                synced_items.append({**updated_seal, "_sync_owner": "electronic_seal"})
+                if not self._is_remote_status_off(remote_item):
+                    play_info_refresh_requests.append({
+                        "channel_id": str(updated_seal.get("id") or "").strip(),
+                        "sync_owner": "electronic_seal",
+                        "upstream_channel_id": str(upstream_channel_id).strip(),
+                        "remote_item": copy.deepcopy(remote_item),
+                    })
+                continue
+
+            if settings.METADATA_DB_ENABLED and not resolved_stream_id and existing is None:
+                # Without a stable stream identity, do not invent a channel ID or
+                # let this unresolved WVP item trigger missing-channel cleanup.
+                synced_channel_ids.update(
+                    str(item.get("id") or "").strip()
+                    for item in candidates
+                    if str(item.get("id") or "").strip()
+                )
+                logger.warning(
+                    "[WVPSync] defer channel without resolved stream upstream_channel_id=%s",
+                    upstream_channel_id,
+                )
+                if not self._is_remote_status_off(remote_item):
+                    play_info_refresh_requests.append({
+                        "channel_id": None,
+                        "sync_owner": "unresolved",
+                        "upstream_channel_id": str(upstream_channel_id).strip(),
+                        "remote_item": copy.deepcopy(remote_item),
+                    })
+                continue
+
+            payload = self._build_channel_payload(
+                remote_item,
+                play_info,
+                existing,
+                stream_hint=resolved_stream_id,
+            )
             rebound_channel_ids = self._rebind_duplicate_channel_references(
                 payload["id"],
                 payload.get("name"),
@@ -721,7 +831,14 @@ class WVPService:
             save_json(channel_path, payload)
             protected_channel_ids = bound_channel_ids - rebound_channel_ids
             self._delete_duplicate_channels(candidates, payload["id"], protected_channel_ids)
-            synced_items.append(payload)
+            synced_items.append({**payload, "_sync_owner": "video_ai"})
+            if not self._is_remote_status_off(remote_item):
+                play_info_refresh_requests.append({
+                    "channel_id": str(payload.get("id") or "").strip(),
+                    "sync_owner": "video_ai",
+                    "upstream_channel_id": str(upstream_channel_id).strip(),
+                    "remote_item": copy.deepcopy(remote_item),
+                })
             synced_channel_ids.add(str(payload["id"]).strip())
             existing_wvp_channels = [
                 item
@@ -744,6 +861,179 @@ class WVPService:
             "total": remote.get("total", len(synced_items)),
             "items": synced_items,
             "missing_cleanup": missing_cleanup,
+            "_play_info_refresh_requests": play_info_refresh_requests,
+        }
+
+    def _load_electronic_seal_channel_by_id(self, channel_id: str) -> dict[str, Any] | None:
+        normalized_id = str(channel_id or "").strip()
+        if not normalized_id or not settings.METADATA_DB_ENABLED:
+            return None
+        with SessionLocal() as session:
+            row = session.get(ElectronicSealChannelMeta, normalized_id)
+        return self._build_channel_item_from_row(row) if row else None
+
+    def _save_play_info_payload(
+        self,
+        owner: str,
+        channel: dict[str, Any],
+        remote_item: dict[str, Any],
+        play_info: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        effective_remote_item = copy.deepcopy(remote_item)
+        if not play_info:
+            effective_remote_item["online"] = False
+            effective_remote_item["status"] = "OFF"
+
+        stream_hint = self._extract_stream_id(play_info, channel)
+        payload = self._build_channel_payload(
+            effective_remote_item,
+            play_info,
+            channel,
+            preserve_stream_on_offline=owner == "electronic_seal",
+            stream_hint=stream_hint,
+        )
+        if payload.get("is_online") and self.is_configured_recorder_rtsp(channel):
+            payload["source_url"] = channel.get("source_url")
+            payload["source_type"] = "rtsp"
+
+        if owner == "electronic_seal":
+            return self._update_electronic_seal_channel(
+                str(channel.get("id") or "").strip(),
+                payload,
+            )
+
+        save_json(self.channels_dir / f"{payload['id']}.json", payload)
+        return payload
+
+    def _refresh_play_info_request(self, refresh_request: dict[str, Any]) -> bool:
+        remote_item = copy.deepcopy(refresh_request.get("remote_item") or {})
+        upstream_channel_id = str(
+            refresh_request.get("upstream_channel_id")
+            or self._extract_upstream_channel_id(remote_item)
+            or ""
+        ).strip()
+        if not upstream_channel_id:
+            return False
+
+        play_info = self.get_play_info(upstream_channel_id)
+        owner = str(refresh_request.get("sync_owner") or "unresolved").strip()
+        channel_id = str(refresh_request.get("channel_id") or "").strip()
+
+        if owner == "electronic_seal" and channel_id:
+            channel = self._load_electronic_seal_channel_by_id(channel_id)
+            if channel:
+                return self._save_play_info_payload(
+                    "electronic_seal",
+                    channel,
+                    remote_item,
+                    play_info,
+                ) is not None
+
+        if owner == "video_ai" and channel_id:
+            channel = self._load_channel_by_id(channel_id)
+            if channel:
+                return self._save_play_info_payload(
+                    "video_ai",
+                    channel,
+                    remote_item,
+                    play_info,
+                ) is not None
+
+        stream_id = self._extract_stream_id(play_info)
+        if not stream_id:
+            return False
+
+        electronic_seal_by_stream = {
+            str(item.get("stream") or "").strip(): item
+            for item in self._list_existing_electronic_seal_channels()
+            if str(item.get("stream") or "").strip()
+        }
+        seal_channel = electronic_seal_by_stream.get(stream_id)
+        if seal_channel:
+            return self._save_play_info_payload(
+                "electronic_seal",
+                seal_channel,
+                remote_item,
+                play_info,
+            ) is not None
+
+        existing_wvp_channels = self._list_existing_wvp_channels()
+        device_id = str(
+            remote_item.get("deviceId")
+            or remote_item.get("gbDeviceId")
+            or remote_item.get("device_id")
+            or ""
+        ).strip()
+        channel_name = str(
+            remote_item.get("gbName")
+            or remote_item.get("name")
+            or remote_item.get("channelName")
+            or ""
+        ).strip()
+        candidates = self._find_existing_wvp_candidates(
+            stream_id,
+            upstream_channel_id,
+            device_id,
+            channel_name,
+            existing_wvp_channels,
+        )
+        bound_channel_ids = self._find_bound_channel_ids({
+            str(item.get("id") or "").strip()
+            for item in candidates
+            if str(item.get("id") or "").strip()
+        })
+        existing = self._select_canonical_existing_channel(
+            candidates,
+            stream_id,
+            bound_channel_ids,
+        )
+        existing = self._merge_existing_candidate_data(existing, candidates)
+        payload = self._build_channel_payload(
+            remote_item,
+            play_info,
+            existing,
+            stream_hint=stream_id,
+        )
+        rebound_channel_ids = self._rebind_duplicate_channel_references(
+            payload["id"],
+            payload.get("name"),
+            {str(item.get("id") or "").strip() for item in candidates},
+        )
+        save_json(self.channels_dir / f"{payload['id']}.json", payload)
+        self._delete_duplicate_channels(
+            candidates,
+            payload["id"],
+            bound_channel_ids - rebound_channel_ids,
+        )
+        return True
+
+    def refresh_play_info_requests(
+        self,
+        refresh_requests: list[dict[str, Any]],
+    ) -> dict[str, int]:
+        refreshed = 0
+        failed = 0
+        skipped = 0
+        for refresh_request in refresh_requests:
+            upstream_channel_id = str(
+                refresh_request.get("upstream_channel_id") or ""
+            ).strip()
+            try:
+                if self._refresh_play_info_request(refresh_request):
+                    refreshed += 1
+                else:
+                    skipped += 1
+            except Exception as exc:
+                failed += 1
+                logger.warning(
+                    "[WVPSync] background play info refresh failed upstream_channel_id=%s error=%s",
+                    upstream_channel_id,
+                    exc,
+                )
+        return {
+            "refreshed": refreshed,
+            "failed": failed,
+            "skipped": skipped,
         }
 
     def refresh_channel_source(self, channel: dict[str, Any]) -> dict[str, Any]:
@@ -766,8 +1056,14 @@ class WVPService:
         media_info = play_info.get("mediaInfo") or {}
         current_time = now_iso()
         refreshed = dict(channel)
-        refreshed["source_url"] = source_url or (refreshed.get("source_url") if not explicit_offline else None)
+        preserve_configured_source = self.is_configured_recorder_rtsp(channel)
+        refreshed["source_url"] = (
+            refreshed.get("source_url")
+            if preserve_configured_source
+            else source_url or (refreshed.get("source_url") if not explicit_offline else None)
+        )
         refreshed["source_type"] = source_type
+        refreshed["flv"] = effective_play_info.get("flv") or refreshed.get("flv")
         refreshed["app"] = effective_play_info.get("app") or media_info.get("app") or refreshed.get("app")
         refreshed["stream"] = effective_play_info.get("stream") or media_info.get("stream") or (refreshed.get("stream") if not explicit_offline else "")
         refreshed["is_online"] = False if explicit_offline else (
@@ -784,6 +1080,14 @@ class WVPService:
         })
         save_json(self.channels_dir / f"{refreshed['id']}.json", refreshed)
         return refreshed
+
+    @staticmethod
+    def is_configured_recorder_rtsp(channel: dict[str, Any]) -> bool:
+        source_url = str(channel.get("source_url") or "").strip()
+        if not source_url.lower().startswith("rtsp://"):
+            return False
+        parsed = urlparse(source_url)
+        return not parsed.path.casefold().startswith("/rtp/")
 
     def _load_channel_by_id(self, channel_id: str) -> dict[str, Any] | None:
         normalized_id = str(channel_id or "").strip()

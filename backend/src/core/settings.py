@@ -94,6 +94,7 @@ def _load_config_toml_to_environment(base_dir: Path) -> None:
     _set_env_if_absent("WVP_API_BASE", wvp.get("APIBase"))
     _set_env_if_absent("WVP_CHANNEL_LIST_PATH", wvp.get("ChannelListPath"))
     _set_env_if_absent("WVP_CHANNEL_PLAY_PATH", wvp.get("ChannelPlayPath"))
+    _set_env_if_absent("WVP_PUBLIC_FLV_BASE", wvp.get("PublicFLVBase"))
 
 
 class Settings(BaseSettings):
@@ -170,6 +171,7 @@ class Settings(BaseSettings):
     WVP_API_BASE: str = ""
     WVP_CHANNEL_LIST_PATH: str = "/api/common/channel/list"
     WVP_CHANNEL_PLAY_PATH: str = "/api/common/channel/play"
+    WVP_PUBLIC_FLV_BASE: str = ""
 
     METADATA_DB_ENABLED: bool = True
     METADATA_DB_STRICT: bool = False

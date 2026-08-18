@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
@@ -43,21 +42,16 @@ def configured_bindings(path: Path | str = DEFAULTS_FILE) -> list[dict[str, Any]
     return result
 
 
-def resolve_default_model_id(registry_dir: Path | str, model_name: str = DEFAULT_MODEL_NAME) -> str:
-    registry_path = Path(registry_dir)
-    matches: list[dict[str, Any]] = []
-    for metadata_path in sorted(registry_path.glob("*/model.json")):
-        try:
-            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
-            raise ValueError(f"failed to read model metadata: {metadata_path}") from exc
-        if metadata.get("name") == model_name:
-            matches.append(metadata)
-    if len(matches) != 1:
+def resolve_default_model_id(model_repository: Any, model_name: str = DEFAULT_MODEL_NAME) -> str:
+    finder = getattr(model_repository, "find_model_by_name", None)
+    if not callable(finder):
+        raise ValueError("electronic-seal model repository is not available")
+    model = finder(model_name)
+    if model is None:
         raise ValueError(
-            f"expected exactly one model named {model_name!r}, found {len(matches)}"
+            f"expected exactly one model named {model_name!r}, found 0"
         )
-    model_id = str(matches[0].get("model_id") or "").strip()
+    model_id = str(model.get("model_id") or "").strip()
     if not model_id:
         raise ValueError(f"model named {model_name!r} has no model_id")
     return model_id
@@ -99,7 +93,7 @@ def seed_defaults(
     defaults_path: Path | str = DEFAULTS_FILE,
 ) -> list[dict]:
     model_name = str((load_defaults(defaults_path).get("model") or {}).get("name") or DEFAULT_MODEL_NAME)
-    model_id = resolve_default_model_id(registry_dir, model_name)
+    model_id = resolve_default_model_id(store, model_name)
     defaults = role_defaults(role, defaults_path)
     return store.ensure_default_configs(
         str(channel_id),

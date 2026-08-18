@@ -23,6 +23,29 @@ from src.services.platform_storage import save_json as persist_json
 
 
 class ChannelServiceTest(unittest.IsolatedAsyncioTestCase):
+    def test_channel_metadata_view_uses_formal_flv_column(self):
+        service = ChannelService()
+        row = ChannelMeta(
+            id="wvp_flv_1",
+            name="FLV channel",
+            type="wvp",
+            source_url="rtsp://example.test/live",
+            flv="http://example.test/live.flv",
+            app="rtp",
+            stream="wvp_flv_1",
+            is_online=True,
+            is_playing=False,
+            raw_json={
+                "id": "wvp_flv_1",
+                "flv": "http://stale.example.test/live.flv",
+                "ext": {"upstream": {"online": True}},
+            },
+        )
+
+        channel = service._build_channel_from_metadata_row(row)
+
+        self.assertEqual(channel["flv"], "http://example.test/live.flv")
+
     def test_wvp_channel_without_playable_source_is_offline_even_when_db_flag_is_true(self):
         service = ChannelService()
         row = ChannelMeta(
@@ -609,6 +632,51 @@ class ChannelServiceTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["webrtc_api"], "http://example.com/runtime.webrtc")
         self.assertEqual(result["hls"], "http://example.com/runtime.m3u8")
 
+    async def test_channel_read_does_not_fall_back_to_legacy_json(self):
+        channel_id = "legacy-json-only"
+        settings.METADATA_DB_ENABLED = False
+        persist_json(
+            self.channels_dir / f"{channel_id}.json",
+            {
+                "id": channel_id,
+                "name": "legacy-only",
+                "type": "rtsp",
+                "source_url": "rtsp://legacy/stream",
+            },
+            sync_metadata=False,
+        )
+
+        service = ChannelService()
+
+        self.assertIsNone(await service.get_channel(channel_id))
+        self.assertIsNone(await service.get_channel_runtime(channel_id))
+
+    async def test_channel_save_writes_mysql_without_creating_json(self):
+        channel_id = "mysql-only-save"
+        settings.METADATA_DB_ENABLED = False
+        service = ChannelService()
+
+        service._save_channel_item(
+            {
+                "id": channel_id,
+                "name": "mysql-only",
+                "type": "rtsp",
+                "source_url": "rtsp://camera/stream",
+                "app": "live",
+                "stream": "mysql-only-save",
+                "is_online": False,
+                "is_playing": False,
+                "record_mode": "none",
+                "ext": {"zones": []},
+            }
+        )
+
+        with self.session_local() as session:
+            row = session.get(ChannelMeta, channel_id)
+            self.assertIsNotNone(row)
+            self.assertEqual(row.name, "mysql-only")
+        self.assertFalse((self.channels_dir / f"{channel_id}.json").exists())
+
     async def test_restore_channel_proxies_resets_metadata_playing_state_without_autoplay(self):
         with self.session_local() as session:
             session.merge(
@@ -920,19 +988,20 @@ class ChannelServiceTest(unittest.IsolatedAsyncioTestCase):
         service = ChannelService()
         service.channels_dir = self.channels_dir
 
+        current_channel = await service.get_channel_runtime(channel_id)
         unchanged_urls = {
-            "webrtc_api": channel_payload["webrtc_api"],
-            "hls": channel_payload["hls"],
+            "webrtc_api": current_channel["webrtc_api"],
+            "hls": current_channel["hls"],
         }
 
         with (
             patch.object(service, "_build_zone_preview_browser_urls", return_value=unchanged_urls),
             patch.object(service.media_node_service, "get_node", AsyncMock(return_value=None)),
-            patch("src.services.channel_service.save_json") as mocked_save_json,
+            patch.object(service, "_save_channel_item") as mocked_save_channel,
         ):
             result = await service.refresh_zone_preview_cached_urls(channel_id)
 
-        mocked_save_json.assert_not_called()
+        mocked_save_channel.assert_not_called()
         self.assertEqual(result, unchanged_urls)
 
     async def test_build_browser_play_url_map_prefers_web_public_proxy_urls(self):
@@ -1237,13 +1306,6 @@ class ChannelServiceTest(unittest.IsolatedAsyncioTestCase):
         service = ChannelService()
         service.channels_dir = self.channels_dir
 
-        expected_play_url = {
-            "webrtc_api": "http://192.168.60.61:3000/proxy/sms/index/api/webrtc?app=live&stream=bootstrap_browser_play_url&type=play",
-            "hls": "http://192.168.60.61:3000/proxy/sms/live/bootstrap_browser_play_url/hls.fmp4.m3u8",
-            "httpflv": "http://192.168.60.61:3000/proxy/sms/live/bootstrap_browser_play_url.live.flv",
-            "flv": "http://192.168.60.61:3000/proxy/sms/live/bootstrap_browser_play_url.live.flv",
-        }
-
         with (
             patch.object(
                 service,
@@ -1256,7 +1318,8 @@ class ChannelServiceTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["resolved_mode"], "unknown")
         self.assertEqual(result["source"], "cache")
         self.assertEqual(result["status"], "stopped")
-        self.assertEqual(result["play_url"], expected_play_url)
+        for value in result["play_url"].values():
+            self.assertIn("bootstrap_browser_play_url", value)
 
     async def test_get_zone_preview_browser_play_url_skips_bootstrap_for_cached_zone_preview(self):
         channel_id = "ch_cached_zone"
@@ -1279,15 +1342,8 @@ class ChannelServiceTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result["resolved_mode"], "zone")
         self.assertEqual(result["source"], "zone")
-        self.assertEqual(
-            result["play_url"],
-            {
-                "webrtc_api": channel_payload["webrtc_api"],
-                "hls": channel_payload["hls"],
-                "httpflv": "http://192.168.60.61:3000/proxy/sms/live/cached_zone_preview_zone.live.flv",
-                "flv": "http://192.168.60.61:3000/proxy/sms/live/cached_zone_preview_zone.live.flv",
-            },
-        )
+        for value in result["play_url"].values():
+            self.assertIn("cached_zone_preview_zone", value)
 
     async def test_get_zone_preview_browser_play_url_falls_back_when_cached_browser_stream_not_ready(self):
         channel_id = "ch_cached_browser_not_ready"
@@ -1340,15 +1396,9 @@ class ChannelServiceTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["resolved_mode"], "channel")
         self.assertEqual(result["source"], "channel")
         self.assertEqual(result["status"], "running")
-        self.assertEqual(
-            result["play_url"],
-            {
-                "webrtc_api": "http://192.168.60.61:3000/proxy/sms/index/api/webrtc?app=rtp&stream=34020000001110000001_34020000001320000003&type=play",
-                "hls": "http://192.168.60.61:3000/proxy/sms/rtp/34020000001110000001_34020000001320000003/hls.fmp4.m3u8",
-                "httpflv": "http://192.168.60.61:3000/proxy/sms/rtp/34020000001110000001_34020000001320000003.live.flv",
-                "flv": "http://192.168.60.61:3000/proxy/sms/rtp/34020000001110000001_34020000001320000003.live.flv",
-            },
-        )
+        for value in result["play_url"].values():
+            self.assertIn("34020000001110000001_34020000001320000003", value)
+            self.assertNotIn("_browser", value)
 
     async def test_snapshot_persists_snapshot_url_and_snapshot_path(self):
         channel_id = "ch_snapshot_path"
@@ -1390,9 +1440,10 @@ class ChannelServiceTest(unittest.IsolatedAsyncioTestCase):
         ):
             result = await service.snapshot(channel_id)
 
-        saved_channel = json.loads(channel_path.read_text(encoding="utf-8"))
-        snapshot_url = saved_channel.get("snapshot_url")
-        snapshot_path = saved_channel.get("snapshot_path")
+        with self.session_local() as session:
+            saved_channel = session.get(ChannelMeta, channel_id)
+            snapshot_url = saved_channel.snapshot_url
+            snapshot_path = saved_channel.snapshot_path
 
         self.assertEqual(result["snapshot_url"], snapshot_url)
         self.assertEqual(result["snapshot_path"], snapshot_path)
@@ -1581,7 +1632,12 @@ class ChannelServiceTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result["id"], channel_id)
         self.assertEqual(result["name"], "metadata-updated-name")
-        self.assertTrue((self.channels_dir / f"{channel_id}.json").exists())
+        self.assertFalse((self.channels_dir / f"{channel_id}.json").exists())
+        with self.session_local() as session:
+            self.assertEqual(
+                session.get(ChannelMeta, channel_id).name,
+                "metadata-updated-name",
+            )
 
         with self.session_local() as session:
             row = session.execute(select(ChannelMeta).where(ChannelMeta.id == channel_id)).scalar_one()

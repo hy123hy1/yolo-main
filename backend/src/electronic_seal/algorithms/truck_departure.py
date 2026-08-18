@@ -24,18 +24,9 @@ from ..tracking import NearestCentroidTracker, validate_bbox
 
 DEFAULT_VEHICLE_LABELS = frozenset(
     {
-        "truck",
-        "car",
         "bus",
-        "van",
-        "vehicle",
-        "automobile",
-        "pickup",
-        "lorry",
-        "trailer",
-        "minibus",
-        "suv",
-        "motor_vehicle",
+        "car",
+        "truck",
     }
 )
 

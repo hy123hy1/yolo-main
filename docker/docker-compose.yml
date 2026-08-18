@@ -3,6 +3,8 @@
 # 开发模式:
 #   cd docker
 #   docker compose up -d backend frontend-dev
+#   本地播放地址默认使用 192.168.1.61；服务器部署时通过环境变量覆盖为服务器地址。
+#   例如：ZLM_PUBLIC_HTTP_HOST=192.168.60.61 docker compose up -d backend frontend
 #
 # 生产预览模式:
 #   cd docker
@@ -35,11 +37,12 @@ services:
       - yolo-network
 
   backend:
-    build:
-      context: ..
-      dockerfile: docker/backend/Dockerfile
+    #build:
+      #context: ..
+      #dockerfile: docker/backend/Dockerfile
       # Before building backend, build the reusable base image once:
       # docker build -f docker/backend/Dockerfile.base -t yolo-backend-base:torch-cu128 ..
+    image: docker-backend
     container_name: yolo-backend
     restart: unless-stopped
     ports:
@@ -58,9 +61,15 @@ services:
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
       - AI_INFERENCE_DEVICE=cuda:0
       - TZ=Asia/Shanghai
+      - WEB_PUBLIC_BASE=${WEB_PUBLIC_BASE:-http://192.168.1.61:3000}
       - METADATA_DB_ENABLED=true
       - METADATA_DB_STRICT=false
-      - METADATA_DATABASE_URL=mysql+pymysql://root:root@192.168.1.58:3006/sp-ai-yolo?charset=utf8mb4
+      - METADATA_DATABASE_URL=mysql+pymysql://root:root@192.168.1.200:3307/sp-ai-yolo?charset=utf8mb4
+      - ZLM_PLAY_BASE=${ZLM_PLAY_BASE:-http://192.168.1.61:8010}
+      - ZLM_WEBRTC_BASE=${ZLM_WEBRTC_BASE:-webrtc://192.168.1.61:8010}
+      - ZLM_PUBLIC_RTSP_HOST=${ZLM_PUBLIC_RTSP_HOST:-192.168.1.61}
+      - ZLM_PUBLIC_RTMP_HOST=${ZLM_PUBLIC_RTMP_HOST:-192.168.1.61}
+      - ZLM_PUBLIC_HTTP_HOST=${ZLM_PUBLIC_HTTP_HOST:-192.168.1.61}
       - TASK_DETECTION_DEBUG_IDS=f5035e1e
       - ZLM_API_BASE=http://zlm-server:8010
       - ZLM_SECRET=HC5elxV5pt8guwuvV8NmddzVhb4u1lyY
@@ -85,20 +94,33 @@ services:
       - ../backend/data/electronic_seal:/app/data/electronic_seal
       - ../backend/models:/app/models:ro
       - ../backend/src:/app/src:ro
+    gpus: all
     networks:
       - yolo-network
     environment:
+      NVIDIA_VISIBLE_DEVICES: "all"
+      NVIDIA_DRIVER_CAPABILITIES: "compute,utility"
+      ELECTRONIC_SEAL_DEVICE: "cuda:0"
       ELECTRONIC_SEAL_ENABLED: "true"
-      ELECTRONIC_SEAL_DEVICE: "cpu"
       ELECTRONIC_SEAL_MAX_WORKERS: "2"
       ELECTRONIC_SEAL_MAX_CHANNEL_WORKERS: "8"
-      MYSQL_HOST: "192.168.1.58"
-      MYSQL_PORT: "3006"
+      ELECTRONIC_SEAL_FRAME_FIRST_FRAME_GRACE_SECONDS: "15"
+      ELECTRONIC_SEAL_BASELINE_WARMUP_SECONDS: "15"
+      ELECTRONIC_SEAL_BASELINE_MIN_VALID_FRAMES: "10"
+      ELECTRONIC_SEAL_BASELINE_MAX_CALIBRATION_SECONDS: "60"
+      ELECTRONIC_SEAL_ONLINE_STATUS_INTERVAL_SECONDS: "3600"
+      ZLM_API_BASE: "http://zlm-server:8010"
+      ZLM_SECRET: "HC5elxV5pt8guwuvV8NmddzVhb4u1lyY"
+      ZLM_PLAY_BASE: "http://192.168.1.61:8010"
+      ZLM_WEBRTC_BASE: "webrtc://192.168.1.61:8010"
+      ZLM_PUBLIC_HTTP_HOST: "192.168.1.61"
+      MYSQL_HOST: "192.168.1.2000"
+      MYSQL_PORT: "3307"
       MYSQL_DATABASE: "sp-ai-yolo"
       MYSQL_USER: "root"
       MYSQL_PASSWORD: "root"
       MYSQL_CHARSET: "utf8mb4"
-      METADATA_DATABASE_URL: "mysql+pymysql://root:root@192.168.1.58:3006/sp-ai-yolo?charset=utf8mb4"
+      METADATA_DATABASE_URL: "mysql+pymysql://root:root@192.168.1.200:3307/sp-ai-yolo?charset=utf8mb4"
       METADATA_DB_ENABLED: "true"
       METADATA_DB_STRICT: "false"
       TZ: "Asia/Shanghai"

@@ -133,7 +133,7 @@ SCENE_MAPPINGS = [
         "scene_key": "helmet_detection",
         "scene_name": "安全帽检测",
         "keywords": ["安全帽", "helmet"],
-        "labels": ["helmet", "person"],
+        "labels": ["no_helmet"],
         "rule_type": "detection",
         "default_need_overlay": True,
         "default_need_snapshot": True,
@@ -145,7 +145,7 @@ SCENE_MAPPINGS = [
         "scene_key": "sleep_on_duty",
         "scene_name": "睡岗检测",
         "keywords": ["睡岗", "睡岗检测", "sleep"],
-        "labels": ["person", "sleep"],
+        "labels": ["sleep"],
         "rule_type": "detection",
         "default_need_overlay": True,
         "default_need_snapshot": True,
@@ -193,7 +193,7 @@ SCENE_MAPPINGS = [
         "scene_key": "reflective_vest_detection",
         "scene_name": "反光背心识别",
         "keywords": ["反光背心", "背心", "vest", "reflective vest"],
-        "labels": ["vest"],
+        "labels": ["no_vest"],
         "rule_type": "detection",
         "default_need_overlay": True,
         "default_need_snapshot": True,
@@ -292,16 +292,6 @@ class ModelService:
         normalized["classes"] = classes
         candidates = self._build_scene_candidates(str(normalized.get("name") or ""), classes)
 
-        if len(classes) <= 5:
-            normalized["auto_label_strategy"] = "all"
-            normalized["recommended_labels"] = classes
-            normalized["scene_candidates"] = candidates
-            if candidates:
-                normalized["scene_key"] = candidates[0]["scene_key"]
-                normalized["scene_name"] = candidates[0]["scene_name"]
-                normalized["rule_type"] = candidates[0]["rule_type"]
-            return normalized
-
         if candidates:
             normalized["auto_label_strategy"] = "recommended"
             normalized["recommended_labels"] = list(candidates[0]["recommended_labels"])
@@ -309,6 +299,12 @@ class ModelService:
             normalized["scene_key"] = candidates[0]["scene_key"]
             normalized["scene_name"] = candidates[0]["scene_name"]
             normalized["rule_type"] = candidates[0]["rule_type"]
+            return normalized
+
+        if len(classes) <= 5:
+            normalized["auto_label_strategy"] = "all"
+            normalized["recommended_labels"] = classes
+            normalized["scene_candidates"] = []
         else:
             normalized["auto_label_strategy"] = "manual"
             normalized["recommended_labels"] = []

@@ -4,7 +4,7 @@ import weakref
 from datetime import datetime, timedelta
 
 import pytest
-from sqlalchemy import create_engine, event
+from sqlalchemy import create_engine, event, inspect
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Query, Session, sessionmaker
 from sqlalchemy.orm.exc import NoResultFound
@@ -12,6 +12,9 @@ from sqlalchemy.orm.exc import NoResultFound
 from src.db.models import (
     Base,
     ChannelMeta,
+    ElectronicSealChannelMeta,
+    ElectronicSealChannelProfileMeta,
+    ElectronicSealEventMeta,
     ElectronicSealEventIndexMeta,
     ElectronicSealBaselineMeta,
     ElectronicSealConfigMeta,
@@ -22,7 +25,11 @@ from src.db.models import (
     ElectronicSealTruckDepartureEventMeta,
 )
 import src.electronic_seal.store as store_module
-from src.electronic_seal.store import ElectronicSealStore, ensure_electronic_seal_schema
+from src.electronic_seal.store import (
+    ElectronicSealStore,
+    StaleRuntimeOwnerError,
+    ensure_electronic_seal_schema,
+)
 
 
 def _store():
@@ -31,7 +38,7 @@ def _store():
     ensure_electronic_seal_schema(engine)
     sessions = sessionmaker(bind=engine, future=True)
     with sessions() as session:
-        session.add(ChannelMeta(id="seal-channel", name="gate", type="rtsp"))
+        session.add(ElectronicSealChannelMeta(id="seal-channel", name="gate", type="rtsp", stream="seal-stream"))
         session.commit()
     return engine, ElectronicSealStore(session_factory=sessions)
 
@@ -45,7 +52,7 @@ def _file_store(tmp_path):
     ensure_electronic_seal_schema(engine)
     sessions = sessionmaker(bind=engine, future=True)
     with sessions() as session:
-        session.add(ChannelMeta(id="seal-channel", name="gate", type="rtsp"))
+        session.add(ElectronicSealChannelMeta(id="seal-channel", name="gate", type="rtsp", stream="seal-stream"))
         session.commit()
     return engine, ElectronicSealStore(session_factory=sessions)
 
@@ -87,6 +94,78 @@ def test_store_reads_only_electronic_seal_models():
         engine.dispose()
 
 
+def test_store_channel_exposes_flv_column():
+    engine, store = _store()
+    try:
+        with store.session_factory() as session:
+            row = session.get(ElectronicSealChannelMeta, "seal-channel")
+            row.flv = "http://media/rtp/seal-stream.live.flv"
+            session.commit()
+
+        channel = store.get_channel("seal-channel")
+
+        assert channel["flv"] == "http://media/rtp/seal-stream.live.flv"
+    finally:
+        engine.dispose()
+
+
+def test_worker_writes_require_matching_runtime_owner():
+    engine, store = _store()
+    try:
+        store.upsert_channel_profile(
+            "seal-channel",
+            {"role": "dispatch_room", "bound": True},
+        )
+        store.claim_runtime("seal-channel", "worker-current")
+
+        state = store.save_state(
+            {
+                "channel_id": "seal-channel",
+                "algorithm_type": "room_empty",
+                "status": "normal",
+                "runtime_owner_id": "worker-current",
+            }
+        )
+        event = store.create_event(
+            {
+                "channel_id": "seal-channel",
+                "algorithm_type": "room_empty",
+                "runtime_owner_id": "worker-current",
+            }
+        )
+
+        assert state["status"] == "normal"
+        assert event["status"] == "new"
+        with pytest.raises(StaleRuntimeOwnerError):
+            store.save_state(
+                {
+                    "channel_id": "seal-channel",
+                    "algorithm_type": "room_empty",
+                    "status": "alarming",
+                    "runtime_owner_id": "worker-stale",
+                }
+            )
+        with pytest.raises(StaleRuntimeOwnerError):
+            store.close_event(
+                event["id"],
+                datetime.now(),
+                1.0,
+                runtime_owner_id="worker-stale",
+            )
+        with pytest.raises(StaleRuntimeOwnerError):
+            store.update_event(
+                event["id"],
+                {"evidence_video_path": "/tmp/stale.mp4"},
+                runtime_owner_id="worker-stale",
+            )
+
+        assert store.get_state("seal-channel", "room_empty")["status"] == "normal"
+        assert store.get_event(event["id"])["status"] == "new"
+        assert store.get_event(event["id"])["evidence_video_path"] is None
+    finally:
+        engine.dispose()
+
+
 def test_store_rejects_unknown_electronic_seal_model():
     engine, store = _store()
     try:
@@ -96,6 +175,23 @@ def test_store_rejects_unknown_electronic_seal_model():
                 "room_empty",
                 {"model_id": "missing"},
             )
+    finally:
+        engine.dispose()
+
+
+def test_store_updates_electronic_seal_channel_snapshot_metadata():
+    engine, store = _store()
+    try:
+        updated = store.update_channel_snapshot(
+            "seal-channel",
+            "/electronic-seal/channels/seal-channel/snapshot/image?v=123",
+            "/app/data/electronic_seal/snapshots/seal-channel.jpg",
+        )
+
+        assert updated["snapshot_url"].endswith("snapshot/image?v=123")
+        assert updated["snapshot_path"].endswith("seal-channel.jpg")
+        assert store.get_channel("seal-channel")["snapshot_path"].endswith("seal-channel.jpg")
+        assert store.update_channel_snapshot("missing", "/image", "/missing.jpg") is None
     finally:
         engine.dispose()
 
@@ -140,17 +236,57 @@ def test_truck_departure_is_counted_once_and_queued_for_upload():
         )
 
         assert duplicate["id"] == first["id"]
+        assert first["severity"] is None
         assert first["upload_job_id"]
         assert first["upload_target"] == "supervision"
         assert second["upload_job_id"]
         assert store.get_truck_count("seal-channel")["out_count"] == 2
         with store.session_factory() as session:
+            assert session.get(ElectronicSealEventIndexMeta, first["id"]).severity is None
+            assert session.get(ElectronicSealTruckDepartureEventMeta, first["id"]).severity is None
+            assert not inspect(engine).has_table("electronic_seal_events")
             assert session.query(ElectronicSealEventIndexMeta).count() == 2
             assert session.query(ElectronicSealTruckDepartureEventMeta).count() == 2
             assert session.query(ElectronicSealTruckCountMeta).one().out_count == 2
             jobs = session.query(ElectronicSealUploadJobMeta).all()
             assert len(jobs) == 2
             assert {job.event_id for job in jobs} == {first["id"], second["id"]}
+    finally:
+        engine.dispose()
+
+
+def test_legacy_event_rows_are_not_used_by_runtime_store_operations():
+    engine, store = _store()
+    try:
+        ElectronicSealEventMeta.__table__.create(engine)
+        now = datetime(2026, 8, 17, 10, 0, 0)
+        with store.session_factory() as session:
+            session.add(
+                ElectronicSealEventMeta(
+                    id="legacy-only",
+                    channel_id="seal-channel",
+                    algorithm_type="room_empty",
+                    event_type="room_empty",
+                    severity="yellow",
+                    started_at=now,
+                    ended_at=None,
+                    duration_seconds=None,
+                    score=0.8,
+                    metrics_json={},
+                    evidence_snapshot_path=None,
+                    evidence_video_path=None,
+                    handling_status=0,
+                    status="new",
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+            session.commit()
+
+        assert store.get_event("legacy-only") is None
+        assert store.update_event("legacy-only", {"status": "closed"}) is None
+        assert store.close_event("legacy-only", now, 0.0) is None
+        assert store.list_events(page=1, page_size=10)["items"] == []
     finally:
         engine.dispose()
 
@@ -274,6 +410,99 @@ def test_config_upsert_applies_defaults_updates_whitelist_and_returns_json_copy(
         assert second["sample_interval_ms"] == 250
         assert second["need_video_clip"] is True
         assert len(store.list_configs("seal-channel")) == 1
+    finally:
+        engine.dispose()
+
+
+def test_room_empty_config_creation_defaults_video_clip_to_true():
+    engine, store = _store()
+    try:
+        room_empty = store.upsert_config("seal-channel", "room_empty", {})
+        truck_departure = store.upsert_config("seal-channel", "truck_departure", {})
+
+        assert room_empty["need_video_clip"] is True
+        assert truck_departure["need_video_clip"] is False
+    finally:
+        engine.dispose()
+
+
+def test_room_empty_default_seed_falls_back_to_video_clip_true():
+    engine, store = _store()
+    try:
+        with store.session_factory() as session:
+            session.add(ElectronicSealModelMetaRecord(id="shared-model", name="电子封条"))
+            session.commit()
+
+        configs = store.ensure_default_configs(
+            "seal-channel",
+            [
+                {"algorithm_type": "room_empty"},
+                {"algorithm_type": "truck_departure"},
+            ],
+            model_id="shared-model",
+        )
+        by_algorithm = {item["algorithm_type"]: item for item in configs}
+
+        assert by_algorithm["room_empty"]["need_video_clip"] is True
+        assert by_algorithm["truck_departure"]["need_video_clip"] is False
+    finally:
+        engine.dispose()
+
+
+def test_unchanged_default_seed_does_not_touch_updated_at():
+    engine, store = _store()
+    try:
+        with store.session_factory() as session:
+            session.add(ElectronicSealModelMetaRecord(id="shared-model", name="电子封条"))
+            session.commit()
+        defaults = [{"algorithm_type": "room_empty", "need_video_clip": True}]
+        store.ensure_default_configs(
+            "seal-channel",
+            defaults,
+            model_id="shared-model",
+        )
+        original_updated_at = datetime(2026, 8, 13, 8, 0, 0)
+        with store.session_factory() as session:
+            row = session.query(ElectronicSealConfigMeta).filter_by(
+                channel_id="seal-channel",
+                algorithm_type="room_empty",
+            ).one()
+            row.updated_at = original_updated_at
+            session.commit()
+
+        store.ensure_default_configs(
+            "seal-channel",
+            defaults,
+            model_id="shared-model",
+        )
+
+        assert store.get_config("seal-channel", "room_empty")["updated_at"] == (
+            "2026-08-13 08:00:00"
+        )
+    finally:
+        engine.dispose()
+
+
+def test_unchanged_profile_upsert_does_not_touch_updated_at():
+    engine, store = _store()
+    try:
+        store.upsert_channel_profile(
+            "seal-channel",
+            {"role": "dispatch_room", "bound": True},
+        )
+        original_updated_at = datetime(2026, 8, 13, 8, 0, 0)
+        with store.session_factory() as session:
+            row = session.get(ElectronicSealChannelProfileMeta, "seal-channel")
+            row.updated_at = original_updated_at
+            session.commit()
+
+        store.upsert_channel_profile(
+            "seal-channel",
+            {"role": "dispatch_room", "bound": True},
+        )
+
+        profile = store.get_channel_profile("seal-channel")
+        assert profile["updated_at"] == "2026-08-13 08:00:00"
     finally:
         engine.dispose()
 
@@ -506,8 +735,7 @@ def test_state_integrity_error_recheck_applies_current_payload(monkeypatch):
 def test_channel_writes_reject_missing_channel(operation):
     engine, store = _store()
     try:
-        expected_exception = IntegrityError if operation == "event" else NoResultFound
-        with pytest.raises(expected_exception):
+        with pytest.raises(NoResultFound):
             if operation == "config":
                 store.upsert_config("missing-channel", "truck_departure", {"enabled": True})
             elif operation == "state":
@@ -621,12 +849,15 @@ def test_event_lifecycle_uses_evidence_paths_and_supports_filters():
                 "severity": "critical",
                 "started_at": started_at,
                 "score": 0.9,
+                "handling_status": None,
                 "metrics_json": {"empty_seconds": 600},
                 "evidence_snapshot_path": "/evidence/snapshot.jpg",
                 "evidence_video_path": "/evidence/video.mp4",
             }
         )
         assert event["started_at"] == "2026-07-21 10:00:00"
+        assert event["severity"] == "yellow"
+        assert event["handling_status"] == 0
         assert event["evidence_snapshot_path"] == "/evidence/snapshot.jpg"
         assert event["evidence_video_path"] == "/evidence/video.mp4"
 

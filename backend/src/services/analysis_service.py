@@ -41,6 +41,46 @@ DETECTION_RULE_TYPES = {
 }
 
 TASK_ANALYSIS_READ_FAIL_LIMIT = 10
+TASK_ANALYSIS_RTSP_FALLBACK_SECONDS = 5.0
+
+
+class _TaskCaptureSourceState:
+    """Keep a running task on FLV after RTSP has stalled."""
+
+    def __init__(self, primary_source_url: str, fallback_source_url: str = ""):
+        self.primary_source_url = str(primary_source_url or "").strip()
+        self.fallback_source_url = str(fallback_source_url or "").strip()
+        self.active_source_url = self.primary_source_url
+        self.fallback_active = False
+        self.no_frame_since: float | None = None
+
+    def note_valid_frame(self) -> None:
+        self.no_frame_since = None
+
+    def note_no_frame(self, now_ts: float) -> bool:
+        if self.fallback_active or not self.fallback_source_url:
+            return False
+        if self.no_frame_since is None:
+            self.no_frame_since = float(now_ts)
+            return False
+        if float(now_ts) - self.no_frame_since < TASK_ANALYSIS_RTSP_FALLBACK_SECONDS:
+            return False
+        self.active_source_url = self.fallback_source_url
+        self.fallback_active = True
+        self.no_frame_since = None
+        return True
+
+    def update_sources(self, primary_source_url: str, fallback_source_url: str = "") -> bool:
+        primary = str(primary_source_url or "").strip()
+        fallback = str(fallback_source_url or "").strip()
+        if primary == self.primary_source_url and fallback == self.fallback_source_url:
+            return False
+        self.primary_source_url = primary
+        self.fallback_source_url = fallback
+        self.active_source_url = primary
+        self.fallback_active = False
+        self.no_frame_since = None
+        return True
 
 
 def _parse_task_detection_debug_ids(raw_value: str | None) -> set[str]:
@@ -217,6 +257,7 @@ class AnalysisService:
                 payload["name"] = row.name
                 payload["type"] = row.type
                 payload["source_url"] = row.source_url
+                payload["flv"] = getattr(row, "flv", None)
                 payload["app"] = row.app
                 payload["stream"] = row.stream
                 payload["is_online"] = row.is_online
@@ -252,6 +293,7 @@ class AnalysisService:
                 payload["name"] = row.name
                 payload["type"] = row.type
                 payload["source_url"] = row.source_url
+                payload["flv"] = getattr(row, "flv", None)
                 payload["app"] = row.app
                 payload["stream"] = row.stream
                 payload["is_online"] = row.is_online
@@ -421,6 +463,7 @@ class AnalysisService:
             "id": task_row.id,
             "name": task_row.name,
             "source_url": task_row.source_url,
+            "flv": (task_row.raw_json or {}).get("flv"),
             "source_type": task_row.source_type,
             "channel_id": task_row.channel_id,
             "frame_interval": int(task_row.frame_interval or 10),
@@ -495,7 +538,7 @@ class AnalysisService:
                 check=False,
                 capture_output=True,
                 text=True,
-                timeout=15,
+                timeout=6 if str(source_url).lower().startswith("rtsp://") else 15,
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise ValueError(f"Failed to probe task source with FFmpeg: {exc}") from exc
@@ -522,6 +565,56 @@ class AnalysisService:
     def _build_task_capture(self, source_url: str):
         width, height = self._probe_task_stream(source_url)
         return FFmpegCapture(source_url, width, height, init_wait=0.3, latest_only=True)
+
+    def _open_task_capture(
+        self,
+        *,
+        task_id: str,
+        task: dict,
+        source_state: _TaskCaptureSourceState,
+        stop_event: threading.Event,
+    ):
+        attempts = 0
+        source_state.note_no_frame(time.time())
+        while not stop_event.is_set():
+            source_url = source_state.active_source_url
+            try:
+                capture = self._build_task_capture(source_url)
+                self._log_task_capture_debug(task, source_url, capture)
+                return capture
+            except Exception as exc:
+                attempts += 1
+                latest_task = self._load_task(task_id)
+                if latest_task:
+                    latest_snapshot = self._build_task_execution_snapshot(latest_task)
+                    latest_primary, latest_fallback = self._resolve_task_capture_sources(latest_snapshot)
+                    if source_state.update_sources(
+                        latest_primary or source_state.primary_source_url,
+                        latest_fallback,
+                    ):
+                        task = latest_task
+                        attempts = 0
+                switched = source_state.note_no_frame(time.time())
+                if switched:
+                    attempts = 0
+                    self._update_task_runtime(
+                        task_id,
+                        last_error="RTSP stream produced no valid frame for 5 seconds; switched to FLV",
+                    )
+                    runtime_logger.warning(
+                        "[TaskCaptureFallback] task_id=%s source=%s",
+                        task_id,
+                        source_state.active_source_url,
+                    )
+                    continue
+                self._update_task_runtime(
+                    task_id,
+                    last_error=f"failed to open task source: {exc}",
+                )
+                if not source_state.fallback_source_url and attempts >= 10:
+                    raise RuntimeError("Task source open failed repeatedly") from exc
+                time.sleep(0.2 if not source_state.fallback_active else min(2 ** min(attempts, 3), 5))
+        return None
 
     def _log_task_capture_debug(self, task: dict, source_url: str, capture) -> None:
         if not self._should_log_task_detections(task):
@@ -2365,9 +2458,21 @@ class AnalysisService:
             "task_id": task.get("id"),
             "channel_id": task.get("channel_id"),
             "source_url": task.get("source_url"),
+            "flv": task.get("flv"),
             "algorithms": algorithms,
             "runtime_models": dict((task.get("runtime") or {}).get("models") or {}),
         }
+
+    def _resolve_task_capture_sources(self, task: dict) -> tuple[str, str]:
+        primary = str(task.get("source_url") or "").strip()
+        fallback = str(task.get("flv") or "").strip()
+        channel_id = str(task.get("channel_id") or "").strip()
+        if channel_id:
+            channel = self._load_channel(channel_id)
+            if channel:
+                primary = str(channel.get("source_url") or "").strip() or primary
+                fallback = str(channel.get("flv") or "").strip()
+        return primary, fallback
 
     def _merge_task_runtime_models(
         self,
@@ -2477,6 +2582,7 @@ class AnalysisService:
         read_fail_count = 0
         reconnect_count = 0
         previous_capture_sequence: int | None = None
+        source_state: _TaskCaptureSourceState | None = None
 
         def flush_pending_alarm_videos(*, ready_only: bool) -> None:
             nonlocal pending_alarm_videos
@@ -2500,9 +2606,10 @@ class AnalysisService:
                 raise ValueError("Task not found")
 
             task_snapshot = self._build_task_execution_snapshot(task)
-            source_url = task_snapshot.get("source_url")
+            source_url, fallback_url = self._resolve_task_capture_sources(task_snapshot)
             if not source_url:
                 raise ValueError("Task source_url is empty")
+            source_state = _TaskCaptureSourceState(source_url, fallback_url)
 
             algorithms = list(task_snapshot.get("algorithms") or [])
             if not algorithms:
@@ -2522,8 +2629,15 @@ class AnalysisService:
             )
             next_runtime_heartbeat_at = time.time()
 
-            capture = self._build_task_capture(source_url)
-            self._log_task_capture_debug(task, source_url, capture)
+            capture = self._open_task_capture(
+                task_id=task_id,
+                task=task,
+                source_state=source_state,
+                stop_event=stop_event,
+            )
+            if capture is None:
+                return
+            source_url = source_state.active_source_url
             warmup_seconds = self._task_analysis_startup_warmup_seconds()
             warmup_until_ts = time.time() + warmup_seconds if warmup_seconds > 0 else 0.0
 
@@ -2543,26 +2657,39 @@ class AnalysisService:
                     ok, frame = self._read_task_frame(capture)
                     if not ok:
                         read_fail_count += 1
-                        if read_fail_count >= TASK_ANALYSIS_READ_FAIL_LIMIT:
+                        switched_to_fallback = source_state.note_no_frame(time.time())
+                        should_reconnect = read_fail_count >= TASK_ANALYSIS_READ_FAIL_LIMIT and (
+                            source_state.fallback_active or not source_state.fallback_source_url
+                        )
+                        if switched_to_fallback or should_reconnect:
                             reconnect_count += 1
                             flush_pending_alarm_videos(ready_only=False)
                             self._release_task_capture(capture)
                             capture = None
-                            last_error = f"task stream stalled, reconnect={reconnect_count}"
+                            source_url = source_state.active_source_url
+                            last_error = (
+                                "RTSP stream produced no valid frame for 5 seconds; switched to FLV"
+                                if switched_to_fallback
+                                else f"task stream stalled, reconnect={reconnect_count}"
+                            )
                             self._update_task_runtime(task_id, last_error=last_error)
-                            if reconnect_count >= 10:
+                            if not source_state.fallback_active and reconnect_count >= 10:
                                 raise RuntimeError("Task source read failed repeatedly")
-                            time.sleep(min(2 ** min(reconnect_count, 3), 5))
+                            if not switched_to_fallback:
+                                time.sleep(min(2 ** min(reconnect_count, 3), 5))
                             task = self._load_task(task_id) or task
                             task_snapshot = self._build_task_execution_snapshot(task)
-                            latest_source_url = task_snapshot.get("source_url")
+                            latest_source_url, latest_fallback_url = self._resolve_task_capture_sources(task_snapshot)
                             if not latest_source_url:
                                 raise ValueError("Task source_url is empty")
+                            source_changed = source_state.update_sources(
+                                latest_source_url,
+                                latest_fallback_url,
+                            )
+                            source_url = source_state.active_source_url
                             latest_algorithms = list(task_snapshot.get("algorithms") or [])
                             if not latest_algorithms:
                                 raise ValueError("Task has no enabled algorithms")
-                            source_changed = latest_source_url != source_url
-                            source_url = latest_source_url
                             algorithms = latest_algorithms
                             runtime_models = self._sync_task_runtime_state(
                                 algorithms=algorithms,
@@ -2575,9 +2702,16 @@ class AnalysisService:
                             )
                             if source_changed:
                                 pre_event_buffer.clear()
-                            capture = self._build_task_capture(source_url)
+                            capture = self._open_task_capture(
+                                task_id=task_id,
+                                task=task,
+                                source_state=source_state,
+                                stop_event=stop_event,
+                            )
+                            if capture is None:
+                                return
+                            source_url = source_state.active_source_url
                             previous_capture_sequence = None
-                            self._log_task_capture_debug(task, source_url, capture)
                             warmup_until_ts = time.time() + warmup_seconds if warmup_seconds > 0 else 0.0
                             next_config_refresh_at = (
                                 time.time() + config_refresh_interval
@@ -2589,6 +2723,7 @@ class AnalysisService:
                             time.sleep(0.2)
                         continue
 
+                    source_state.note_valid_frame()
                     recovered_after_stall = reconnect_count > 0
                     read_fail_count = 0
                     if recovered_after_stall:
@@ -2623,24 +2758,34 @@ class AnalysisService:
                         latest_task = self._load_task(task_id)
                         if latest_task:
                             latest_snapshot = self._build_task_execution_snapshot(latest_task)
-                            latest_source_url = latest_snapshot.get("source_url") or source_url
+                            latest_source_url, latest_fallback_url = self._resolve_task_capture_sources(latest_snapshot)
+                            latest_source_url = latest_source_url or source_state.primary_source_url
                             latest_algorithms = list(latest_snapshot.get("algorithms") or [])
                             if not latest_algorithms:
                                 raise ValueError("Task has no enabled algorithms")
-                            source_changed = latest_source_url != source_url
-                            if latest_source_url != source_url:
+                            source_changed = source_state.update_sources(
+                                latest_source_url,
+                                latest_fallback_url,
+                            )
+                            if source_changed:
                                 flush_pending_alarm_videos(ready_only=False)
                                 self._release_task_capture(capture)
-                                capture = self._build_task_capture(latest_source_url)
+                                capture = self._open_task_capture(
+                                    task_id=task_id,
+                                    task=latest_task,
+                                    source_state=source_state,
+                                    stop_event=stop_event,
+                                )
+                                if capture is None:
+                                    return
                                 previous_capture_sequence = None
-                                self._log_task_capture_debug(latest_task, latest_source_url, capture)
                                 warmup_until_ts = time.time() + warmup_seconds if warmup_seconds > 0 else 0.0
                                 read_fail_count = 0
                                 reconnect_count = 0
                                 pre_event_buffer.clear()
                             task = latest_task
                             task_snapshot = latest_snapshot
-                            source_url = latest_source_url
+                            source_url = source_state.active_source_url
                             algorithms = latest_algorithms
                             runtime_models = self._sync_task_runtime_state(
                                 algorithms=algorithms,
