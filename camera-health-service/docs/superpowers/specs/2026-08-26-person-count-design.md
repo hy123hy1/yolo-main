@@ -177,8 +177,19 @@ FFmpegStreamReader（每通道一条视频连接）
 文件名格式：
 
 ```text
-person_count_{channel_id}_{analysis_case}_{yyyyMMddHHmmssfff}.jpg
+{camera_code}_{analysis_case}_{yyyyMMddHHmmss}.jpg
 ```
+
+其中 `camera_code` 是绑定在 `channels` 表上的 20 位摄像仪编码，不能使用本服务内部的
+`channel_id` 代替。`analysis_case` 为四位人数编码，时间戳使用 `yyyyMMddHHmmss` 格式。
+例如：
+
+```text
+12345678901234567890_0002_20260826103001.jpg
+```
+
+生成图片前必须校验 `camera_code` 已配置且长度为 20 位；未配置或格式不正确时不生成
+不符合监管命名规则的文件，并在人员计数运行状态中记录错误。
 
 采用临时文件加原子替换方式写入，避免接口读取到未完成图片。图片保存失败时仍允许计数
 记录落库，但 `snapshot_path` 保存为 `NULL`，并在运行状态中记录错误。
