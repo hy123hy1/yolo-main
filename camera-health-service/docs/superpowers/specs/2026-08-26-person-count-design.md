@@ -182,8 +182,7 @@ FFmpegStreamReader（每通道一条视频连接）
 
 其中 `camera_code` 是绑定在 `channels` 表上的 20 位摄像仪编码，不能使用本服务内部的
 `channel_id` 代替。`analysis_type` 为两位分析类型编码，人员计数固定为 `01`；时间戳使用
-`yyyyMMddHHmmss` 格式。`analysis_case` 仍保存在计数记录中，用于表示四位人数编码。
-例如：
+`yyyyMMddHHmmss` 格式。示例：
 
 ```text
 12345678901234567890_01_20260826103001.jpg
@@ -229,7 +228,7 @@ CAMERA_HEALTH_PERSON_COUNT_CONFIDENCE=0.25
 CAMERA_HEALTH_PERSON_COUNT_IMAGE_SIZE=640
 CAMERA_HEALTH_PERSON_COUNT_DEVICE=cuda:0
 CAMERA_HEALTH_PERSON_COUNT_SNAPSHOT_DIR=/app/data/camera_health/person_count
-YOLO_CONFIG_DIR=/tmp/Ultralytics
+YOLO_CONFIG_DIR=/tmp
 ```
 
 同时增加 `.env.example` 作为可提交的参数模板，实际 `.env` 继续由根目录 `.gitignore`
