@@ -76,6 +76,12 @@ class Settings:
             "/app/data/camera_health/person_count",
         )
     )
+    person_count_run_dir: Path = Path(
+        os.getenv(
+            "CAMERA_HEALTH_PERSON_COUNT_RUN_DIR",
+            "/tmp/camera_health/person_count/runs",
+        )
+    )
 
     def __post_init__(self) -> None:
         if self.person_count_interval_seconds <= 0:

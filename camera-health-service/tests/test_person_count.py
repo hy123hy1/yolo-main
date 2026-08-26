@@ -133,6 +133,8 @@ def test_person_count_detector_filters_person_by_name_and_confidence():
     assert result.detections[0].confidence == pytest.approx(0.80)
     assert result.detections[0].box == (11, 12, 30, 40)
     assert model.calls[0][1]["conf"] == 0.25
+    assert model.calls[0][1]["save"] is False
+    assert model.calls[0][1]["project"]
 
 
 def test_person_count_encoding_preserves_four_digits():

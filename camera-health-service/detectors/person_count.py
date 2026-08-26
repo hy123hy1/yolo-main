@@ -7,6 +7,8 @@ from typing import Any, Callable, Iterable
 
 import numpy as np
 
+from config import settings
+
 
 @dataclass(frozen=True, slots=True)
 class PersonDetection:
@@ -62,6 +64,8 @@ class PersonCountDetector:
         kwargs: dict[str, Any] = {
             "conf": self.confidence,
             "imgsz": self.image_size,
+            "project": str(settings.person_count_run_dir),
+            "save": False,
             "verbose": False,
         }
         if self.device:
