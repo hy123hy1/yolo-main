@@ -137,7 +137,10 @@ async def update_task(task_id: str, request: TaskUpdateRequest):
 
 @router.delete("/{task_id}")
 async def delete_task(task_id: str):
-    result = await task_service.delete_task(task_id)
+    try:
+        result = await task_service.delete_task(task_id)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
     if not result:
         raise HTTPException(404, "Task not found")
     return result

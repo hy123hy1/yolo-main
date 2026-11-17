@@ -7,17 +7,12 @@ import tempfile
 import zipfile
 import io
 from pathlib import Path
-from datetime import datetime
 from fastapi import UploadFile
 from src.core.settings import settings
 from src.db.database import SessionLocal
 from src.db.models import ModelMetaRecord, TaskAlgorithmMeta
 from src.services.metadata_db_sync import delete_json_document
 from src.services.platform_storage import format_datetime, generate_id, normalize_datetime_fields, now_iso, save_json as persist_json
-import matplotlib
-matplotlib.use('Agg')  # 使用非交互式后端
-import matplotlib.pyplot as plt
-import matplotlib.font_manager as fm
 
 
 SCENE_MAPPINGS = [
@@ -312,6 +307,8 @@ class ModelService:
         return normalized
 
     def _extract_classes_from_yolo_weights(self, weights_path: str) -> list[str]:
+        if Path(weights_path).suffix.lower() == ".om":
+            return []
         try:
             from ultralytics import YOLO
 
@@ -593,6 +590,8 @@ class ModelService:
         
         if not await asyncio.to_thread(lambda: Path(weights_path).exists()):
             return None
+        if Path(weights_path).suffix.lower() == ".om":
+            return {"task": "detect", "model_type": "ascend_om", "hardware_validated": False}
         
         def _get_model_info_sync():
             try:
@@ -744,15 +743,10 @@ class ModelService:
                 # 查找model.json和weights目录
                 model_json_path = None
                 weights_dir_path = None
-                zip_model_id = None
                 
                 # 查找model.json（可能在根目录或子目录中）
                 for json_file in temp_path.rglob("model.json"):
                     model_json_path = json_file
-                    # 如果model.json在子目录中，提取model_id
-                    relative_path = json_file.relative_to(temp_path)
-                    if len(relative_path.parts) > 1:
-                        zip_model_id = relative_path.parts[0]
                     break
                 
                 # 查找weights目录
@@ -765,10 +759,12 @@ class ModelService:
                 if not weights_dir_path:
                     raise ValueError("ZIP file must contain a 'weights' directory")
                 
-                # 检查weights目录中是否有.pt文件
-                pt_files = list(weights_dir_path.glob("*.pt"))
-                if not pt_files:
-                    raise ValueError("weights directory must contain at least one .pt file")
+                weight_files = sorted(item for item in weights_dir_path.iterdir()
+                                      if item.is_file() and item.suffix.lower() in {".pt", ".om"})
+                if not weight_files:
+                    raise ValueError("weights directory must contain at least one .pt or .om file")
+                if any(item.suffix.lower() == ".om" for item in weight_files) and len(weight_files) != 1:
+                    raise ValueError("OM model package must contain exactly one .om weight and no .pt weights")
                 
                 # 读取或创建model.json
                 if model_json_path and model_json_path.exists():
@@ -799,6 +795,11 @@ class ModelService:
                     }
 
                 model_meta["name"] = uploaded_name
+                if weight_files[0].suffix.lower() == ".om":
+                    from src.inference.ascend_om import validate_om_metadata
+
+                    model_meta["inference"] = validate_om_metadata(model_meta)
+                    model_meta["model_format"] = "om"
                 
                 # 创建目标目录
                 model_dir = self.registry_dir / model_id
@@ -808,14 +809,14 @@ class ModelService:
                 
                 # 复制权重文件
                 total_size = 0
-                for pt_file in pt_files:
-                    target_pt = target_weights_dir / pt_file.name
-                    shutil.copy2(pt_file, target_pt)
-                    total_size += pt_file.stat().st_size
+                for weight_file in weight_files:
+                    target_weight = target_weights_dir / weight_file.name
+                    shutil.copy2(weight_file, target_weight)
+                    total_size += weight_file.stat().st_size
                 
                 # 更新model.json
                 model_meta["model_id"] = model_id
-                model_meta["weights_path"] = str((target_weights_dir / pt_files[0].name).resolve())
+                model_meta["weights_path"] = str((target_weights_dir / weight_files[0].name).resolve())
                 model_meta["file_size"] = total_size
                 model_meta["file_size_mb"] = round(total_size / (1024 * 1024), 2)
                 model_meta["confidence"] = float(
@@ -950,6 +951,10 @@ class ModelService:
         
         # 生成图表
         def _generate_charts():
+            import matplotlib
+            matplotlib.use('Agg')
+            import matplotlib.pyplot as plt
+
             # 设置中文字体支持（如果需要）
             plt.rcParams['font.sans-serif'] = ['DejaVu Sans']
             plt.rcParams['axes.unicode_minus'] = False

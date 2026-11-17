@@ -328,6 +328,7 @@ class TaskAlgorithmMetricHistoryMeta(Base):
     metric_value: Mapped[float | None] = mapped_column(Float)
     region_id: Mapped[str | None] = mapped_column(String(64), index=True)
     region_name: Mapped[str | None] = mapped_column(String(255))
+    snapshot_path: Mapped[str | None] = mapped_column(Text)
     sampled_at: Mapped[DateTime | None] = mapped_column(DateTime(), index=True)
     created_at: Mapped[DateTime | None] = mapped_column(DateTime(), index=True)
     raw_json: Mapped[dict | None] = mapped_column(JSON)
@@ -496,6 +497,40 @@ class EventMeta(Base):
     created_at: Mapped[DateTime | None] = mapped_column(DateTime(), index=True)
     updated_at: Mapped[DateTime | None] = mapped_column(DateTime(), index=True)
     raw_json: Mapped[dict | None] = mapped_column(JSON)
+
+
+class AlarmPushTarget(Base):
+    __tablename__ = "alarm_push_targets"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    name: Mapped[str] = mapped_column(String(255))
+    push_url: Mapped[str] = mapped_column(String(2048))
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[DateTime] = mapped_column(DateTime())
+    updated_at: Mapped[DateTime] = mapped_column(DateTime())
+
+
+class AlarmPushJob(Base):
+    __tablename__ = "alarm_push_jobs"
+    __table_args__ = (
+        UniqueConstraint("target_id", "event_id", name="uq_alarm_push_target_event"),
+        Index("idx_alarm_push_due", "status", "next_retry_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    target_id: Mapped[str] = mapped_column(String(64))
+    event_id: Mapped[str] = mapped_column(String(64))
+    payload_json: Mapped[dict] = mapped_column(JSON)
+    status: Mapped[str] = mapped_column(String(16), default="pending")
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    next_retry_at: Mapped[DateTime | None] = mapped_column(DateTime())
+    lease_until: Mapped[DateTime | None] = mapped_column(DateTime())
+    claim_token: Mapped[str | None] = mapped_column(String(32))
+    last_error: Mapped[str | None] = mapped_column(Text)
+    response_status: Mapped[int | None] = mapped_column(Integer)
+    sent_at: Mapped[DateTime | None] = mapped_column(DateTime())
+    created_at: Mapped[DateTime] = mapped_column(DateTime())
+    updated_at: Mapped[DateTime] = mapped_column(DateTime())
 
 
 class RecordingMeta(Base):

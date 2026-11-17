@@ -5,6 +5,7 @@ from datetime import datetime
 from pathlib import Path
 
 from src.core.settings import settings
+from src.alarm_push.service import enqueue_event
 from src.db.database import SessionLocal
 from src.db.models import ChannelMeta, EventMeta, ModelMetaRecord, RecordingMeta
 from src.services.metadata_db_sync import delete_json_document
@@ -314,6 +315,7 @@ class EventService:
                             raw_json=copy.deepcopy(item),
                         )
                     )
+                    enqueue_event(session, item, need_video_clip=bool(payload.get("_need_video_clip", False)))
                     session.commit()
                 return item
 

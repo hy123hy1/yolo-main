@@ -64,6 +64,19 @@ def _load_config_toml_to_environment(base_dir: Path) -> None:
 
     ai_cfg = config.get("AI", {}) if isinstance(config.get("AI"), dict) else {}
     _set_env_if_absent("AI_INFERENCE_DEVICE", ai_cfg.get("InferenceDevice"))
+    _set_env_if_absent("AI_TASK_GPU_ADAPTIVE", ai_cfg.get("TaskGpuAdaptive"))
+    _set_env_if_absent("AI_GPU_CANDIDATES", ai_cfg.get("GpuCandidates"))
+    _set_env_if_absent("AI_GPU_MIN_FREE_MB", ai_cfg.get("GpuMinFreeMB"))
+    _set_env_if_absent("AI_GPU_TASK_RESERVE_MB", ai_cfg.get("GpuTaskReserveMB"))
+    _set_env_if_absent("AI_INFERENCE_BACKEND", ai_cfg.get("InferenceBackend"))
+    _set_env_if_absent("ASCEND_DEVICE_ID", ai_cfg.get("AscendDeviceId"))
+
+    push = config.get("AlarmPush", {})
+    _set_env_if_absent("ALARM_PUSH_ENABLED", push.get("Enabled"))
+    _set_env_if_absent("ALARM_PUSH_URL", push.get("PushURL"))
+    _set_env_if_absent("ALARM_PUSH_PUBLIC_BASE_URL", push.get("PublicBaseURL"))
+    _set_env_if_absent("ALARM_PUSH_TIMEOUT_SECONDS", push.get("TimeoutSeconds"))
+    _set_env_if_absent("ALARM_PUSH_MAX_ATTEMPTS", push.get("MaxAttempts"))
 
     data_cfg = config.get("Data", {})
     _set_env_if_absent("METADATA_DB_ENABLED", data_cfg.get("MetadataDBEnabled"))
@@ -124,6 +137,11 @@ class Settings(BaseSettings):
     HOST: str = "0.0.0.0"
     PORT: int = 8000
     WEB_PUBLIC_BASE: str = "http://localhost:3000"
+    ALARM_PUSH_ENABLED: bool = False
+    ALARM_PUSH_URL: str = ""
+    ALARM_PUSH_PUBLIC_BASE_URL: str = "http://192.168.1.61:8000"
+    ALARM_PUSH_TIMEOUT_SECONDS: float = 10.0
+    ALARM_PUSH_MAX_ATTEMPTS: int = 3
     HOST_MONITOR_AGENT_URL: str = ""
     HOST_MONITOR_AGENT_TIMEOUT_SECONDS: float = 2
     HOST_MONITOR_METRICS_FILE: Path = DATA_DIR / "host_monitor_resources.json"
@@ -156,6 +174,12 @@ class Settings(BaseSettings):
     TASK_ALARM_VIDEO_CAPTURE_TIMEOUT_SECONDS: float = 0
     TASK_ALARM_VIDEO_READ_FAIL_LIMIT: int = 20
     AI_INFERENCE_DEVICE: str = "auto"
+    AI_TASK_GPU_ADAPTIVE: bool = False
+    AI_GPU_CANDIDATES: str = ""
+    AI_GPU_MIN_FREE_MB: int = 2048
+    AI_GPU_TASK_RESERVE_MB: int = 1024
+    AI_INFERENCE_BACKEND: str = "auto"
+    ASCEND_DEVICE_ID: int = 0
 
     CAMERA_HEALTH_ENABLED: bool = True
     CAMERA_HEALTH_SAMPLE_INTERVAL_MS: int = 1000

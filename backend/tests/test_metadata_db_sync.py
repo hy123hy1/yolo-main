@@ -64,6 +64,26 @@ class MetadataDbSyncTest(unittest.TestCase):
         settings.CHANNELS_DIR = self.original_channels_dir
         self.temp_dir.cleanup()
 
+    def test_metric_history_snapshot_migration_is_additive_and_idempotent(self):
+        with self.engine.begin() as connection:
+            connection.execute(text("ALTER TABLE task_algorithm_metric_history DROP COLUMN snapshot_path"))
+            connection.execute(text(
+                "INSERT INTO task_algorithm_metric_history (id, task_id, algorithm_id, metric_value) "
+                "VALUES (1, 'old-task', 'old-algo', 2)"
+            ))
+        metadata_db_sync.migrate_metadata_database_schema()
+        with self.session_local() as session:
+            row = session.get(TaskAlgorithmMetricHistoryMeta, 1)
+            self.assertEqual(row.metric_value, 2)
+            self.assertIsNone(row.snapshot_path)
+            row.snapshot_path = "/app/data/snapshots/existing.jpg"
+            session.commit()
+        metadata_db_sync.migrate_metadata_database_schema()
+        with self.session_local() as session:
+            row = session.get(TaskAlgorithmMetricHistoryMeta, 1)
+            self.assertEqual(row.snapshot_path, "/app/data/snapshots/existing.jpg")
+            self.assertEqual(session.query(TaskAlgorithmMetricHistoryMeta).count(), 1)
+
     def test_sync_channel_persists_parent_and_strips_legacy_ai_fields(self):
         channel_payload = {
             "id": "ch_sync_parent_first",
@@ -251,6 +271,8 @@ class MetadataDbSyncTest(unittest.TestCase):
 
         try:
             with self.session_local() as session:
+                # Simulate legacy orphan data, which cannot be inserted with current FKs enabled.
+                session.execute(text("PRAGMA foreign_keys=OFF"))
                 session.execute(
                     text(
                         """
@@ -275,6 +297,8 @@ class MetadataDbSyncTest(unittest.TestCase):
                         """
                     )
                 )
+                session.commit()
+                session.execute(text("PRAGMA foreign_keys=ON"))
                 session.commit()
 
             metadata_db_sync.migrate_metadata_database_schema()
@@ -359,6 +383,7 @@ class MetadataDbSyncTest(unittest.TestCase):
                     raw_json={},
                 )
             )
+            session.flush()
             session.add(
                 TaskAlgorithmMeta(
                     id="algo_fk_model_restrict",

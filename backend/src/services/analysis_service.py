@@ -8,19 +8,25 @@ import threading
 import time
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import nullcontext
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import cv2
 import numpy as np
 
 from src.core.algorithm_rule_config import get_algorithm_rule_config
 from src.core.settings import settings
+from src.inference.gpu_scheduler import GpuAllocation, GpuScheduler
+from src.alarm_push.media import alarm_video_path
 from src.db.database import SessionLocal
 from src.db.models import AlgorithmRegionMeta, ChannelMeta, ModelMetaRecord, TaskAlgorithmMeta, TaskAlgorithmRegionMeta, TaskMeta, TaskRegionMeta
 from src.services.event_service import EventService
+from src.services.external_video_capture import ExternalVideoCaptureService
 from src.services.metric_service import metric_service
+from src.services.person_flow_counter import PersonFlowCounter, flow_regions, is_person_count_algorithm, validate_flow_algorithm
 from src.services.recording_service import RecordingService
 from src.services.platform_storage import format_datetime, load_json, now_iso, save_json
 from src.services.realtime_detection_service import realtime_detection_hub
@@ -103,7 +109,11 @@ class AnalysisService:
         self._lock = threading.Lock()
         self._model_cache_lock = threading.Lock()
         self._workers: dict[str, dict] = {}
-        self._model_cache: dict[str, tuple[object, dict]] = {}
+        self._model_cache: dict[tuple[str, str], tuple[object, dict]] = {}
+        self._alarm_video_model_refs: dict[tuple[str, str], int] = {}
+        self._gpu_scheduler = GpuScheduler()
+        self._task_inference_devices: dict[str, str] = {}
+        self._task_gpu_allocations: dict[str, GpuAllocation] = {}
         self._task_workers: dict[str, dict] = {}
         self._alarm_video_futures: set[Future] = set()
         self._task_inference_executor = ThreadPoolExecutor(
@@ -114,6 +124,7 @@ class AnalysisService:
             max_workers=self._alarm_video_worker_count(),
             thread_name_prefix="alarm-video",
         )
+        self.external_video_capture = ExternalVideoCaptureService(self)
 
     def _alarm_video_before_seconds(self) -> int:
         return max(int(getattr(settings, "ALARM_VIDEO_BEFORE_SECONDS", 10) or 10), 0)
@@ -129,7 +140,8 @@ class AnalysisService:
         return max(int(round(safe_fps * self._alarm_video_total_seconds())), 1)
 
     def _alarm_video_pre_event_buffer_size(self, fps: float = 25.0) -> int:
-        return self._alarm_video_frame_limit(fps)
+        # Also retain 10s pre-roll for requests arriving up to 10s after the trigger.
+        return max(self._alarm_video_frame_limit(fps), int(round(max(fps, 1.0) * 22)))
 
     def _alarm_video_buffer_jpeg_quality(self) -> int:
         return min(max(int(getattr(settings, "ALARM_VIDEO_BUFFER_JPEG_QUALITY", 75) or 75), 10), 95)
@@ -910,12 +922,16 @@ class AnalysisService:
         detections = self._filter_detections_by_zones(detections, scoped_task)
         return detections
 
-    def _release_torch_memory(self) -> None:
+    def _release_torch_memory(self, devices: set[str] | None = None) -> None:
         try:
             import torch
 
             if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+                for device in devices or ():
+                    if not str(device).startswith("cuda"):
+                        continue
+                    with torch.cuda.device(device):
+                        torch.cuda.empty_cache()
         except Exception:
             pass
 
@@ -928,6 +944,8 @@ class AnalysisService:
         return configured
 
     def _resolve_inference_device(self) -> str:
+        if settings.AI_INFERENCE_BACKEND == "ascend_om":
+            return f"npu:{settings.ASCEND_DEVICE_ID}"
         try:
             import torch
 
@@ -941,49 +959,66 @@ class AnalysisService:
 
     def clear_model_cache(self) -> None:
         with self._model_cache_lock:
+            devices = {key[1] for key in self._model_cache if isinstance(key, tuple)}
             self._model_cache.clear()
         gc.collect()
-        self._release_torch_memory()
+        self._release_torch_memory(devices)
 
-    def _active_model_ids(self) -> set[str]:
+    def _bind_task_inference_device(self, task_id: str) -> None:
+        allocation = None
+        if settings.AI_TASK_GPU_ADAPTIVE and settings.AI_INFERENCE_BACKEND != "ascend_om":
+            configured = str(settings.AI_INFERENCE_DEVICE or "auto").strip().lower()
+            if configured != "auto" and not configured.startswith("cuda"):
+                raise ValueError("AI_TASK_GPU_ADAPTIVE requires AI_INFERENCE_DEVICE=auto or cuda:N")
+            allocation = self._gpu_scheduler.reserve(
+                candidates=settings.AI_GPU_CANDIDATES,
+                min_free_mb=settings.AI_GPU_MIN_FREE_MB,
+                reserve_mb=settings.AI_GPU_TASK_RESERVE_MB,
+            )
+        device = allocation.device if allocation else self._resolve_inference_device()
         with self._lock:
-            task_ids = list(self._task_workers.keys())
+            self._task_inference_devices[task_id] = device
+            if allocation:
+                self._task_gpu_allocations[task_id] = allocation
+        logger.info("[TaskInferenceDevice] task=%s device=%s adaptive=%s", task_id, device, bool(allocation))
 
-        active_model_ids: set[str] = set()
-        for task_id in task_ids:
+    def _task_inference_device(self, task_id: str) -> str:
+        with self._lock:
+            device = self._task_inference_devices.get(task_id)
+        return device or self._resolve_inference_device()
+
+    def _prune_model_cache(self) -> None:
+        with self._lock:
+            devices = dict(self._task_inference_devices)
+        active_keys = set()
+        for task_id, device in devices.items():
             try:
                 task = self._load_task(task_id)
-                if not task:
-                    continue
-                active_model_ids.update(
-                    str(item["model_id"])
+            except Exception:
+                logger.exception("Skip model cache pruning: active task metadata unavailable: %s", task_id)
+                return
+            if task:
+                active_keys.update(
+                    (str(item["model_id"]), device)
                     for item in self._normalize_task_algorithms(task)
                     if item.get("enabled") and item.get("model_id")
                 )
-            except Exception:
-                logger.exception("Failed to collect active task model ids: %s", task_id)
-
-        return active_model_ids
-
-    def _prune_model_cache(self) -> None:
-        active_model_ids = self._active_model_ids()
         with self._model_cache_lock:
-            stale_model_ids = [
-                model_id
-                for model_id in list(self._model_cache.keys())
-                if model_id not in active_model_ids
+            stale_keys = [
+                key for key in self._model_cache
+                if key not in active_keys and key not in self._alarm_video_model_refs
             ]
-        if not stale_model_ids:
-            return
-        with self._model_cache_lock:
-            for model_id in stale_model_ids:
-                self._model_cache.pop(model_id, None)
-        gc.collect()
-        self._release_torch_memory()
+            for key in stale_keys:
+                self._model_cache.pop(key, None)
+        if stale_keys:
+            gc.collect()
+            self._release_torch_memory({key[1] for key in stale_keys})
 
-    def _load_model(self, model_id: str):
+    def _load_model(self, model_id: str, device: str | None = None):
+        device = device or self._resolve_inference_device()
+        key = (model_id, device)
         with self._model_cache_lock:
-            cached = self._model_cache.get(model_id)
+            cached = self._model_cache.get(key)
             if cached:
                 return cached
 
@@ -997,43 +1032,26 @@ class AnalysisService:
         if not weights_path:
             raise ValueError("Model weights_path not found in model.json")
 
-        from ultralytics import YOLO
+        from src.inference import load_detection_model
 
-        model = YOLO(str(weights_path))
+        weights_path = Path(weights_path)
+        if not weights_path.is_absolute():
+            weights_path = model_dir / weights_path
         with self._model_cache_lock:
-            cached = self._model_cache.get(model_id)
+            cached = self._model_cache.get(key)
             if cached:
                 return cached
-            self._model_cache[model_id] = (model, model_meta)
+            model = load_detection_model(weights_path, model_meta)
+            model_meta = dict(model_meta, _inference_device=device, _prediction_lock=threading.Lock())
+            self._model_cache[key] = (model, model_meta)
             return model, model_meta
 
     def _detect_frame(self, model, model_meta: dict, frame, conf_threshold: float) -> list[dict]:
-        classes = model_meta.get("classes", [])
-        results = model(
-            frame,
-            verbose=False,
-            conf=conf_threshold,
-            device=self._resolve_inference_device(),
-        )
-        detections = []
-        for result in results:
-            boxes = result.boxes
-            for i in range(len(boxes)):
-                box = boxes[i]
-                x1, y1, x2, y2 = box.xyxy[0].tolist()
-                conf = float(box.conf[0])
-                class_id = int(box.cls[0])
-                class_name = classes[class_id] if class_id < len(classes) else f"class_{class_id}"
-                detections.append({
-                    "class_id": class_id,
-                    "class_name": class_name,
-                    "conf": conf,
-                    "x1": x1,
-                    "y1": y1,
-                    "x2": x2,
-                    "y2": y2,
-                })
-        return detections
+        from src.inference import predict_detections
+
+        device = model_meta.get("_inference_device") or self._resolve_inference_device()
+        with model_meta.get("_prediction_lock", nullcontext()):
+            return predict_detections(model, model_meta, frame, conf_threshold, device)
 
     def _format_detection_label(self, detection: dict) -> str:
         custom_label = str(detection.get("annotation_label") or "").strip()
@@ -1215,6 +1233,12 @@ class AnalysisService:
             cv2.fillPoly(overlay, [pts], color)
             annotated = cv2.addWeighted(overlay, 0.12, annotated, 0.88, 0)
             cv2.polylines(annotated, [pts], isClosed=True, color=color, thickness=2)
+            if region.get("type") == "person_flow" and len(points) == 4:
+                a = ((points[0][0] + points[1][0]) // 2, (points[0][1] + points[1][1]) // 2)
+                b = ((points[2][0] + points[3][0]) // 2, (points[2][1] + points[3][1]) // 2)
+                cv2.arrowedLine(annotated, a, b, color, 3, tipLength=0.15)
+                for label, anchor in (("A", a), ("B", b)):
+                    cv2.putText(annotated, label, (anchor[0], anchor[1] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
         return annotated
 
     def _annotate_absence_frame(self, frame, detections: list[dict], regions: list[dict] | None = None):
@@ -1376,10 +1400,11 @@ class AnalysisService:
         algorithm: dict,
         model_id: str,
         frames: list[tuple[float, object]],
+        inference_device: str | None = None,
     ) -> list[list[dict]]:
         detections_by_frame: list[list[dict]] = []
         try:
-            model, model_meta = self._load_model(model_id)
+            model, model_meta = self._load_model(model_id, inference_device or self._task_inference_device(task_id))
         except Exception:
             logger.exception(
                 "Failed to load model for alarm video redetection: task=%s model=%s",
@@ -1422,22 +1447,30 @@ class AnalysisService:
         task_id: str | None = None,
         algorithm: dict | None = None,
         model_id: str | None = None,
+        inference_device: str | None = None,
+        duration_seconds: float | None = None,
+        sanitize_frames: bool = True,
     ) -> str | None:
         if not frames:
             return None
 
         safe_fps = max(float(fps or 25.0), 1.0)
-        frame_limit = self._alarm_video_frame_limit(safe_fps)
+        frame_limit = (
+            max(int(round(safe_fps * duration_seconds)), 1)
+            if duration_seconds is not None
+            else self._alarm_video_frame_limit(safe_fps)
+        )
         frames = list(frames)[:frame_limit]
-        frames = self._sanitize_alarm_video_frames(frames)
+        if sanitize_frames:
+            frames = self._sanitize_alarm_video_frames(frames)
         if not frames:
             return None
 
         recordings_dir = settings.RECORDINGS_DIR
         recordings_dir.mkdir(parents=True, exist_ok=True)
-        filename = f"{channel_id}_alarm_{int(time.time() * 1000)}_{event_id}.mp4"
-        output_path = recordings_dir / filename
+        output_path = alarm_video_path(event_id)
         temp_output_path = recordings_dir / f"{output_path.stem}_raw{output_path.suffix}"
+        encoded_path = recordings_dir / f"{output_path.stem}_encoding{output_path.suffix}"
 
         first_frame = self._decode_alarm_video_frame(frames[0][1])
         height, width = first_frame.shape[:2]
@@ -1447,6 +1480,7 @@ class AnalysisService:
                 algorithm=algorithm,
                 model_id=model_id,
                 frames=frames,
+                inference_device=inference_device,
             )
             if task_id and algorithm and model_id
             else None
@@ -1487,23 +1521,20 @@ class AnalysisService:
                     "yuv420p",
                     "-movflags",
                     "+faststart",
-                    str(output_path),
+                    str(encoded_path),
                 ],
                 check=True,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
+            encoded_path.replace(output_path)
             try:
                 temp_output_path.unlink(missing_ok=True)
             except Exception:
                 pass
         except Exception:
+            encoded_path.unlink(missing_ok=True)
             if temp_output_path.exists():
-                try:
-                    if output_path.exists():
-                        output_path.unlink()
-                except Exception:
-                    pass
                 temp_output_path.replace(output_path)
         return str(output_path.resolve())
 
@@ -1610,7 +1641,7 @@ class AnalysisService:
         algorithm_id = algorithm.get("id")
         rule_type = str(algorithm.get("rule_type") or algorithm.get("algorithm_type") or "detection").lower()
         try:
-            model, model_meta = self._load_model(model_id)
+            model, model_meta = self._load_model(model_id, self._task_inference_device(str(task.get("id") or "")))
             raw_detections = self._detect_frame(
                 model,
                 model_meta,
@@ -1627,7 +1658,11 @@ class AnalysisService:
                     "confidence_threshold": float(algorithm.get("confidence", 0.25) or 0.25),
                 },
             )
-            detections = self._apply_algorithm_scoped_filters(raw_detections, task, algorithm)
+            if flow_regions(algorithm):
+                # Tracking must see people before and after both boundaries, not only inside the ROI.
+                detections = [dict(item) for item in raw_detections if item.get("class_name") == "person"]
+            else:
+                detections = self._apply_algorithm_scoped_filters(raw_detections, task, algorithm)
             self._log_task_detection_debug(
                 task=task,
                 algorithm=algorithm,
@@ -1753,6 +1788,7 @@ class AnalysisService:
         before_seconds: int,
         after_seconds: int,
         event_timestamp: float | None = None,
+        inference_device: str | None = None,
     ) -> None:
         if after_frames is None:
             after_frame_limit = max(int(round(max(fps, 1.0) * max(after_seconds, 0))), 0)
@@ -1782,6 +1818,7 @@ class AnalysisService:
             task_id=task_id,
             algorithm=algorithm,
             model_id=model_id,
+            inference_device=inference_device,
         )
         if not video_path:
             logger.warning("Failed to save task alarm video: task=%s event=%s", task_id, event["id"])
@@ -1824,6 +1861,30 @@ class AnalysisService:
         after_seconds: int,
         event_timestamp: float | None = None,
     ) -> None:
+        device = self._task_inference_device(task_id)
+        key = (model_id, device)
+        with self._lock:
+            allocation = self._task_gpu_allocations.get(task_id)
+            if allocation:
+                self._gpu_scheduler.retain(allocation)
+        with self._model_cache_lock:
+            self._alarm_video_model_refs[key] = self._alarm_video_model_refs.get(key, 0) + 1
+
+        def release_resources():
+            with self._model_cache_lock:
+                remaining = self._alarm_video_model_refs[key] - 1
+                if remaining:
+                    self._alarm_video_model_refs[key] = remaining
+                else:
+                    self._alarm_video_model_refs.pop(key)
+            try:
+                self._prune_model_cache()
+            except Exception:
+                logger.exception("Failed to prune model cache after alarm video: task=%s", task_id)
+            finally:
+                if allocation:
+                    self._gpu_scheduler.release(allocation)
+
         finalize_kwargs = {
             "task_id": task_id,
             "task_channel_id": task_channel_id,
@@ -1838,13 +1899,19 @@ class AnalysisService:
             "before_seconds": before_seconds,
             "after_seconds": after_seconds,
             "event_timestamp": event_timestamp,
+            "inference_device": device,
         }
         if after_frames is not None:
             finalize_kwargs["after_frames"] = list(after_frames)
-        future = self._alarm_video_executor.submit(
-            self._finalize_task_alarm_video_job,
-            **finalize_kwargs,
-        )
+        try:
+            future = self._alarm_video_executor.submit(
+                self._finalize_task_alarm_video_job,
+                **finalize_kwargs,
+            )
+        except Exception:
+            release_resources()
+            raise
+        future.add_done_callback(lambda _: release_resources())
         self._track_alarm_video_future(future)
 
         def _log_failure(done_future):
@@ -2353,6 +2420,7 @@ class AnalysisService:
             "class_name": persisted_detection.get("class_name", "unknown"),
             "conf": persisted_detection.get("conf", 0),
             "snapshot_path": snapshot_path,
+            "_need_video_clip": bool(algorithm.get("need_video_clip", True)),
             "handling_status": 0,
             "remark": json.dumps({
                 **persisted_detection,
@@ -2380,6 +2448,8 @@ class AnalysisService:
         return "count"
 
     def _update_count_metric(self, task: dict, algorithm: dict, detections: list[dict], now_ts: float) -> None:
+        if is_person_count_algorithm(algorithm):
+            raise ValueError("Person counting requires a person_flow region and confirmed crossings")
         algorithm_id = algorithm.get("id")
         if not algorithm_id:
             return
@@ -2406,6 +2476,42 @@ class AnalysisService:
                 "updated_ts": now_ts,
             },
         )
+
+    def _update_person_flow_metric(self, task, algorithm, detections, now_ts, states, run_id, *, frame=None):
+        regions = flow_regions(algorithm)
+        state = states.get(algorithm["id"])
+        if state is None:
+            validate_flow_algorithm(algorithm, list(algorithm.get("regions") or []))
+            metric_service.reset_person_flow_sync(task, algorithm, regions, run_id)
+            state = {"counter": PersonFlowCounter(), "balances": {region["id"]: 0 for region in regions}}
+            states[algorithm["id"]] = state
+        crossings = state["counter"].update(detections, regions, now_ts)
+        snapshot_path = None
+        if crossings and frame is not None:
+            try:
+                # One image per crossing frame; UUID avoids overwrites across tasks/algorithms.
+                snapshot_path = self._save_event_snapshot(
+                    f"person_count_{task['id']}_{algorithm['id']}_{uuid4().hex}",
+                    frame, detections, regions=regions,
+                )
+            except Exception:
+                # A storage failure must not discard an already confirmed crossing.
+                logger.exception(
+                    "[PersonFlowSnapshot] task=%s algorithm=%s failed to save snapshot; preserving count",
+                    task["id"], algorithm["id"],
+                )
+        histories = metric_service.record_person_flow_sync(
+            task=task, algorithm=algorithm, crossings=crossings, run_id=run_id,
+            now=datetime.fromtimestamp(now_ts), snapshot_path=snapshot_path,
+        )
+        for history in histories:
+            state["balances"][history["region_id"]] = history["metric_value"]
+            logger.info(
+                "[PersonFlow] task=%s algorithm=%s region=%s direction=%s track=%s balance=%s history_id=%s",
+                task["id"], algorithm["id"], history["region_id"], history["raw_json"]["direction"],
+                history["raw_json"]["track_id"], history["metric_value"], history["id"],
+            )
+        return sum(state["balances"].get(region["id"], 0) for region in regions)
 
     def _normalize_task_algorithms(self, task: dict) -> list[dict]:
         algorithms = list(task.get("algorithms") or [])
@@ -2576,6 +2682,9 @@ class AnalysisService:
         event_count = 0
         cooldown_cache: dict[str, float] = {}
         rule_state: dict[str, dict] = {}
+        person_flow_states: dict[str, dict] = {}
+        person_flow_run_id = uuid4().hex
+        missing_flow_regions: set[str] = set()
         pre_event_buffer: deque[tuple[float, object]] = deque(maxlen=self._alarm_video_pre_event_buffer_size())
         pending_alarm_videos: list[dict[str, Any]] = []
         capture = None
@@ -2583,6 +2692,7 @@ class AnalysisService:
         reconnect_count = 0
         previous_capture_sequence: int | None = None
         source_state: _TaskCaptureSourceState | None = None
+        external_video_buffer = None
 
         def flush_pending_alarm_videos(*, ready_only: bool) -> None:
             nonlocal pending_alarm_videos
@@ -2614,12 +2724,26 @@ class AnalysisService:
             algorithms = list(task_snapshot.get("algorithms") or [])
             if not algorithms:
                 raise ValueError("Task has no enabled algorithms")
+            external_video_buffer = self.external_video_capture.register(
+                task_id, task.get("channel_id"), pre_event_buffer, stop_event,
+            )
+            self._bind_task_inference_device(task_id)
+            for algorithm in algorithms:
+                if flow_regions(algorithm):
+                    self._update_person_flow_metric(
+                        task, algorithm, [], time.time(), person_flow_states, person_flow_run_id,
+                    )
             runtime_models = self._sync_task_runtime_state(
                 algorithms=algorithms,
                 runtime_models=task_snapshot.get("runtime_models") or {},
                 cooldown_cache=cooldown_cache,
                 rule_state=rule_state,
             )
+            for algorithm in algorithms:
+                if flow_regions(algorithm):
+                    runtime_models.setdefault(self._task_runtime_model_key(algorithm), {}).update(
+                        metric_type="person_count", metric_value=0,
+                    )
             config_refresh_interval = self._task_config_refresh_interval_seconds()
             runtime_heartbeat_interval = self._task_runtime_heartbeat_interval_seconds()
             next_config_refresh_at = (
@@ -2656,6 +2780,8 @@ class AnalysisService:
                 while not stop_event.is_set():
                     ok, frame = self._read_task_frame(capture)
                     if not ok:
+                        for state in person_flow_states.values():
+                            state["counter"].break_continuity()
                         read_fail_count += 1
                         switched_to_fallback = source_state.note_no_frame(time.time())
                         should_reconnect = read_fail_count >= TASK_ANALYSIS_READ_FAIL_LIMIT and (
@@ -2701,7 +2827,7 @@ class AnalysisService:
                                 rule_state=rule_state,
                             )
                             if source_changed:
-                                pre_event_buffer.clear()
+                                self.external_video_capture.reset(external_video_buffer)
                             capture = self._open_task_capture(
                                 task_id=task_id,
                                 task=task,
@@ -2748,7 +2874,7 @@ class AnalysisService:
                             )
                         continue
                     packed_frame = (now_ts, self._pack_alarm_video_frame(frame))
-                    pre_event_buffer.append(packed_frame)
+                    self.external_video_capture.append(external_video_buffer, packed_frame)
                     for pending_job in pending_alarm_videos:
                         pending_job["after_frames"].append(packed_frame)
                     flush_pending_alarm_videos(ready_only=True)
@@ -2768,6 +2894,9 @@ class AnalysisService:
                                 latest_fallback_url,
                             )
                             if source_changed:
+                                self.external_video_capture.reset(external_video_buffer)
+                                for state in person_flow_states.values():
+                                    state["counter"].break_continuity()
                                 flush_pending_alarm_videos(ready_only=False)
                                 self._release_task_capture(capture)
                                 capture = self._open_task_capture(
@@ -2782,7 +2911,6 @@ class AnalysisService:
                                 warmup_until_ts = time.time() + warmup_seconds if warmup_seconds > 0 else 0.0
                                 read_fail_count = 0
                                 reconnect_count = 0
-                                pre_event_buffer.clear()
                             task = latest_task
                             task_snapshot = latest_snapshot
                             source_url = source_state.active_source_url
@@ -2870,12 +2998,37 @@ class AnalysisService:
                         }
                         if error:
                             runtime_by_model[runtime_key]["last_error"] = error
+                            if algorithm_id in person_flow_states:
+                                person_flow_states[algorithm_id]["counter"].break_continuity()
                             continue
 
                         if rule_type == "count":
-                            self._update_count_metric(task, algorithm, detections, now_ts)
-                            runtime_by_model[runtime_key]["metric_value"] = len(detections)
+                            if is_person_count_algorithm(algorithm) and not flow_regions(algorithm):
+                                runtime_by_model[runtime_key].update(
+                                    metric_value=None, metric_type="person_count", metric_status="awaiting_flow_region",
+                                    last_error="Person counting requires a person_flow region; minute aggregation is disabled",
+                                )
+                                if algorithm_id not in missing_flow_regions:
+                                    logger.warning(
+                                        "[PersonFlow] task=%s algorithm=%s status=awaiting_flow_region; no history written",
+                                        task_id, algorithm_id,
+                                    )
+                                    missing_flow_regions.add(algorithm_id)
+                                continue
+                            missing_flow_regions.discard(algorithm_id)
+                            if flow_regions(algorithm):
+                                value = self._update_person_flow_metric(
+                                    task, algorithm, detections, now_ts, person_flow_states, person_flow_run_id,
+                                    frame=frame,
+                                )
+                            else:
+                                person_flow_states.pop(algorithm_id, None)
+                                self._update_count_metric(task, algorithm, detections, now_ts)
+                                value = len(detections)
+                            runtime_by_model[runtime_key]["metric_value"] = value
                             runtime_by_model[runtime_key]["metric_type"] = self._metric_type_for_algorithm(algorithm)
+                            if flow_regions(algorithm):
+                                runtime_by_model[runtime_key].update(metric_status="running", last_error=None)
                             continue
 
                         rule_events = self._build_rule_events(
@@ -3027,9 +3180,17 @@ class AnalysisService:
         except Exception as exc:
             self._update_task_runtime(task_id, status="error", last_error=str(exc), stopped_at=now_iso())
         finally:
+            if external_video_buffer is not None:
+                self.external_video_capture.close(external_video_buffer)
             with self._lock:
                 self._task_workers.pop(task_id, None)
-            self._prune_model_cache()
+                self._task_inference_devices.pop(task_id, None)
+                allocation = self._task_gpu_allocations.pop(task_id, None)
+            try:
+                self._prune_model_cache()
+            finally:
+                if allocation:
+                    self._gpu_scheduler.release(allocation)
             task = self._load_task(task_id)
             if task and task.get("runtime", {}).get("status") != "error":
                 self._update_task_runtime(
@@ -3061,17 +3222,18 @@ class AnalysisService:
                 daemon=True,
                 name=f"task-analysis-{task_id}",
             )
+            started_at = now_iso()
             self._task_workers[task_id] = {
                 "thread": thread,
                 "stop_event": stop_event,
-                "started_at": now_iso(),
+                "started_at": started_at,
             }
             thread.start()
 
         return {
             "task_id": task_id,
             "status": "starting",
-            "started_at": self._task_workers[task_id]["started_at"],
+            "started_at": started_at,
         }
 
     async def restart_task_analysis(self, task_id: str) -> dict | None:
@@ -3102,7 +3264,7 @@ class AnalysisService:
         self._update_task_runtime(task_id, status="restarting", stopped_at=now_iso())
         return await self.start_task_analysis(task_id)
 
-    async def stop_task_analysis(self, task_id: str) -> dict | None:
+    async def stop_task_analysis(self, task_id: str, *, wait: bool = False) -> dict | None:
         task = self._load_task(task_id)
         if not task:
             return None
@@ -3113,6 +3275,10 @@ class AnalysisService:
                 existing["stop_event"].set()
 
         self._update_task_runtime(task_id, status="stopping", stopped_at=now_iso())
+        if wait and existing:
+            await asyncio.to_thread(existing["thread"].join, 10)
+            if existing["thread"].is_alive():
+                raise ValueError("Task analysis worker is still stopping; retry deleting the task")
         return {
             "task_id": task_id,
             "status": "stopping",

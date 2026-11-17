@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import copy
 import tomllib
 from pathlib import Path
 
@@ -94,7 +93,3 @@ def load_camera_health_thresholds(path: Path | str | None = None) -> dict[str, d
     with config_path.open("rb") as fp:
         raw = tomllib.load(fp)
     return _validate_thresholds(raw)
-
-
-def default_camera_health_thresholds() -> dict[str, dict[str, float | int]]:
-    return copy.deepcopy(load_camera_health_thresholds())

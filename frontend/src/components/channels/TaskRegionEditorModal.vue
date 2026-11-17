@@ -65,6 +65,14 @@
             <input v-model="draftZone.color" type="color" class="color-input" />
           </label>
 
+          <div v-if="personCount" class="form-block">
+            <span>人员计数区域规则</span>
+            <span class="inline-muted">
+              按顺序点击四个角点。第1、2点为A线，第3、4点为B线；A→B进入加1，B→A离开减1。
+              保存时自动应用双线进出计数，无需选择区域类型。
+            </span>
+          </div>
+
           <div class="form-block">
             <span>保存说明</span>
             <div class="inline-muted">
@@ -108,6 +116,11 @@
             :viewBox="`0 0 ${imageSize.width} ${imageSize.height}`"
             preserveAspectRatio="none"
           >
+            <defs>
+              <marker :id="flowArrowId" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+                <path d="M 0 0 L 10 5 L 0 10 z" fill="#2563eb" />
+              </marker>
+            </defs>
             <g v-for="zone in displayZones" :key="zone.renderKey">
               <polygon
                 v-if="zone.coordinates.length >= 2"
@@ -116,6 +129,13 @@
                 :stroke="zone.color || '#3b82f6'"
                 :stroke-width="zone.selected ? 3 : 2"
               />
+              <g v-if="zone.type === 'person_flow' && zone.coordinates.length === 4">
+                <line :x1="zone.coordinates[0][0]" :y1="zone.coordinates[0][1]" :x2="zone.coordinates[1][0]" :y2="zone.coordinates[1][1]" stroke="#2563eb" stroke-width="5" />
+                <line :x1="zone.coordinates[2][0]" :y1="zone.coordinates[2][1]" :x2="zone.coordinates[3][0]" :y2="zone.coordinates[3][1]" stroke="#f59e0b" stroke-width="5" />
+                <text :x="edgeMidpoint(zone.coordinates, 0)[0]" :y="edgeMidpoint(zone.coordinates, 0)[1] - 12" fill="#2563eb" stroke="white" stroke-width="3" paint-order="stroke" font-size="24">A</text>
+                <text :x="edgeMidpoint(zone.coordinates, 2)[0]" :y="edgeMidpoint(zone.coordinates, 2)[1] - 12" fill="#b45309" stroke="white" stroke-width="3" paint-order="stroke" font-size="24">B</text>
+                <line :x1="edgeMidpoint(zone.coordinates, 0)[0]" :y1="edgeMidpoint(zone.coordinates, 0)[1]" :x2="edgeMidpoint(zone.coordinates, 2)[0]" :y2="edgeMidpoint(zone.coordinates, 2)[1]" stroke="#2563eb" stroke-width="3" :marker-end="`url(#${flowArrowId})`" />
+              </g>
               <g
                 v-if="zone.selected"
                 v-for="(point, index) in zone.coordinates"
@@ -154,6 +174,7 @@ type ZoneItem = {
   color?: string
   coordinates: number[][]
   enabled?: boolean
+  type?: string
 }
 
 type EditableZone = {
@@ -161,6 +182,8 @@ type EditableZone = {
   name: string
   color: string
   coordinates: number[][]
+  type: string
+  enabled: boolean
 }
 
 const props = defineProps<{
@@ -170,6 +193,7 @@ const props = defineProps<{
   channelId: string
   algorithmId: string
   algorithmName?: string
+  personCount?: boolean
 }>()
 
 const emit = defineEmits<{
@@ -205,6 +229,7 @@ let localZoneCounter = 0
 const isLocalZoneId = (zoneId?: string) => Boolean(zoneId && zoneId.startsWith(LOCAL_ZONE_PREFIX))
 
 const isEditingExisting = computed(() => Boolean(draftZone.value?.id && !isLocalZoneId(draftZone.value.id)))
+const flowArrowId = computed(() => `person-flow-arrow-${props.algorithmId}`)
 
 const displayZones = computed(() => {
   const selectedDraft = draftZone.value
@@ -217,6 +242,7 @@ const displayZones = computed(() => {
             name: selectedDraft.name,
             color: selectedDraft.color,
             coordinates: selectedDraft.coordinates,
+            type: selectedDraft.type,
           }
         : zone
 
@@ -263,6 +289,7 @@ const normalizeZone = (zone: any): ZoneItem => ({
     ? zone.coordinates.map((point: any) => [Number(point[0]), Number(point[1])])
     : [],
   enabled: zone.enabled !== false,
+  type: zone.type || 'polygon',
 })
 
 const cloneZone = (zone: ZoneItem): ZoneItem => ({
@@ -271,6 +298,7 @@ const cloneZone = (zone: ZoneItem): ZoneItem => ({
   color: zone.color || '#3b82f6',
   coordinates: cloneCoordinates(zone.coordinates),
   enabled: zone.enabled !== false,
+  type: zone.type || 'polygon',
 })
 
 const cloneZoneToDraft = (zone?: ZoneItem | null): EditableZone | null => {
@@ -280,6 +308,8 @@ const cloneZoneToDraft = (zone?: ZoneItem | null): EditableZone | null => {
     name: zone.name,
     color: zone.color || '#3b82f6',
     coordinates: cloneCoordinates(zone.coordinates),
+    type: zone.type || 'polygon',
+    enabled: zone.enabled !== false,
   }
 }
 
@@ -302,7 +332,8 @@ const commitDraftToZones = () => {
     name: draftZone.value.name || 'zone',
     color: draftZone.value.color || '#3b82f6',
     coordinates: cloneCoordinates(draftZone.value.coordinates),
-    enabled: true,
+    type: draftZone.value.type,
+    enabled: draftZone.value.enabled,
   })
 }
 
@@ -321,6 +352,7 @@ const createNewZone = () => {
   const zone: ZoneItem = {
     id: zoneId,
     name: `zone_${zones.value.length + 1}`,
+    type: props.personCount ? 'person_flow' : 'polygon',
     color: '#3b82f6',
     coordinates: [],
     enabled: true,
@@ -412,6 +444,7 @@ const getImagePoint = (event: MouseEvent) => {
 
 const handleStageClick = (event: MouseEvent) => {
   if (!draftZone.value) return
+  if (draftZone.value.type === 'person_flow' && draftZone.value.coordinates.length >= 4) return
   const point = getImagePoint(event)
   if (!point) return
   draftZone.value.coordinates = [...draftZone.value.coordinates, point]
@@ -479,6 +512,11 @@ const validateZones = (zoneItems: ZoneItem[]) => {
       }
     }
     seenNames.add(normalizedName)
+    if (zone.type === 'person_flow') {
+      if (!props.personCount || !validFlowPoints(zone.coordinates)) {
+        return { ok: false, zoneId: zone.id, message: '双线规则仅支持人员计数，请按顺序绘制四个角点，不能交叉或共线。' }
+      }
+    }
     if ((zone.coordinates || []).length < 3) {
       return {
         ok: false,
@@ -487,12 +525,19 @@ const validateZones = (zoneItems: ZoneItem[]) => {
       }
     }
   }
+  if (zoneItems.some(zone => zone.enabled !== false && zone.type === 'person_flow')
+    && zoneItems.some(zone => zone.enabled !== false && zone.type !== 'person_flow')) {
+    return { ok: false, zoneId: zoneItems[0]?.id, message: '同一算法不能混用双线计数区域和普通区域，请统一区域规则。' }
+  }
   return { ok: true as const }
 }
 
 const saveAndRefreshPreview = async () => {
   commitDraftToZones()
-  const currentZones = zones.value.map(cloneZone)
+  const currentZones = zones.value.map(zone => ({
+    ...cloneZone(zone),
+    type: props.personCount ? 'person_flow' : zone.type || 'polygon',
+  }))
   const validation = validateZones(currentZones)
   if (!validation.ok) {
     const invalidZone = currentZones.find((zone) => zone.id === validation.zoneId)
@@ -512,6 +557,7 @@ const saveAndRefreshPreview = async () => {
       color: zone.color || '#3b82f6',
       coordinates: zone.coordinates.map((point) => [Math.round(point[0]), Math.round(point[1])]),
       enabled: zone.enabled !== false,
+      type: zone.type || 'polygon',
     }))
 
     await replaceTaskAlgorithmRegions(props.taskId, props.algorithmId, {
@@ -534,6 +580,20 @@ const saveAndRefreshPreview = async () => {
 }
 
 const toPolygonPoints = (points: number[][]) => points.map((point) => `${point[0]},${point[1]}`).join(' ')
+
+const edgeMidpoint = (points: number[][], index: number) => [
+  (points[index][0] + points[(index + 1) % 4][0]) / 2,
+  (points[index][1] + points[(index + 1) % 4][1]) / 2,
+]
+
+const validFlowPoints = (points: number[][]) => {
+  if (points.length !== 4 || points.some(p => p.length !== 2 || p.some(v => !Number.isFinite(v) || v < 0))) return false
+  const turns = points.map((p, i) => {
+    const q = points[(i + 1) % 4], r = points[(i + 2) % 4]
+    return (q[0] - p[0]) * (r[1] - q[1]) - (q[1] - p[1]) * (r[0] - q[0])
+  })
+  return turns.every(v => v > 1e-6) || turns.every(v => v < -1e-6)
+}
 
 const withAlpha = (color: string, alpha: number) => {
   if (!color.startsWith('#')) return color

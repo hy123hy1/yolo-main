@@ -1,0 +1,138 @@
+# Standalone Ascend deployment. Do not merge with the NVIDIA compose file.
+x-runtime: &runtime
+  image: yolo-backend:ascend-310p
+  # Use native ARM64 images; explicit platform needs Engine API >=1.41.
+  build:
+    context: ../..
+    dockerfile: docker/ascend/Dockerfile
+    args:
+      ASCEND_BASE_IMAGE: ${ASCEND_BASE_IMAGE:-yolo-ascend-sdk:310p3-test}
+  restart: unless-stopped
+  devices:
+    - /dev/davinci${ASCEND_DEVICE_ID:-0}:/dev/davinci${ASCEND_DEVICE_ID:-0}
+    - /dev/davinci_manager:/dev/davinci_manager
+    - /dev/devmm_svm:/dev/devmm_svm
+    - /dev/hisi_hdc:/dev/hisi_hdc
+  volumes:
+    - /usr/local/Ascend/driver:/usr/local/Ascend/driver:ro
+    - ../../backend/configs:/app/configs:ro
+    - ../../backend/data:/app/data
+    - ../../backend/models:/app/models
+  logging:
+    driver: json-file
+    options:
+      max-size: 20m
+      max-file: "3"
+
+x-environment: &environment
+  AI_INFERENCE_BACKEND: ascend_om
+  AI_INFERENCE_DEVICE: npu:${ASCEND_DEVICE_ID:-0}
+  ASCEND_DEVICE_ID: ${ASCEND_DEVICE_ID:-0}
+  ASCEND_ENV_SCRIPT: ${ASCEND_ENV_SCRIPT:-/usr/local/Ascend/ascend-toolkit/set_env.sh}
+  ENABLE_TRAINING: "false"
+  METADATA_DB_ENABLED: "true"
+  METADATA_DB_STRICT: "true"
+  # Empty permits ZLM-only startup; the application entrypoint rejects an empty DSN.
+  METADATA_DATABASE_URL: ${METADATA_DATABASE_URL:-}
+  ZLM_API_BASE: http://zlm-server:80
+  ZLM_SECRET: ${ZLM_SECRET:-}
+  ZLM_PLAY_BASE: http://${PUBLIC_HOST:-192.168.1.179}:${ZLM_HTTP_PORT:-8010}
+  ZLM_WEBRTC_BASE: webrtc://${PUBLIC_HOST:-192.168.1.179}:${ZLM_HTTP_PORT:-8010}
+  ZLM_PUBLIC_RTSP_HOST: ${PUBLIC_HOST:-192.168.1.179}
+  ZLM_PUBLIC_RTMP_HOST: ${PUBLIC_HOST:-192.168.1.179}
+  ZLM_PUBLIC_HTTP_HOST: ${PUBLIC_HOST:-192.168.1.179}
+  ZLM_RTSP_PORT: ${ZLM_RTSP_PORT:-554}
+  ZLM_RTMP_PORT: ${ZLM_RTMP_PORT:-1935}
+  ZLM_HTTP_PORT: ${ZLM_HTTP_PORT:-8010}
+  ALARM_PUSH_PUBLIC_BASE_URL: http://${PUBLIC_HOST:-192.168.1.179}:${BACKEND_PORT:-8000}
+  TZ: Asia/Shanghai
+
+services:
+  zlm-server:
+    image: ${ZLM_IMAGE:-zlmediakit/zlmediakit:master}
+    restart: unless-stopped
+    ports:
+      - "${ZLM_HTTP_PORT:-8010}:80"
+      - "${ZLM_RTSP_PORT:-554}:554"
+      - "${ZLM_RTMP_PORT:-1935}:1935"
+    volumes:
+      - zlm-conf:/opt/media/conf
+      - zlm-www:/opt/media/bin/www
+      - zlm-log:/opt/media/bin/log
+      - zlm-ffmpeg:/opt/media/bin/ffmpeg
+    environment:
+      TZ: Asia/Shanghai
+    logging:
+      driver: json-file
+      options:
+        max-size: 20m
+        max-file: "3"
+
+  mysql:
+    image: mysql:8.0
+    restart: unless-stopped
+    ports:
+      - "${MYSQL_PUBLISHED_PORT:-3306}:3306"
+    volumes:
+      - ${MYSQL_DATA_DIR:-/data/mysql/data}:/var/lib/mysql
+      - ${MYSQL_CONF_DIR:-/data/mysql/conf}:/etc/mysql/conf.d
+      - ${MYSQL_LOG_DIR:-/data/mysql/logs}:/var/log/mysql
+    environment:
+      TZ: Asia/Shanghai
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "--silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: 20m
+        max-file: "3"
+
+  backend:
+    <<: *runtime
+    profiles: ["video-ai"]
+    networks:
+      - default
+    depends_on:
+      zlm-server:
+        condition: service_started
+      mysql:
+        condition: service_healthy
+    ports:
+      - "${BACKEND_PORT:-8000}:8000"
+    environment:
+      <<: *environment
+    command: ["uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  electronic-seal-worker:
+    <<: *runtime
+    profiles: ["electronic-seal"]
+    networks:
+      - default
+    depends_on:
+      zlm-server:
+        condition: service_started
+      mysql:
+        condition: service_healthy
+    ports:
+      - "${ELECTRONIC_SEAL_PORT:-9001}:9001"
+    environment:
+      <<: *environment
+      ELECTRONIC_SEAL_ENABLED: "true"
+      ELECTRONIC_SEAL_DEVICE: npu:${ASCEND_DEVICE_ID:-0}
+    command: ["uvicorn", "src.electronic_seal.main:app", "--host", "0.0.0.0", "--port", "9001"]
+
+volumes:
+  zlm-conf:
+  zlm-www:
+  zlm-log:
+  zlm-ffmpeg:
+

@@ -1,0 +1,7 @@
+-r requirements-runtime.txt
+# ais_bench/aclruntime are supplied by the verified aarch64 CANN base image.
+# Preserve an already-installed NumPy 2.x; the target SDK was tested with 2.5.3.
+numpy>=1.26,<3
+opencv-python-headless==4.11.0.86
+pillow>=11.0.0
+pyyaml==6.0.1

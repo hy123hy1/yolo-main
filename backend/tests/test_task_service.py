@@ -84,23 +84,27 @@ class TaskServiceTest(unittest.IsolatedAsyncioTestCase):
         from src.services import analysis_service as analysis_service_module
         from src.services import event_service as event_service_module
         from src.services import metric_service as metric_service_module
+        from src.services import model_service as model_service_module
         from src.services import recording_service as recording_service_module
         from src.services import task_service as task_service_module
         from src.services.channel_service import ChannelService
-        from src.services.wvp_service import WVPService
 
         self.original_task_service_session_local = task_service_module.SessionLocal
         self.original_analysis_service_session_local = analysis_service_module.SessionLocal
         self.original_event_service_session_local = event_service_module.SessionLocal
         self.original_metric_service_session_local = metric_service_module.SessionLocal
         self.original_recording_service_session_local = recording_service_module.SessionLocal
+        self.original_channel_service_session_local = channel_service_module.SessionLocal
+        self.original_model_service_session_local = model_service_module.SessionLocal
+        self.original_task_channel_service = task_service_module.channel_service
         task_service_module.SessionLocal = self.session_local
         analysis_service_module.SessionLocal = self.session_local
         event_service_module.SessionLocal = self.session_local
         metric_service_module.SessionLocal = self.session_local
         recording_service_module.SessionLocal = self.session_local
+        channel_service_module.SessionLocal = self.session_local
+        model_service_module.SessionLocal = self.session_local
         task_service_module.channel_service = ChannelService()
-        task_service_module.wvp_service = WVPService()
 
         from src.services.task_service import TaskService
 
@@ -113,6 +117,7 @@ class TaskServiceTest(unittest.IsolatedAsyncioTestCase):
         from src.services import analysis_service as analysis_service_module
         from src.services import event_service as event_service_module
         from src.services import metric_service as metric_service_module
+        from src.services import model_service as model_service_module
         from src.services import recording_service as recording_service_module
         from src.services import task_service as task_service_module
         task_service_module.SessionLocal = self.original_task_service_session_local
@@ -120,6 +125,9 @@ class TaskServiceTest(unittest.IsolatedAsyncioTestCase):
         event_service_module.SessionLocal = self.original_event_service_session_local
         metric_service_module.SessionLocal = self.original_metric_service_session_local
         recording_service_module.SessionLocal = self.original_recording_service_session_local
+        channel_service_module.SessionLocal = self.original_channel_service_session_local
+        model_service_module.SessionLocal = self.original_model_service_session_local
+        task_service_module.channel_service = self.original_task_channel_service
         settings.TASKS_DIR = self.original_tasks_dir
         settings.EVENTS_DIR = self.original_events_dir
         settings.RECORDINGS_DIR = self.original_recordings_dir

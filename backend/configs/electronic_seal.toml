@@ -1,6 +1,6 @@
-# Electronic-seal worker defaults. The worker is CPU-only by design.
+# Electronic-seal worker defaults. The deployment provides NVIDIA CUDA.
 enabled = true
-device = "cpu"
+device = "cuda:0"
 max_workers = 2
 max_channel_workers = 8
 sample_interval_ms = 1000

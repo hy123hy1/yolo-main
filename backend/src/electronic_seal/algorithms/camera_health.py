@@ -15,10 +15,10 @@ from src.services.camera_health_defaults import (
     CAMERA_VIEW_SHIFT,
     load_camera_health_thresholds,
 )
-from src.services.camera_occlusion_detector import CameraOcclusionDetector
 from src.services.camera_health_state_machine import CameraHealthStateMachine
-from src.services.camera_view_shift_detector import CameraViewShiftDetector
 from src.services.camera_health_types import DetectorResult
+from src.vision_core.camera_occlusion_detector import CameraOcclusionDetector
+from src.vision_core.camera_view_shift_detector import CameraViewShiftDetector
 
 
 SUPPORTED_CAMERA_HEALTH_ALGORITHMS = frozenset({CAMERA_OCCLUSION, CAMERA_VIEW_SHIFT})

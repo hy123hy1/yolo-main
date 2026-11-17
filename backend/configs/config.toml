@@ -27,6 +27,17 @@
     TaskAlarmVideoCaptureTimeoutSeconds = 25
     TaskAlarmVideoReadFailLimit = 20
 
+[AlarmPush]
+  # Default receiver, synchronized to the target table on backend startup.
+  Enabled = true
+  # push address
+  PushURL = "http://192.168.1.16:15299/api/open/camera_ai_alarm"
+  # Address reachable by the receiving Java server, not a container hostname.
+  PublicBaseURL = "http://192.168.1.61:8000"
+  TimeoutSeconds = 10
+  # Total delivery attempts, including the first request.
+  MaxAttempts = 3
+
 [Data]
   MetadataDBEnabled = true
   MetadataDBStrict = false
@@ -37,12 +48,19 @@
     #   ./data/metadata.db
     #   mysql+pymysql://root:root@192.168.1.58:3006/sp-ai-yolo?charset=utf8mb4
     #   postgresql+psycopg2://postgres:123456@127.0.0.1:5432/sp_ai_yolo
-    Dsn = "mysql+pymysql://root:root@192.168.1.200:3007/sp-ai-yolo?charset=utf8mb4"
+    Dsn = "mysql+pymysql://root:root@192.168.1.200:3307/sp-ai-yolo?charset=utf8mb4"
 
 [AI]
   # auto: use cuda:0 when CUDA is visible, otherwise CPU.
   # cuda:0: prefer the first NVIDIA GPU and fall back to CPU if unavailable.
   InferenceDevice = "cuda:0"
+  # Adaptive placement applies only to continuous video AI detection tasks.
+  TaskGpuAdaptive = true
+  # CUDA-local indices visible inside the backend container.
+  # GpuCandidates = "0,1,2,3"
+  GpuCandidates = "0"
+  GpuMinFreeMB = 2048
+  GpuTaskReserveMB = 1024
 
 [Media]
   APIBase = "http://host.docker.internal:8010"

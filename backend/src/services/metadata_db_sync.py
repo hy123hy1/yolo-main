@@ -469,6 +469,9 @@ def migrate_metadata_database_schema() -> None:
         ])
         dialect_name = (session.bind.dialect.name or "").lower()
         _ensure_metric_tables_v2(session, dialect_name)
+        _add_column_if_missing(
+            session, "task_algorithm_metric_history", "snapshot_path", "snapshot_path TEXT",
+        )
 
         if dialect_name == "sqlite":
             _add_column_if_missing(session, "channels", "flv", "flv TEXT")

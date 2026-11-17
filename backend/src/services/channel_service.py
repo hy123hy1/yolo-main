@@ -1297,11 +1297,13 @@ class ChannelService:
             await self.play(channel_id)
             return await self.get_channel(channel_id)
         except Exception as exc:
+            error_message = str(exc)
+
             def _mark_error():
                 latest = self._load_channel_from_db(channel_id)
                 if not latest:
                     latest = dict(item)
-                latest.setdefault("ext", {})["auto_play_error"] = str(exc)
+                latest.setdefault("ext", {})["auto_play_error"] = error_message
                 latest["updated_at"] = now_iso()
                 self._save_channel_item(latest)
                 return latest
@@ -2024,32 +2026,14 @@ class ChannelService:
         }
 
     def _run_detection_once(self, weights_path: str, model_meta: dict, image_path: str, conf_threshold: float):
-        from ultralytics import YOLO
+        from src.inference import load_detection_model, predict_detections
 
-        model = YOLO(str(weights_path))
-        results = model(
-            image_path,
-            verbose=False,
-            conf=conf_threshold,
-            device=analysis_service._resolve_inference_device(),
-        )
-        detections = []
-        classes = model_meta.get("classes", [])
-        for result in results:
-            boxes = result.boxes
-            for i in range(len(boxes)):
-                box = boxes[i]
-                x1, y1, x2, y2 = box.xyxy[0].tolist()
-                conf = float(box.conf[0])
-                class_id = int(box.cls[0])
-                class_name = classes[class_id] if class_id < len(classes) else f"class_{class_id}"
-                detections.append({
-                    "class_id": class_id,
-                    "class_name": class_name,
-                    "conf": conf,
-                    "x1": x1,
-                    "y1": y1,
-                    "x2": x2,
-                    "y2": y2,
-                })
-        return detections
+        model = load_detection_model(weights_path, model_meta)
+        try:
+            return predict_detections(model, model_meta, image_path, conf_threshold,
+                                      analysis_service._resolve_inference_device())
+        finally:
+            from src.inference.ascend_om import AscendOmDetector
+
+            if isinstance(model, AscendOmDetector):
+                model.close()

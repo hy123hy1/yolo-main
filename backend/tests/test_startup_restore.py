@@ -14,6 +14,17 @@ from src import main
 
 
 class StartupRestoreTest(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        for item in (
+            patch.object(main, "ensure_alarm_push_schema"),
+            patch.object(main.alarm_push_worker, "start"),
+            patch.object(main.analysis_service.external_video_capture, "recover_interrupted"),
+            patch.object(main, "ensure_electronic_seal_schema"),
+            patch.object(main, "ensure_camera_health_schema"),
+        ):
+            item.start()
+            self.addCleanup(item.stop)
+
     async def test_startup_schedules_restore_in_background(self):
         async def slow_restore():
             await asyncio.sleep(1)
@@ -26,7 +37,7 @@ class StartupRestoreTest(unittest.IsolatedAsyncioTestCase):
             return object()
 
         with (
-            patch.object(main, "initialize_metadata_database", side_effect=lambda: time.sleep(0.2)),
+            patch.object(main, "initialize_metadata_database", side_effect=lambda **_: time.sleep(0.2)),
             patch.object(main, "ensure_camera_health_schema"),
             patch.object(main.channel_service, "restore_channel_proxies", AsyncMock(side_effect=slow_restore)),
             patch.object(main.task_service, "restore_running_tasks", AsyncMock(side_effect=slow_restore)),
@@ -41,7 +52,7 @@ class StartupRestoreTest(unittest.IsolatedAsyncioTestCase):
     async def test_startup_waits_before_restoring_running_tasks(self):
         with (
             patch.object(main.settings, "STARTUP_TASK_RESTORE_INITIAL_DELAY_SECONDS", 2.0, create=True),
-            patch.object(main, "initialize_metadata_database", side_effect=lambda: None),
+            patch.object(main, "initialize_metadata_database", side_effect=lambda **_: None),
             patch.object(main.channel_service, "restore_channel_proxies", AsyncMock(return_value={"restored": 0})),
             patch.object(main.task_service, "restore_running_tasks", AsyncMock(return_value={"restored": 0})),
             patch.object(main.analysis_service, "restore_enabled_channels", AsyncMock(return_value={"restored": 0})),
@@ -65,11 +76,12 @@ class StartupRestoreTest(unittest.IsolatedAsyncioTestCase):
             await main._restore_runtime_state_after_startup()
 
         mocked_initialize.assert_called_once_with(sync_files=False)
+        if main.settings.METADATA_DB_ENABLED:
+            main.analysis_service.external_video_capture.recover_interrupted.assert_called_once_with()
 
     async def test_startup_restores_enabled_camera_health_channels(self):
         with (
-            patch.object(main, "initialize_metadata_database", side_effect=lambda: None),
-            patch.object(main, "ensure_camera_health_schema"),
+            patch.object(main, "initialize_metadata_database", side_effect=lambda **_: None),
             patch.object(main, "ensure_camera_health_schema"),
             patch.object(main.channel_service, "restore_channel_proxies", AsyncMock(return_value={"restored": 0})),
             patch.object(main.task_service, "restore_running_tasks", AsyncMock(return_value={"restored": 0})),

@@ -690,7 +690,7 @@ class AnalysisServiceTest(unittest.TestCase):
             )
 
         self.assertEqual(detections, [])
-        self.assertEqual(calls[0]["device"], "cuda:0")
+        self.assertEqual(str(calls[0]["device"]), "cuda:0")
 
     def test_alarm_video_clip_is_limited_by_frame_count(self):
         service = AnalysisService()

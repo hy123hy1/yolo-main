@@ -79,20 +79,11 @@ class ZonePreviewServiceTest(unittest.IsolatedAsyncioTestCase):
         self.temp_dir.cleanup()
 
     async def test_ffmpeg_capture_rtsp_probe_keeps_hevc_codec_headers(self):
-        capture = object.__new__(FFmpegCapture)
-        capture.source_url = "rtsp://example/live/test"
-        capture.width = 1920
-        capture.height = 1080
-        capture.frame_size = 1920 * 1080 * 3
-        capture.process = None
-        capture._pending_frame_bytes = bytearray()
-
         fake_process = object()
         with (
-            patch("src.services.zone_preview_service.subprocess.Popen", return_value=fake_process) as popen_mock,
-            patch("src.services.zone_preview_service.time.sleep"),
+            patch("src.vision_core.ffmpeg_capture.subprocess.Popen", return_value=fake_process) as popen_mock,
         ):
-            capture.start()
+            capture = FFmpegCapture("rtsp://example/live/test", 1920, 1080, init_wait=0)
 
         command = popen_mock.call_args.args[0]
         self.assertEqual(command[command.index("-probesize") + 1], "5M")

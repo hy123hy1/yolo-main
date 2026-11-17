@@ -1,0 +1,226 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>人员分析测试页</title>
+  <style>
+    :root { color-scheme: light; font-family: system-ui, sans-serif; }
+    body { margin: 0; background: #f4f6f8; color: #1f2933; }
+    header { padding: 20px 24px; background: #17324d; color: white; }
+    main { max-width: 1200px; margin: 20px auto; padding: 0 16px; }
+    button, select, input, textarea { font: inherit; }
+    button { cursor: pointer; border: 0; border-radius: 4px; padding: 8px 12px; background: #1677ff; color: white; }
+    button.secondary { background: #607080; }
+    button.danger { background: #b42318; }
+    .toolbar { display: flex; gap: 8px; align-items: center; margin-bottom: 16px; }
+    .channel { background: white; border: 1px solid #d9e0e7; border-radius: 6px; padding: 16px; margin-bottom: 14px; }
+    .channel-head { display: flex; justify-content: space-between; gap: 12px; align-items: center; }
+    .grid { display: grid; grid-template-columns: minmax(0, 1.35fr) minmax(280px, .65fr); gap: 16px; margin-top: 12px; }
+    .preview { position: relative; width: 100%; min-height: 220px; background: #101820; border-radius: 4px; overflow: hidden; }
+    .preview img { display: block; width: 100%; height: auto; min-height: 220px; object-fit: contain; }
+    .preview canvas { position: absolute; inset: 0; width: 100%; height: 100%; cursor: crosshair; }
+    .preview.empty img { display: none; }
+    .empty-message { position: absolute; inset: 0; display: grid; place-items: center; color: #b9c4cf; padding: 20px; text-align: center; }
+    .preview:not(.empty) .empty-message { display: none; }
+    .tools, .geometry-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+    .tools button.active { background: #0e7490; }
+    .geometry-json { margin: 10px 0 0; padding: 10px; background: #f7f9fb; border: 1px solid #e1e7ed; border-radius: 4px; white-space: pre-wrap; word-break: break-word; font: 12px/1.45 ui-monospace, monospace; }
+    label { display: flex; gap: 8px; align-items: center; }
+    .status { color: #52606d; font-size: 13px; margin-top: 10px; }
+    .error { color: #b42318; }
+    @media (max-width: 760px) { .grid { grid-template-columns: 1fr; } .channel-head { align-items: flex-start; flex-direction: column; } }
+  </style>
+</head>
+<body>
+  <header><strong>人员分析接口测试</strong><div>启用后服务默认使用 YOLO + ByteTrack。当前人数与单向进入事件分别展示。</div></header>
+  <main>
+    <div class="toolbar"><button id="reload">刷新摄像头</button><span id="message"></span></div>
+    <div id="channels"></div>
+  </main>
+  <script>
+    const root = document.getElementById('channels');
+    const message = document.getElementById('message');
+    const esc = value => String(value ?? '').replace(/[&<>"']/g, char => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
+    const pretty = value => JSON.stringify(value || {}, null, 2);
+
+    function pointsFromConfig(config) {
+      return Array.isArray(config?.points)
+        ? config.points.filter(point => Array.isArray(point) && point.length === 2)
+          .map(point => [Number(point[0]), Number(point[1])])
+          .filter(point => point.every(value => Number.isFinite(value)))
+        : [];
+    }
+
+    function drawGeometry(canvas, regionPoints, generatedLine = []) {
+      const context = canvas.getContext('2d');
+      const width = canvas.clientWidth;
+      const height = canvas.clientHeight;
+      const scale = window.devicePixelRatio || 1;
+      if (!width || !height) return;
+      if (canvas.width !== Math.round(width * scale) || canvas.height !== Math.round(height * scale)) {
+        canvas.width = Math.round(width * scale);
+        canvas.height = Math.round(height * scale);
+      }
+      context.setTransform(scale, 0, 0, scale, 0, 0);
+      context.clearRect(0, 0, width, height);
+
+      const drawPoints = (points, color, close = false) => {
+        if (!points.length) return;
+        context.beginPath();
+        points.forEach(([x, y], index) => {
+          const px = x * width;
+          const py = y * height;
+          if (index === 0) context.moveTo(px, py); else context.lineTo(px, py);
+        });
+        if (close && points.length >= 3) context.closePath();
+        context.strokeStyle = color;
+        context.lineWidth = 3;
+        context.stroke();
+        if (close && points.length >= 3) {
+          context.fillStyle = `${color}33`;
+          context.fill();
+        }
+        context.fillStyle = color;
+        points.forEach(([x, y], index) => {
+          context.beginPath();
+          context.arc(x * width, y * height, 5, 0, Math.PI * 2);
+          context.fill();
+          context.fillStyle = '#fff';
+          context.font = '12px system-ui';
+          context.fillText(String(index + 1), x * width + 8, y * height - 8);
+          context.fillStyle = color;
+        });
+      };
+      drawPoints(regionPoints, '#f59e0b', true);
+      drawPoints(regionPoints.slice(0, 2), '#ef4444');
+      drawPoints(generatedLine, '#22c55e');
+    }
+
+    function generatedLineFromRegion(points) {
+      if (points.length !== 4) return [];
+      const interpolate = (start, end, fraction) => [
+        start[0] + (end[0] - start[0]) * fraction,
+        start[1] + (end[1] - start[1]) * fraction,
+      ];
+      return [interpolate(points[0], points[3], 1 / 3), interpolate(points[1], points[2], 1 / 3)];
+    }
+
+    async function json(url, options) {
+      const response = await fetch(url, options);
+      const body = await response.json();
+      if (!response.ok) throw new Error(body.detail || `HTTP ${response.status}`);
+      return body;
+    }
+
+    async function load() {
+      message.textContent = '加载中...';
+      try {
+        const data = await json('/channels');
+        root.innerHTML = '';
+        for (const channel of data.items || []) await addChannel(channel);
+        message.textContent = `${data.total || 0} 个摄像头`;
+      } catch (error) {
+        message.textContent = error.message;
+        message.className = 'error';
+      }
+    }
+
+    async function addChannel(channel) {
+      const config = await json(`/channels/${encodeURIComponent(channel.id)}/person-analysis/config`);
+      const status = await json(`/channels/${encodeURIComponent(channel.id)}/person-analysis/status`);
+      const item = document.createElement('section');
+      item.className = 'channel';
+      item.innerHTML = `
+        <div class="channel-head"><div><strong>${esc(channel.name || channel.id)}</strong><div>${esc(channel.id)}</div></div>
+          <label><input class="enabled" type="checkbox" ${config.enabled ? 'checked' : ''}> 启用人员分析</label></div>
+        <div class="grid">
+          <div>
+            <div class="preview empty"><img class="snapshot" alt="${esc(channel.name || channel.id)} 抓拍图"><canvas></canvas><div class="empty-message">暂无抓拍图，请先生成基准图或检查视频流</div></div>
+            <div class="tools">
+              <button class="refresh-image secondary">刷新抓拍图</button>
+              <button class="draw-region">绘制防区</button>
+              <button class="finish-region secondary" hidden>完成防区</button>
+            </div>
+            <div class="geometry-actions">
+              <button class="clear-region danger">清除区域</button>
+            </div>
+          </div>
+          <div>
+            <div class="status">Worker: ${status.running ? '运行中' : '未运行'}，当前人数: ${status.current_count ?? '-'}，最近通行: ${status.last_entry_at || '-'}</div>
+            <div class="status">提示：按顺序绘制四个点。第一、第二个点组成红色目标边，只统计从对侧朝目标边通行的人员；绿色判定线由系统自动生成。</div>
+            <pre class="geometry-json"></pre>
+            <button class="save">保存配置</button><span class="status result"></span>
+          </div>
+        </div>`;
+
+      const preview = item.querySelector('.preview');
+      const image = item.querySelector('.snapshot');
+      const canvas = item.querySelector('canvas');
+      const regionPoints = pointsFromConfig(config.region_config);
+      let generatedLine = config.generated_line || generatedLineFromRegion(regionPoints);
+      let drawMode = null;
+
+      const updateJson = () => {
+        item.querySelector('.geometry-json').textContent = JSON.stringify({
+          generated_line: generatedLine,
+          region_config: regionPoints.length >= 3 ? {points: regionPoints} : {},
+        }, null, 2);
+        drawGeometry(canvas, regionPoints, generatedLine);
+      };
+      const updateModeButtons = () => {
+        item.querySelector('.draw-region').classList.toggle('active', drawMode === 'region');
+        item.querySelector('.finish-region').hidden = drawMode !== 'region';
+      };
+      const loadImage = () => {
+        preview.classList.add('empty');
+        image.onload = () => { preview.classList.remove('empty'); drawGeometry(canvas, regionPoints, generatedLine); };
+        image.onerror = () => preview.classList.add('empty');
+        image.src = `/channels/${encodeURIComponent(channel.id)}/snapshot/image?t=${Date.now()}`;
+      };
+      const getPoint = event => {
+        const rect = canvas.getBoundingClientRect();
+        return [
+          Math.min(1, Math.max(0, (event.clientX - rect.left) / rect.width)),
+          Math.min(1, Math.max(0, (event.clientY - rect.top) / rect.height)),
+        ];
+      };
+      canvas.addEventListener('click', event => {
+        if (!drawMode) return;
+        const point = getPoint(event);
+        if (regionPoints.length >= 4) regionPoints.splice(0, regionPoints.length);
+        regionPoints.push(point);
+        if (regionPoints.length === 4) { generatedLine = generatedLineFromRegion(regionPoints); drawMode = null; }
+        updateModeButtons();
+        updateJson();
+      });
+      item.querySelector('.draw-region').addEventListener('click', () => { drawMode = 'region'; updateModeButtons(); });
+      item.querySelector('.finish-region').addEventListener('click', () => { drawMode = null; updateModeButtons(); });
+      item.querySelector('.clear-region').addEventListener('click', () => { regionPoints.splice(0, regionPoints.length); generatedLine = []; updateJson(); });
+      item.querySelector('.refresh-image').addEventListener('click', loadImage);
+      item.querySelector('.save').addEventListener('click', async () => {
+        const result = item.querySelector('.result');
+        if (regionPoints.length > 0 && regionPoints.length !== 4) { result.className = 'status result error'; result.textContent = '防区需要四个点'; return; }
+        try {
+          const body = {
+            enabled: item.querySelector('.enabled').checked,
+            region_config: regionPoints.length === 4 ? {points: regionPoints} : {},
+          };
+          await json(`/channels/${encodeURIComponent(channel.id)}/person-analysis/config`, {
+            method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)
+          });
+          result.className = 'status result'; result.textContent = '已保存';
+          generatedLine = generatedLineFromRegion(regionPoints); updateJson();
+        } catch (error) { result.className = 'status result error'; result.textContent = error.message; }
+      });
+      window.addEventListener('resize', updateJson);
+      updateJson();
+      loadImage();
+      root.appendChild(item);
+    }
+
+    document.getElementById('reload').addEventListener('click', load);
+    load();
+  </script>
+</body>
+</html>

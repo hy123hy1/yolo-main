@@ -23,7 +23,7 @@ _DEFAULT_DEFAULTS_FILE = _BACKEND_DIR / "configs" / "electronic_seal_defaults.to
 
 class ElectronicSealSettings(BaseSettings):
     enabled: bool = True
-    device: str = "cpu"
+    device: str = "cuda:0"
     max_workers: int = Field(default=2, ge=1)
     max_channel_workers: int = Field(default=8, ge=1)
     sample_interval_ms: int = Field(default=1000, ge=1)

@@ -27,7 +27,7 @@ Useful prefixes are `[ElectronicSeal]` for channel workers and `electronic-seal 
 
 ## Resource Settings
 
-The compose service requests `gpus: all` and defaults inference to `cuda:0` through `ELECTRONIC_SEAL_DEVICE`. Its current resource limit is 2 CPUs and 2 GB memory. It does not depend on the AI backend process. Evidence is stored under `backend/data/electronic_seal`.
+The compose service requests `gpus: all` and defaults inference to `cuda:0` through `ELECTRONIC_SEAL_DEVICE`. The standalone settings and `backend/configs/electronic_seal.toml` use the same CUDA default. Its current resource limit is 2 CPUs and 2 GB memory. It does not depend on the AI backend process. Evidence is stored under `backend/data/electronic_seal`.
 
 ## Configuration and Recovery
 

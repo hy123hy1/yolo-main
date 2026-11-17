@@ -14,6 +14,7 @@ from config import settings
 class PersonDetection:
     box: tuple[int, int, int, int]
     confidence: float
+    track_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -26,8 +27,8 @@ class PersonCountResult:
 
 def encode_person_count(person_count: int) -> str:
     value = int(person_count)
-    if value <= 0:
-        raise ValueError("person count must be greater than 0")
+    if value < 0:
+        raise ValueError("person count cannot be negative")
     if value > 9999:
         raise ValueError("person count cannot exceed 9999")
     return f"{value:04d}"
@@ -56,7 +57,7 @@ class PersonCountDetector:
         self.model_factory = model_factory
         self._model: Any | None = None
 
-    def analyze(self, frame: Any) -> PersonCountResult:
+    def analyze(self, frame: Any, *, track: bool = False) -> PersonCountResult:
         if frame is None or not hasattr(frame, "size") or frame.size == 0:
             raise ValueError("frame is empty")
         model = self._ensure_model()
@@ -70,7 +71,12 @@ class PersonCountDetector:
         }
         if self.device:
             kwargs["device"] = self.device
-        raw_results = model(frame, **kwargs)
+        if track:
+            kwargs["tracker"] = "bytetrack.yaml"
+            kwargs["persist"] = True
+            raw_results = model.track(frame, **kwargs)
+        else:
+            raw_results = model(frame, **kwargs)
         elapsed_ms = (time.perf_counter() - started) * 1000
         result = next(iter(raw_results), None) if _is_iterable(raw_results) else raw_results
         detections = self._extract_person_detections(result, model)
@@ -79,6 +85,22 @@ class PersonCountDetector:
             detections=tuple(detections),
             inference_ms=elapsed_ms,
             source_frame=frame,
+        )
+
+    def new_context(self) -> "PersonCountDetector":
+        """Create an independent detector context for one video stream.
+
+        Ultralytics keeps ByteTrack state on the model/predictor when
+        ``persist=True``.  A fresh detector therefore prevents track IDs from
+        leaking between channels while retaining the same model settings.
+        The model itself remains lazy-loaded in the new context.
+        """
+        return type(self)(
+            model_path=self.model_path,
+            confidence=self.confidence,
+            image_size=self.image_size,
+            device=self.device,
+            model_factory=self.model_factory,
         )
 
     @staticmethod
@@ -124,10 +146,16 @@ class PersonCountDetector:
         classes = _to_numpy(getattr(boxes, "cls", []))
         confidences = _to_numpy(getattr(boxes, "conf", []))
         coordinates = _to_numpy(getattr(boxes, "xyxy", []))
+        raw_track_ids = getattr(boxes, "id", None)
+        track_ids = (
+            _to_numpy(raw_track_ids).reshape(-1)
+            if raw_track_ids is not None
+            else np.empty((0,))
+        )
         names = getattr(result, "names", None) or getattr(model, "names", None) or {}
         detections: list[PersonDetection] = []
-        for class_id, confidence, coordinate in zip(
-            classes.tolist(), confidences.tolist(), coordinates.tolist()
+        for index, (class_id, confidence, coordinate) in enumerate(
+            zip(classes.tolist(), confidences.tolist(), coordinates.tolist())
         ):
             confidence_value = float(confidence)
             if confidence_value < self.confidence:
@@ -140,6 +168,11 @@ class PersonCountDetector:
                 PersonDetection(
                     box=tuple(int(round(value)) for value in coordinate[:4]),
                     confidence=confidence_value,
+                    track_id=(
+                        _track_id(track_ids[index])
+                        if index < len(track_ids)
+                        else None
+                    ),
                 )
             )
         return detections
@@ -165,3 +198,14 @@ def _class_name(names: Any, class_id: int) -> str:
     if isinstance(names, (list, tuple)) and 0 <= class_id < len(names):
         return str(names[class_id])
     return ""
+
+
+def _track_id(value: Any) -> str | None:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        text = str(value).strip()
+        return text or None
+    if not np.isfinite(numeric):
+        return None
+    return str(int(numeric)) if numeric.is_integer() else str(numeric)

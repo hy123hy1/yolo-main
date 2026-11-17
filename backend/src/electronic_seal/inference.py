@@ -46,13 +46,13 @@ class YoloInferenceAdapter:
         self,
         *,
         registry_dir: Path | str,
-        device: str = "cpu",
+        device: str = "cuda:0",
         model_loader: Callable[[str], Any] | None = None,
         metadata_loader: Callable[[str], dict[str, Any]] | None = None,
     ) -> None:
         self.registry_dir = Path(registry_dir)
         self.device = device
-        self._model_loader = model_loader or self._load_yolo_model
+        self._model_loader = model_loader
         self._metadata_loader = metadata_loader or (
             lambda model_id: _default_metadata_loader(model_id, self.registry_dir)
         )
@@ -78,41 +78,15 @@ class YoloInferenceAdapter:
             raise ValueError("conf_threshold must be between 0 and 1")
 
         model, metadata = self._get_model(model_id)
-        call_kwargs = {"verbose": False, "conf": conf_threshold}
-        if self.device:
-            call_kwargs["device"] = self.device
-        results = model(frame, **call_kwargs)
-        detections: list[dict[str, Any]] = []
-        for result in results or ():
-            boxes = getattr(result, "boxes", None)
-            if boxes is None:
-                continue
-            names = (
-                metadata.get("classes")
-                or getattr(result, "names", None)
-                or getattr(model, "names", None)
-                or getattr(getattr(model, "model", None), "names", None)
-                or {}
-            )
-            for index in range(len(boxes)):
-                box = boxes[index]
-                class_id = int(self._scalar(getattr(box, "cls", [0])))
-                confidence = float(self._scalar(getattr(box, "conf", [0.0])))
-                xyxy = self._values(getattr(box, "xyxy", []))
-                if len(xyxy) == 1 and isinstance(xyxy[0], (list, tuple)):
-                    xyxy = xyxy[0]
-                if len(xyxy) < 4:
-                    continue
-                label = self._class_name(names, class_id)
-                detections.append(
-                    YoloDetection(
-                        label=label,
-                        confidence=confidence,
-                        bbox=[float(value) for value in xyxy[:4]],
-                        class_id=class_id,
-                    ).to_dict()
-                )
-        return detections
+        from src.inference import predict_detections
+
+        return [
+            YoloDetection(
+                label=item["class_name"].strip().lower(), confidence=item["conf"],
+                bbox=[item[key] for key in ("x1", "y1", "x2", "y2")], class_id=item["class_id"],
+            ).to_dict()
+            for item in predict_detections(model, metadata, frame, conf_threshold, self.device)
+        ]
 
     def _get_model(self, model_id: str) -> tuple[Any, dict[str, Any]]:
         cached = self._model_cache.get(model_id)
@@ -132,40 +106,10 @@ class YoloInferenceAdapter:
                 weights_path = fallback.resolve()
             else:
                 raise ValueError(f"model weights not found: {weights_path}")
-        model = self._model_loader(str(weights_path))
+        from src.inference import load_detection_model
+
+        model = self._model_loader(str(weights_path)) if self._model_loader else load_detection_model(weights_path, metadata)
         self._model_cache[model_id] = (model, metadata)
         return model, metadata
-
-    @staticmethod
-    def _load_yolo_model(weights_path: str) -> Any:
-        from ultralytics import YOLO
-
-        return YOLO(weights_path)
-
-    @staticmethod
-    def _values(value: Any) -> list[Any]:
-        if hasattr(value, "tolist"):
-            value = value.tolist()
-        if isinstance(value, (tuple, list)):
-            return list(value)
-        return [value]
-
-    @classmethod
-    def _scalar(cls, value: Any) -> Any:
-        values = cls._values(value)
-        if len(values) == 1 and isinstance(values[0], (tuple, list)):
-            return cls._scalar(values[0])
-        return values[0] if values else 0
-
-    @staticmethod
-    def _class_name(names: Any, class_id: int) -> str:
-        if isinstance(names, dict):
-            value = names.get(class_id, names.get(str(class_id), f"class_{class_id}"))
-        elif isinstance(names, (list, tuple)) and 0 <= class_id < len(names):
-            value = names[class_id]
-        else:
-            value = f"class_{class_id}"
-        return str(value).strip().lower() or f"class_{class_id}"
-
 
 __all__ = ["YoloDetection", "YoloInferenceAdapter"]

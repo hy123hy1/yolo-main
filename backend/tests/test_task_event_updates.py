@@ -95,7 +95,6 @@ class TaskEventUpdatesTest(unittest.IsolatedAsyncioTestCase):
         from src.services import event_service as event_service_module
         from src.services import recording_service as recording_service_module
         from src.services import task_service as task_service_module
-        from src.services.wvp_service import WVPService
 
         self.original_analysis_service_session_local = analysis_service_module.SessionLocal
         self.original_channel_service_session_local = channel_service_module.SessionLocal
@@ -103,7 +102,6 @@ class TaskEventUpdatesTest(unittest.IsolatedAsyncioTestCase):
         self.original_recording_service_session_local = recording_service_module.SessionLocal
         self.original_task_service_session_local = task_service_module.SessionLocal
         self.original_task_channel_service = task_service_module.channel_service
-        self.original_task_wvp_service = task_service_module.wvp_service
 
         analysis_service_module.SessionLocal = self.session_local
         channel_service_module.SessionLocal = self.session_local
@@ -111,7 +109,6 @@ class TaskEventUpdatesTest(unittest.IsolatedAsyncioTestCase):
         recording_service_module.SessionLocal = self.session_local
         task_service_module.SessionLocal = self.session_local
         task_service_module.channel_service = ChannelService()
-        task_service_module.wvp_service = WVPService()
 
         self.task_service = TaskService()
         self.event_service = EventService()
@@ -134,7 +131,6 @@ class TaskEventUpdatesTest(unittest.IsolatedAsyncioTestCase):
         recording_service_module.SessionLocal = self.original_recording_service_session_local
         task_service_module.SessionLocal = self.original_task_service_session_local
         task_service_module.channel_service = self.original_task_channel_service
-        task_service_module.wvp_service = self.original_task_wvp_service
 
         settings.TASKS_DIR = self.original_tasks_dir
         settings.EVENTS_DIR = self.original_events_dir
@@ -486,7 +482,7 @@ class TaskEventUpdatesTest(unittest.IsolatedAsyncioTestCase):
                 return True, np.zeros((16, 32, 3), dtype=np.uint8)
             return False, None
 
-        def _fake_load_model(model_id):
+        def _fake_load_model(model_id, device=None):
             return model_id, {"classes": ["person"]}
 
         def _fake_detect(model, _model_meta, _frame, _confidence):

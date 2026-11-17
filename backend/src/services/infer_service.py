@@ -17,6 +17,7 @@ import numpy as np
 from datetime import datetime
 from src.core.settings import settings
 from src.services.analysis_service import analysis_service
+from src.inference import load_detection_model, predict_detections
 
 class InferService:
     def __init__(self):
@@ -48,6 +49,8 @@ class InferService:
             return None, None, "Model weights_path not found in model.json"
         
         weights_path = Path(weights_path_str)
+        if settings.AI_INFERENCE_BACKEND == "ascend_om" and weights_path.suffix.lower() != ".om":
+            return None, None, "Ascend OM deployment requires .om weights; PT recovery/fallback is disabled"
         
         # 如果不是绝对路径，则相对于 model_dir 解析
         if not weights_path.is_absolute():
@@ -57,6 +60,14 @@ class InferService:
         # 尝试解析路径（处理可能的符号链接等）
         weights_path = weights_path.resolve()
         
+        if not weights_path.exists():
+            if weights_path.suffix.lower() == ".om":
+                relocated = model_dir / "weights" / weights_path.name
+                if relocated.is_file():
+                    weights_path = relocated
+                else:
+                    return None, None, f"OM model not found: {weights_path}; PT fallback is forbidden"
+
         if not weights_path.exists():
             # 提供更详细的错误信息，包括尝试的路径
             error_msg = f"Model weights not found. Expected path: {weights_path}"
@@ -114,8 +125,7 @@ class InferService:
             if not found:
                 return None, None, error_msg
         
-        from ultralytics import YOLO
-        model = YOLO(str(weights_path))
+        model = load_detection_model(weights_path, model_meta)
         
         self._model_cache[model_id] = (model, model_meta, None)
         return model, model_meta, None
@@ -137,10 +147,7 @@ class InferService:
             with Image.open(tmp_path) as img:
                 image_width, image_height = img.size
             
-            results = model(tmp_path, verbose=False, device=self._resolve_inference_device())
-            
-            # 解析结果
-            detections = self._parse_results(results, model_meta)
+            detections = predict_detections(model, model_meta, tmp_path, device=self._resolve_inference_device())
             
             return {
                 "model_id": model_id,
@@ -203,8 +210,7 @@ class InferService:
                 # 对每张图片进行推理
                 for img_info in image_infos:
                     try:
-                        infer_results = model(img_info["path"], verbose=False, device=self._resolve_inference_device())
-                        detections = self._parse_results(infer_results, model_meta)
+                        detections = predict_detections(model, model_meta, img_info["path"], device=self._resolve_inference_device())
                         
                         model_results["images"].append({
                             "filename": img_info["filename"],
@@ -235,31 +241,6 @@ class InferService:
             # 清理所有临时文件
             for tmp_path in temp_files:
                 self._cleanup_temp_file(tmp_path)
-    
-    def _parse_results(self, results, model_meta):
-        """解析推理结果"""
-        detections = []
-        for result in results:
-            boxes = result.boxes
-            for i in range(len(boxes)):
-                box = boxes[i]
-                x1, y1, x2, y2 = box.xyxy[0].tolist()
-                conf = float(box.conf[0])
-                class_id = int(box.cls[0])
-                
-                classes = model_meta.get("classes", [])
-                class_name = classes[class_id] if class_id < len(classes) else f"class_{class_id}"
-                
-                detections.append({
-                    "class_id": class_id,
-                    "class_name": class_name,
-                    "conf": conf,
-                    "x1": x1,
-                    "y1": y1,
-                    "x2": x2,
-                    "y2": y2
-                })
-        return detections
     
     def _cleanup_temp_file(self, tmp_path: str):
         """清理临时文件"""
@@ -304,7 +285,6 @@ class InferService:
             fourcc = cv2.VideoWriter_fourcc(*'mp4v')
             out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
             
-            classes = model_meta.get("classes", [])
             frame_count = 0
             all_detections = []
             
@@ -317,37 +297,29 @@ class InferService:
                 frame_count += 1
                 
                 # 使用YOLO进行推理
-                results = model(frame, verbose=False, conf=conf_threshold, device=self._resolve_inference_device())
+                detections = predict_detections(model, model_meta, frame, conf_threshold, self._resolve_inference_device())
                 
                 # 绘制检测框
                 frame_detections = []
-                for result in results:
-                    boxes = result.boxes
-                    for i in range(len(boxes)):
-                        box = boxes[i]
-                        x1, y1, x2, y2 = [int(v) for v in box.xyxy[0].tolist()]
-                        conf = float(box.conf[0])
-                        class_id = int(box.cls[0])
-                        class_name = classes[class_id] if class_id < len(classes) else f"class_{class_id}"
-                        
-                        # 绘制边界框
-                        color = self._get_color(class_id)
-                        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-                        
-                        # 绘制标签
-                        label = f"{class_name}: {conf:.2f}"
-                        label_size, _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
-                        cv2.rectangle(frame, (x1, y1 - label_size[1] - 10), 
-                                    (x1 + label_size[0], y1), color, -1)
-                        cv2.putText(frame, label, (x1, y1 - 5), 
-                                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-                        
-                        frame_detections.append({
-                            "class_id": class_id,
-                            "class_name": class_name,
-                            "conf": conf,
-                            "bbox": [x1, y1, x2, y2]
-                        })
+                for detection in detections:
+                    x1, y1, x2, y2 = [int(detection[key]) for key in ("x1", "y1", "x2", "y2")]
+                    conf = detection["conf"]
+                    class_id = detection["class_id"]
+                    class_name = detection["class_name"]
+                    color = self._get_color(class_id)
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+                    label = f"{class_name}: {conf:.2f}"
+                    label_size, _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+                    cv2.rectangle(frame, (x1, y1 - label_size[1] - 10),
+                                  (x1 + label_size[0], y1), color, -1)
+                    cv2.putText(frame, label, (x1, y1 - 5),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                    frame_detections.append({
+                        "class_id": class_id,
+                        "class_name": class_name,
+                        "conf": conf,
+                        "bbox": [x1, y1, x2, y2]
+                    })
                 
                 all_detections.append({
                     "frame": frame_count,
@@ -420,7 +392,6 @@ class InferService:
             # 发送视频信息
             yield f"data: {json.dumps({'type': 'info', 'fps': fps, 'width': width, 'height': height, 'total_frames': total_frames})}\n\n"
             
-            classes = model_meta.get("classes", [])
             frame_count = 0
             
             # 处理每一帧
@@ -432,37 +403,29 @@ class InferService:
                 frame_count += 1
                 
                 # 使用YOLO进行推理
-                results = model(frame, verbose=False, conf=conf_threshold, device=self._resolve_inference_device())
+                detections = predict_detections(model, model_meta, frame, conf_threshold, self._resolve_inference_device())
                 
                 # 解析检测结果
                 frame_detections = []
-                for result in results:
-                    boxes = result.boxes
-                    for i in range(len(boxes)):
-                        box = boxes[i]
-                        x1, y1, x2, y2 = [int(v) for v in box.xyxy[0].tolist()]
-                        conf = float(box.conf[0])
-                        class_id = int(box.cls[0])
-                        class_name = classes[class_id] if class_id < len(classes) else f"class_{class_id}"
-                        
-                        # 绘制边界框到帧上
-                        color = self._get_color(class_id)
-                        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-                        
-                        # 绘制标签
-                        label = f"{class_name}: {conf:.2f}"
-                        label_size, _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
-                        cv2.rectangle(frame, (x1, y1 - label_size[1] - 10), 
-                                    (x1 + label_size[0], y1), color, -1)
-                        cv2.putText(frame, label, (x1, y1 - 5), 
-                                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-                        
-                        frame_detections.append({
-                            "class_id": class_id,
-                            "class_name": class_name,
-                            "conf": conf,
-                            "bbox": [x1, y1, x2, y2]
-                        })
+                for detection in detections:
+                    x1, y1, x2, y2 = [int(detection[key]) for key in ("x1", "y1", "x2", "y2")]
+                    conf = detection["conf"]
+                    class_id = detection["class_id"]
+                    class_name = detection["class_name"]
+                    color = self._get_color(class_id)
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+                    label = f"{class_name}: {conf:.2f}"
+                    label_size, _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+                    cv2.rectangle(frame, (x1, y1 - label_size[1] - 10),
+                                  (x1 + label_size[0], y1), color, -1)
+                    cv2.putText(frame, label, (x1, y1 - 5),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                    frame_detections.append({
+                        "class_id": class_id,
+                        "class_name": class_name,
+                        "conf": conf,
+                        "bbox": [x1, y1, x2, y2]
+                    })
                 
                 # 将帧编码为JPEG
                 _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
@@ -532,8 +495,7 @@ class InferService:
                     img_array = np.array(img)
                 
                 # 执行推理
-                infer_results = model(tmp_path, verbose=False, device=self._resolve_inference_device())
-                detections = self._parse_results(infer_results, model_meta)
+                detections = predict_detections(model, model_meta, tmp_path, device=self._resolve_inference_device())
                 
                 # 生成UUID
                 image_uuid = str(uuid.uuid4())

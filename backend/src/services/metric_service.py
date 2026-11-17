@@ -1,6 +1,7 @@
 from datetime import datetime, timedelta
 from typing import Any
 
+from src.alarm_push.service import enqueue_metric_history
 from src.db.database import SessionLocal
 from src.db.models import ModelMetaRecord, TaskAlgorithmMeta, TaskAlgorithmMetricHistoryMeta, TaskAlgorithmMetricMeta
 from src.services.platform_storage import format_datetime
@@ -11,6 +12,76 @@ CUMULATIVE_METRIC_TYPES = frozenset({"count", "person_count", "vehicle_count"})
 
 
 class MetricService:
+    def reset_person_flow_sync(self, task: dict, algorithm: dict, regions: list[dict], run_id: str):
+        now = datetime.now()
+        with SessionLocal() as session:
+            session.query(TaskAlgorithmMetricMeta).filter(
+                TaskAlgorithmMetricMeta.task_id == task["id"],
+                TaskAlgorithmMetricMeta.algorithm_id == algorithm["id"],
+                TaskAlgorithmMetricMeta.metric_type == "person_count",
+            ).delete(synchronize_session=False)
+            for region in regions:
+                session.add(TaskAlgorithmMetricMeta(
+                    task_id=task["id"], algorithm_id=algorithm["id"],
+                    channel_id=task.get("channel_id"), model_id=algorithm.get("model_id"),
+                    metric_type="person_count", metric_value=0,
+                    region_id=region["id"], region_name=region.get("name"), scope_key=region["id"],
+                    updated_at=now, raw_json={"counting_mode": "person_flow", "run_id": run_id},
+                ))
+            session.commit()
+
+    def record_person_flow_sync(
+        self, *, task: dict, algorithm: dict, crossings: list[dict], run_id: str,
+        now: datetime | None = None,
+        snapshot_path: str | None = None,
+    ) -> list[dict]:
+        """Persist each confirmed crossing, its balance and delivery job atomically."""
+        if not crossings:
+            return []
+        now = now or datetime.now()
+        histories = []
+        with SessionLocal() as session:
+            for crossing in crossings:
+                region_id = crossing["region_id"]
+                row = session.query(TaskAlgorithmMetricMeta).filter(
+                    TaskAlgorithmMetricMeta.task_id == task["id"],
+                    TaskAlgorithmMetricMeta.algorithm_id == algorithm["id"],
+                    TaskAlgorithmMetricMeta.metric_type == "person_count",
+                    TaskAlgorithmMetricMeta.scope_key == region_id,
+                ).with_for_update().one_or_none()
+                if row is None:
+                    row = TaskAlgorithmMetricMeta(
+                        task_id=task["id"], algorithm_id=algorithm["id"], metric_type="person_count",
+                        scope_key=region_id,
+                    )
+                    session.add(row)
+                previous = float(row.metric_value or 0) if (row.raw_json or {}).get("run_id") == run_id else 0
+                delta = crossing["delta"]
+                if delta not in (-1, 1):
+                    raise ValueError("person flow delta must be +1 or -1")
+                details = {
+                    "counting_mode": "person_flow", "run_id": run_id,
+                    "delta": delta, "balance_before": previous,
+                    "direction": crossing["direction"], "track_id": crossing["track_id"],
+                }
+                row.channel_id, row.model_id = task.get("channel_id"), algorithm.get("model_id")
+                row.region_id, row.region_name = region_id, crossing.get("region_name")
+                row.metric_value, row.updated_at, row.raw_json = previous + delta, now, dict(details)
+                history = TaskAlgorithmMetricHistoryMeta(
+                    task_id=task["id"], algorithm_id=algorithm["id"], channel_id=task.get("channel_id"),
+                    model_id=algorithm.get("model_id"), metric_type="person_count", metric_value=row.metric_value,
+                    region_id=region_id, region_name=crossing.get("region_name"),
+                    snapshot_path=snapshot_path,
+                    sampled_at=now, created_at=now, raw_json=dict(details),
+                )
+                session.add(history)
+                session.flush()
+                payload = self._history_from_row(history)
+                enqueue_metric_history(session, payload)
+                histories.append(payload)
+            session.commit()
+        return histories
+
     @staticmethod
     def _is_cumulative_metric(metric_type: str) -> bool:
         return str(metric_type or "").strip().lower() in CUMULATIVE_METRIC_TYPES
@@ -157,6 +228,7 @@ class MetricService:
             "metric_value": row.metric_value,
             "region_id": row.region_id,
             "region_name": row.region_name,
+            "snapshot_path": row.snapshot_path,
             "sampled_at": format_datetime(row.sampled_at),
             "created_at": format_datetime(row.created_at),
             "raw_json": dict(row.raw_json or {}),

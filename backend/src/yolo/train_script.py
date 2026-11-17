@@ -5,7 +5,6 @@
 import argparse
 import json
 import sys
-import os
 from pathlib import Path
 from datetime import datetime
 
@@ -99,11 +98,6 @@ def main():
         # 使用传入的 batch size
         batch_size = args.batch
         
-        # Windows 兼容性：在 Windows 上使用 workers=0 避免多进程问题
-        # Windows 上的 PyTorch multiprocessing 使用 spawn 模式，需要额外内存
-        # 如果页面文件不足，会导致错误 1455
-        workers = 0 if os.name == 'nt' else 4  # Windows 单进程，Linux/Mac 多进程
-        
         train_kwargs = {
             "data": args.data,
             "epochs": args.epochs,
@@ -125,10 +119,10 @@ def main():
         if args.resume:
             print(f"[{datetime.now().isoformat()}] Resuming training from checkpoint...")
             train_kwargs["resume"] = True
-            results = model.train(**train_kwargs)
+            model.train(**train_kwargs)
         else:
             print(f"[{datetime.now().isoformat()}] Starting new training...")
-            results = model.train(**train_kwargs)
+            model.train(**train_kwargs)
         
         print(f"[{datetime.now().isoformat()}] Training completed!")
         

@@ -3,7 +3,6 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from typing import Optional
 from src.services.model_service import ModelService
-import os
 
 router = APIRouter(prefix="/models", tags=["models"])
 model_service = ModelService()

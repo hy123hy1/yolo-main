@@ -16,6 +16,8 @@ from src.services.metadata_db_sync import initialize_metadata_database
 from src.services.task_service import TaskService
 from src.services.zone_preview_service import zone_preview_service
 from src.electronic_seal.store import ensure_electronic_seal_schema
+from src.alarm_push.api import router as alarm_push_router
+from src.alarm_push.service import alarm_push_worker, ensure_schema as ensure_alarm_push_schema
 
 app = FastAPI(title="YOLO Training Platform API")
 channel_service = ChannelService()
@@ -51,6 +53,7 @@ app.include_router(recordings.router)
 app.include_router(proxy_sms.router)
 app.include_router(server_monitor.router)
 app.include_router(camera_health.router)
+app.include_router(alarm_push_router)
 
 
 async def _restore_runtime_state_after_startup():
@@ -61,8 +64,15 @@ async def _restore_runtime_state_after_startup():
             return
         await asyncio.sleep(startup_task_restore_delay)
 
+    async def _start_alarm_push():
+        if settings.METADATA_DB_ENABLED:
+            await asyncio.to_thread(ensure_alarm_push_schema)
+            await asyncio.to_thread(analysis_service.external_video_capture.recover_interrupted)
+            alarm_push_worker.start()
+
     steps = [
         ("initialize_metadata_database", lambda: asyncio.to_thread(initialize_metadata_database, sync_files=False)),
+        ("initialize_alarm_push", _start_alarm_push),
         ("ensure_camera_health_schema", lambda: asyncio.to_thread(ensure_camera_health_schema)),
         ("ensure_electronic_seal_schema", lambda: asyncio.to_thread(ensure_electronic_seal_schema)),
         ("restore_channel_proxies", channel_service.restore_channel_proxies),
@@ -100,6 +110,7 @@ async def restore_ai_analysis_tasks():
 
 @app.on_event("shutdown")
 async def shutdown_runtime_workers():
+    await asyncio.to_thread(alarm_push_worker.stop)
     try:
         result = await analysis_service.stop_all()
         logger.info("[ShutdownCleanup] step=stop_all_analysis status=ok result=%s", result)

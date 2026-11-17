@@ -1,0 +1,82 @@
+# Run from this directory: docker compose -f docker-compose.t4.yml up -d
+# Requires the preloaded Linux AMD64 images and NVIDIA Container Toolkit.
+# Business settings are maintained in backend/configs/config.toml.
+services:
+  zlm-server:
+    image: zlmediakit/zlmediakit:master
+    container_name: yolo-t4-zlm
+    restart: unless-stopped
+    ports:
+      - "8010:8010"
+      - "443:443"
+      - "1935:1935"
+      - "554:554"
+      - "3011:3011"
+      - "8011:8011"
+      - "8011:8011/udp"
+      - "3478:3478"
+      - "3478:3478/udp"
+      - "10000:10000"
+      - "10000:10000/udp"
+      - "9000:9000/udp"
+    volumes:
+      - ./zlm/conf-t4:/opt/media/conf
+      - ./zlm/www:/opt/media/bin/www
+      - ./zlm/log:/opt/media/bin/log
+      - ./zlm/ffmpeg:/opt/media/bin/ffmpeg
+    environment:
+      TZ: Asia/Shanghai
+    networks:
+      - yolo-network
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
+
+  backend:
+    image: docker-backend:latest
+    container_name: yolo-t4-backend
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      - ../backend/configs:/app/configs
+      - ../backend/data:/app/data
+      - ../backend/models:/app/models
+      - ../backend/src:/app/src:ro
+    shm_size: "24gb"
+    environment:
+      APP_CONFIG_FILE: /app/configs/config.toml
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      TZ: Asia/Shanghai
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    networks:
+      - yolo-network
+    depends_on:
+      zlm-server:
+        condition: service_started
+    command: ["uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
+
+networks:
+  yolo-network:
+    driver: bridge
+    name: yolo-network

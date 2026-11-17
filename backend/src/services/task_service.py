@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime
 import logging
 import time
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
+from sqlalchemy import select
 from src.core.settings import settings
 from src.db.database import SessionLocal
 from src.db.models import AlgorithmRegionMeta, ModelMetaRecord, TaskAlgorithmMeta, TaskAlgorithmMetricMeta, TaskAlgorithmRegionMeta, TaskMeta, TaskRegionMeta
@@ -17,6 +17,7 @@ from src.services.channel_service import ChannelService
 from src.services import metadata_db_sync
 from src.services.metadata_db_sync import delete_json_document
 from src.services.metric_service import metric_service
+from src.services.person_flow_counter import is_person_count_algorithm, validate_flow_algorithm
 from src.services.platform_storage import format_datetime, generate_id, list_json_items, load_json, now_iso, save_json
 from src.services.model_service import ModelService
 
@@ -196,7 +197,9 @@ class TaskService:
             if not isinstance(region, dict):
                 continue
             normalized = self._normalize_region(region)
-            normalized["id"] = self._build_private_region_id(algorithm_id, normalized.get("id"))
+            if not (normalized.get("type") == "person_flow" and algorithm_id
+                    and str(normalized.get("id") or "").startswith(f"{algorithm_id}_")):
+                normalized["id"] = self._build_private_region_id(algorithm_id, normalized.get("id"))
             normalized_regions.append(normalized)
         return normalized_regions
 
@@ -258,6 +261,11 @@ class TaskService:
         return normalized_runtime
 
     def _normalize_algorithm(self, algorithm: dict[str, Any], task_regions: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+        if not algorithm.get("id") and any(
+            region.get("type") == "person_flow" for region in algorithm.get("regions", [])
+            if isinstance(region, dict)
+        ):
+            algorithm = {**algorithm, "id": generate_id("algo")}
         need_video_clip = self._default_true_bool(algorithm.get("need_video_clip"))
         need_snapshot = self._default_true_bool(algorithm.get("need_snapshot"))
         labels = list(algorithm.get("labels") or [])
@@ -297,6 +305,8 @@ class TaskService:
         rule_type = algorithm.get("rule_type") or algorithm.get("algorithm_type") or "detection"
         label_source = algorithm.get("label_source") or ("all" if detect_all_classes else ("recommended" if scene_key else "manual"))
         requires_region = bool(algorithm.get("requires_region", algorithm.get("need_overlay", False)))
+
+        validate_flow_algorithm({**algorithm, "rule_type": rule_type, "detect_all_classes": detect_all_classes}, normalized_regions)
 
         return {
             "id": algorithm.get("id") or generate_id("algo"),
@@ -515,6 +525,17 @@ class TaskService:
 
     def _save_task_to_metadata(self, task: dict[str, Any]) -> None:
         with SessionLocal() as session:
+            valid_flow_scopes = {
+                (algorithm["id"], region["id"])
+                for algorithm in task.get("algorithms", []) for region in algorithm.get("regions", [])
+                if region.get("type") == "person_flow"
+            }
+            saved_flow_metrics = [dict(row) for row in session.execute(
+                select(TaskAlgorithmMetricMeta.__table__).where(
+                    TaskAlgorithmMetricMeta.task_id == task["id"],
+                ).with_for_update()
+            ).mappings() if (row["raw_json"] or {}).get("counting_mode") == "person_flow"
+                and (row["algorithm_id"], row["region_id"]) in valid_flow_scopes]
             session.merge(self._build_task_meta_row(task))
             session.query(TaskAlgorithmMetricMeta).filter(TaskAlgorithmMetricMeta.task_id == task["id"]).delete()
             session.query(AlgorithmRegionMeta).filter(AlgorithmRegionMeta.task_id == task["id"]).delete()
@@ -610,6 +631,7 @@ class TaskService:
                         )
                     )
 
+            session.add_all(TaskAlgorithmMetricMeta(**row) for row in saved_flow_metrics)
             session.commit()
 
     def _attach_model_names_to_task(self, task: dict[str, Any]) -> dict[str, Any]:
@@ -1032,6 +1054,8 @@ class TaskService:
         item = await self.get_task(task_id, prefer_metadata=True)
         if not item:
             return None
+        # Stop before deletion so an in-flight counter cannot recreate realtime rows.
+        await analysis_service.stop_task_analysis(task_id, wait=True)
         if path.exists():
             path.unlink()
         with SessionLocal() as session:
@@ -1217,6 +1241,9 @@ class TaskService:
         for index, algorithm in enumerate(algorithms):
             if algorithm.get("id") != algorithm_id:
                 continue
+
+            if is_person_count_algorithm(algorithm):
+                requested_regions = [{**region, "type": "person_flow"} for region in requested_regions]
 
             normalized_algorithm = self._normalize_algorithm(
                 {

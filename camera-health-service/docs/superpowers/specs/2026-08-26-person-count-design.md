@@ -12,7 +12,7 @@ MySQL `person_count` 表。
 - 复用现有 FFmpeg Reader 和 FrameBuffer，不为人员计数重复拉取视频流。
 - YOLO 每个通道每 1 秒最多检测一次。
 - 只统计模型输出中类别名称为 `person` 的目标。
-- 检测人数大于 0 时，每次成功检测生成一条计数记录。
+- 检测人数大于 0 时，人数变化立即生成计数记录；人数不变时按独立的数据库写入心跳间隔生成记录。
 - 仅在人数相对上一次成功检测发生变化时保存标注图片。
 - 人员计数推理、落库或图片保存失败时，不影响现有摄像头健康检测。
 - 支持 Java 后端查询计数记录、计数运行状态和标注图片。
@@ -52,14 +52,15 @@ COMMENT '是否启用人员计数：0关闭，1启用';
 
 ### 2.3 落库与图片规则
 
-每次成功推理后按以下规则处理：
+每次成功推理后按以下规则处理。推理间隔与数据库写入间隔独立：推理默认约每 1 秒一次，数据库默认每 300 秒最多为相同人数补一条心跳记录。
 
 | 检测结果 | 是否写入 `person_count` | 是否保存标注图片 |
 | --- | --- | --- |
 | 首次成功检测到 N 人，N > 0 | 是 | 是 |
-| 与上一次成功检测人数相同，N > 0 | 是 | 否 |
+| 与上一次已写入人数相同，且未超过写入心跳间隔，N > 0 | 否 | 否 |
+| 与上一次已写入人数相同，但已超过写入心跳间隔，N > 0 | 是 | 否 |
 | 与上一次成功检测人数不同，N > 0 | 是 | 是 |
-| 成功检测到 0 人 | 否 | 否，但内存人数更新为 0 |
+| 成功检测到 0 人且人数发生变化或到达写入心跳间隔 | 是 | 否 |
 | 从 0 人再次检测到 N 人 | 是 | 是 |
 | 视频断流、帧过期或推理失败 | 否 | 否，且不把人数更新为 0 |
 
@@ -85,7 +86,7 @@ COMMENT '当前画面人数，左侧补零到4位';
 
 | 字段 | 类型 | 用途 |
 | --- | --- | --- |
-| `id` | `VARCHAR(64)` | 计数记录唯一 ID，使用 UUID hex |
+| `id` | `BIGINT UNSIGNED` | 计数记录自增数字 ID，由 MySQL 生成 |
 | `channel_id` | `VARCHAR(64)` | 对应本服务 `channels.id` |
 | `analysis_type` | `CHAR(2)` | 固定为 `01` |
 | `analysis_case` | `VARCHAR(4)` | 当前人数的四位字符串编码 |
@@ -100,8 +101,7 @@ CREATE INDEX idx_person_count_channel_created
 ON person_count (channel_id, created_at);
 ```
 
-按照“有人时每秒一条”的规则，单通道持续有人一天最多生成 86400 条记录。本期不自动
-清理历史计数，数据保留策略由部署方后续根据监管和统计周期确定。
+按照“人数变化立即记录、相同人数按心跳记录”的规则，默认 300 秒心跳时单通道持续有人一天最多约生成 288 条记录。历史计数默认保留 180 天，由服务每日按批次清理过期记录，不拆分为每日新表。
 
 ## 4. 总体架构
 
@@ -162,6 +162,24 @@ FFmpegStreamReader（每通道一条视频连接）
   `last_error`。
 - 只有成功推理结果才能更新 `last_person_count`；断流和异常不等同于 0 人。
 
+### 5.2.1 健康算法独立分析周期
+
+健康检测不再要求所有算法使用相同的采样周期。默认建议如下：
+
+| 算法 | 默认周期（秒） | 说明 |
+| --- | ---: | --- |
+| `video_loss` | 1 | 持续检测，优先保证断流告警及时性 |
+| `freeze` | 1 | 画面冻结需要较高频率 |
+| `occlusion` | 2 | 遮挡变化通常不需要每帧判断 |
+| `shake` | 2 | 保留抖动变化响应速度 |
+| `blur` | 3 | 降低重复计算和低光误报 |
+| `exposure` | 3 | 后续可按昼夜切换阈值配置 |
+| `view_shift` | 5 | 视角偏移属于慢变化事件 |
+| `resolution` | 30 | 通常只需低频巡检或源变更时检查 |
+
+视频丢失单独使用 5 秒报警保持时间和 5 秒恢复保持时间；其他算法继续使用通用报警保持时间。
+视频帧超时仍由 `frame_timeout_seconds` 控制，默认 5 秒。
+
 多通道采用轮询方式执行推理。如果所有启用通道一次轮询耗时超过 1 秒，每个通道的
 实际间隔会大于 1 秒，但不会积压历史帧。后续通道规模明显增加时，可以在不改变数据库
 和 API 的前提下升级为批量推理。
@@ -205,7 +223,7 @@ FFmpegStreamReader（每通道一条视频连接）
 - 将 SQLAlchemy 数据对象转换为稳定的接口字典。
 
 写入前校验 `channel_id` 对应通道存在，`analysis_type` 必须是 `01`，`analysis_case`
-必须是四位数字且不为 `0000`。
+必须是四位数字，`0000` 表示成功识别到 0 人。
 
 ### 5.5 WorkerManager 与启动恢复
 
@@ -224,10 +242,23 @@ FFmpegStreamReader（每通道一条视频连接）
 ```dotenv
 CAMERA_HEALTH_PERSON_COUNT_MODEL_PATH=/app/camera-health-service/model/yolo11s.pt
 CAMERA_HEALTH_PERSON_COUNT_INTERVAL_SECONDS=1.0
+CAMERA_HEALTH_PERSON_COUNT_RECORD_INTERVAL_SECONDS=300
 CAMERA_HEALTH_PERSON_COUNT_CONFIDENCE=0.25
 CAMERA_HEALTH_PERSON_COUNT_IMAGE_SIZE=640
 CAMERA_HEALTH_PERSON_COUNT_DEVICE=cuda:0
 CAMERA_HEALTH_PERSON_COUNT_SNAPSHOT_DIR=/app/data/camera_health/person_count
+CAMERA_HEALTH_PERSON_COUNT_RETENTION_DAYS=180
+CAMERA_HEALTH_PERSON_COUNT_CLEANUP_INTERVAL_SECONDS=86400
+CAMERA_HEALTH_VIDEO_LOSS_ALARM_HOLD_SECONDS=5
+CAMERA_HEALTH_VIDEO_LOSS_RECOVERY_HOLD_SECONDS=5
+CAMERA_HEALTH_OCCLUSION_INTERVAL_SECONDS=2
+CAMERA_HEALTH_VIEW_SHIFT_INTERVAL_SECONDS=5
+CAMERA_HEALTH_BLUR_INTERVAL_SECONDS=3
+CAMERA_HEALTH_EXPOSURE_INTERVAL_SECONDS=3
+CAMERA_HEALTH_FREEZE_INTERVAL_SECONDS=1
+CAMERA_HEALTH_VIDEO_LOSS_INTERVAL_SECONDS=1
+CAMERA_HEALTH_SHAKE_INTERVAL_SECONDS=2
+CAMERA_HEALTH_RESOLUTION_INTERVAL_SECONDS=30
 YOLO_CONFIG_DIR=/tmp
 ```
 
@@ -332,7 +363,7 @@ GET /person-count/records/{record_id}/snapshot
 - 模型结果只保留类别名称为 `person` 的目标。
 - 置信度低于阈值的 person 不参与计数。
 - 人数正确转换为四位 `analysis_case`。
-- 0 人不写记录，正数每次成功推理都写记录。
+- 0 人和正数统一按规则写记录：人数变化时立即写入，相同人数按写入心跳间隔补写；推理失败和断流不写入。
 - 人数不变不保存图片，人数变化保存标注图片。
 - 推理失败和断流不把上一次人数改成 0。
 - Repository 正确保存和分页查询人员计数记录。
@@ -356,7 +387,7 @@ GET /person-count/records/{record_id}/snapshot
 5. 确认模型只加载一次且每秒最多推理一次；
 6. 连续保持 1 人，确认每秒落库但只有首条记录有图片；
 7. 增加为 2 人，确认新记录为 `0002` 且生成新标注图；
-8. 人员离开后确认不生成 `0000` 记录；
+8. 人员离开后确认生成一次 `0000` 记录，后续按写入心跳间隔补写；
 9. 模拟断流，确认健康检测可产生视频丢失事件，人员计数不误写 0 人；
 10. 运行完整测试集，确保现有摄像头健康功能没有回归。
 

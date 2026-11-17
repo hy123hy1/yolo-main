@@ -474,6 +474,7 @@
       :channel-id="taskRegionEditor.channelId"
       :algorithm-id="taskRegionEditor.algorithmId"
       :algorithm-name="taskRegionEditor.algorithmName"
+      :person-count="taskRegionEditor.personCount"
       @close="closeTaskRegionEditor"
       @updated="handleTaskRegionsUpdated"
     />
@@ -572,6 +573,7 @@ type FenceRenderableRegion = {
   coordinates: number[][]
   source: 'task' | 'channel'
   algorithmName?: string
+  type?: string
 }
 
 type RealtimeDetection = {
@@ -670,6 +672,7 @@ const taskRegionEditor = ref({
   channelId: '',
   algorithmId: '',
   algorithmName: '',
+  personCount: false,
 })
 
 const zoneEditor = ref({
@@ -1055,6 +1058,8 @@ const openTaskRegionEditor = (algorithm: any) => {
     channelId: selectedTask.value.channel_id || selectedTaskChannelId.value,
     algorithmId: algorithm.id,
     algorithmName: algorithm.model_name || models.value.find((item) => item.model_id === algorithm.model_id)?.name || algorithm.model_id || '',
+    personCount: (algorithm.rule_type || algorithm.algorithm_type) === 'count'
+      && !algorithm.detect_all_classes && algorithm.labels?.length === 1 && algorithm.labels[0] === 'person',
   }
 }
 
@@ -1369,6 +1374,7 @@ const buildTaskFenceRegions = (channelId: string): FenceRenderableRegion[] => {
         coordinates,
         source: 'task',
         algorithmName,
+        type: region.type || 'polygon',
       })
     })
   })
@@ -2222,6 +2228,21 @@ const renderFenceOverlayOnCanvas = (
     ctx.lineWidth = 2
     ctx.fill()
     ctx.stroke()
+
+    if (region.type === 'person_flow' && coordinates.length === 4) {
+      const a = { x: (coordinates[0][0] + coordinates[1][0]) / 2, y: (coordinates[0][1] + coordinates[1][1]) / 2 }
+      const b = { x: (coordinates[2][0] + coordinates[3][0]) / 2, y: (coordinates[2][1] + coordinates[3][1]) / 2 }
+      const angle = Math.atan2(b.y - a.y, b.x - a.x)
+      ctx.beginPath()
+      ctx.moveTo(a.x, a.y)
+      ctx.lineTo(b.x, b.y)
+      ctx.moveTo(b.x - 12 * Math.cos(angle - Math.PI / 6), b.y - 12 * Math.sin(angle - Math.PI / 6))
+      ctx.lineTo(b.x, b.y)
+      ctx.lineTo(b.x - 12 * Math.cos(angle + Math.PI / 6), b.y - 12 * Math.sin(angle + Math.PI / 6))
+      ctx.stroke()
+      drawFenceLabel(ctx, 'A', region.color, a.x, a.y, width)
+      drawFenceLabel(ctx, 'B', region.color, b.x, b.y, width)
+    }
 
     const anchor = coordinates.reduce(
       (current, point) => ({

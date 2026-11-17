@@ -4,7 +4,6 @@ import logging
 import threading
 import time
 from datetime import datetime
-from pathlib import Path
 from queue import Empty
 from typing import Callable
 
@@ -21,8 +20,8 @@ from src.services.camera_health_defaults import (
 )
 from src.services.camera_health_state_machine import CameraHealthStateMachine
 from src.services.camera_health_store import CameraHealthStore
-from src.services.camera_occlusion_detector import CameraOcclusionDetector
-from src.services.camera_view_shift_detector import CameraViewShiftDetector
+from src.vision_core.camera_occlusion_detector import CameraOcclusionDetector
+from src.vision_core.camera_view_shift_detector import CameraViewShiftDetector
 from src.services.channel_frame_hub import ChannelFrameHub, ChannelFrameSubscription, channel_frame_hub
 
 
