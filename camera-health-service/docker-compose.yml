@@ -1,0 +1,77 @@
+# YOLO Training Platform - Docker Compose Configuration
+#
+# 开发模式:
+#   cd docker
+#   docker compose up -d backend frontend-dev
+#   本地播放地址默认使用 192.168.1.61；服务器部署时通过环境变量覆盖为服务器地址。
+#   例如：ZLM_PUBLIC_HTTP_HOST=192.168.60.61 docker compose up -d backend frontend
+#
+# 生产预览模式:
+#   cd docker
+#   docker compose up -d --build backend frontend
+
+services:
+  camera-health-service:
+    image: ${CAMERA_HEALTH_IMAGE:-docker-backend}
+    container_name: ${CAMERA_HEALTH_CONTAINER_NAME:-camera-health-service}
+    restart: unless-stopped
+    gpus: all
+    ports:
+      - "${CAMERA_HEALTH_PORT:-9002}:9002"
+    volumes:
+      - ./:/app/camera-health-service:ro
+      - ../backend/data/camera_health:/app/data/camera_health
+    networks:
+      - yolo-network
+    environment:
+      CAMERA_HEALTH_DATABASE_URL: ${CAMERA_HEALTH_DATABASE_URL:-mysql+pymysql://root:root@192.168.1.200:3307/rjry_yolo?charset=utf8mb4}
+      CAMERA_HEALTH_MINE_CODE: ${CAMERA_HEALTH_MINE_CODE:-}
+      CAMERA_HEALTH_SNAPSHOT_DIR: /app/data/camera_health/snapshots
+      CAMERA_HEALTH_PERSON_COUNT_MODEL_PATH: ${CAMERA_HEALTH_PERSON_COUNT_MODEL_PATH:-/app/camera-health-service/model/yolo11s.pt}
+      CAMERA_HEALTH_PERSON_COUNT_INTERVAL_SECONDS: ${CAMERA_HEALTH_PERSON_COUNT_INTERVAL_SECONDS:-1.0}
+      CAMERA_HEALTH_PERSON_COUNT_CONFIDENCE: ${CAMERA_HEALTH_PERSON_COUNT_CONFIDENCE:-0.25}
+      CAMERA_HEALTH_PERSON_COUNT_IMAGE_SIZE: ${CAMERA_HEALTH_PERSON_COUNT_IMAGE_SIZE:-640}
+      CAMERA_HEALTH_PERSON_COUNT_DEVICE: ${CAMERA_HEALTH_PERSON_COUNT_DEVICE:-cuda:0}
+      CAMERA_HEALTH_PERSON_COUNT_SNAPSHOT_DIR: ${CAMERA_HEALTH_PERSON_COUNT_SNAPSHOT_DIR:-/app/data/camera_health/person_count}
+      CAMERA_HEALTH_PERSON_COUNT_RUN_DIR: ${CAMERA_HEALTH_PERSON_COUNT_RUN_DIR:-/tmp/camera_health/person_count/runs}
+      YOLO_CONFIG_DIR: ${YOLO_CONFIG_DIR:-/tmp}
+      WVP_API_BASE: ${WVP_API_BASE:-http://192.168.1.36:18080}
+      WVP_CHANNEL_LIST_PATH: ${WVP_CHANNEL_LIST_PATH:-/api/common/channel/list}
+      WVP_CHANNEL_PLAY_PATH: ${WVP_CHANNEL_PLAY_PATH:-/api/common/channel/play}
+      WVP_TIMEOUT_SECONDS: ${WVP_TIMEOUT_SECONDS:-20}
+      CAMERA_HEALTH_FFMPEG_TIMEOUT_SECONDS: ${CAMERA_HEALTH_FFMPEG_TIMEOUT_SECONDS:-15}
+      CAMERA_HEALTH_ALARM_HOLD_SECONDS: ${CAMERA_HEALTH_ALARM_HOLD_SECONDS:-10}
+      CAMERA_HEALTH_RECOVERY_HOLD_SECONDS: ${CAMERA_HEALTH_RECOVERY_HOLD_SECONDS:-5}
+      CAMERA_HEALTH_ANALYSIS_INTERVAL_SECONDS: ${CAMERA_HEALTH_ANALYSIS_INTERVAL_SECONDS:-0.5}
+      CAMERA_HEALTH_FRAME_TIMEOUT_SECONDS: ${CAMERA_HEALTH_FRAME_TIMEOUT_SECONDS:-5}
+      CAMERA_HEALTH_BASELINE_STABLE_FRAMES: ${CAMERA_HEALTH_BASELINE_STABLE_FRAMES:-10}
+      FFMPEG_BIN: ${FFMPEG_BIN:-ffmpeg}
+      NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-all}
+      NVIDIA_DRIVER_CAPABILITIES: ${NVIDIA_DRIVER_CAPABILITIES:-compute,utility}
+      TZ: Asia/Shanghai
+    command:
+      - uvicorn
+      - main:app
+      - --app-dir
+      - /app/camera-health-service
+      - --host
+      - 0.0.0.0
+      - --port
+      - "9002"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://localhost:9002/health')",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+networks:
+  yolo-network:
+    external: true
+    name: yolo-network

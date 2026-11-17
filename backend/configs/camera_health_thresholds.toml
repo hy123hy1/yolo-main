@@ -1,0 +1,42 @@
+# 摄像头健康算法阈值配置。
+# 只修改本文件即可调参；修改后重启后端，新的配置会在新 worker 中生效。
+
+[camera_occlusion]
+# 画面平均亮度低于此值时，计为低亮度信号（0-255）。
+low_brightness = 12.0
+# 画面平均亮度高于此值时，计为过曝信号（0-255）。
+high_brightness = 245.0
+# 灰度熵低于此值时，计为纹理不足信号。
+min_entropy = 1.2
+# Canny 边缘像素比例低于此值时，计为边缘不足信号。
+min_edge_density = 0.005
+# Laplacian 方差低于此值时，计为模糊信号。
+min_blur_variance = 20.0
+# 画面中占比高于此值的主灰度区域，计为大面积纯色。
+max_uniform_ratio = 0.85
+# 与正常基准结构差异高于此值时，计为基准差异信号（0-1）。
+max_baseline_difference = 0.55
+# 至少达到几个独立质量信号后才判定遮挡，避免单指标误报。
+min_bad_signals = 2
+# 网格局部遮挡比例高于此值时，计为局部遮挡信号（0-1）。
+local_occlusion_ratio = 0.35
+
+[camera_view_shift]
+# ORB ratio test 保留匹配点的比例阈值（0-1）。
+ratio_test = 0.75
+# 至少需要的有效匹配点数量。
+min_good_matches = 20
+# RANSAC 判断几何内点使用的重投影误差阈值（像素）。
+ransac_reproj_threshold = 5.0
+# 内点比例低于此值时，不输出可靠的视角变化结论（0-1）。
+min_inlier_ratio = 0.35
+# 水平位移比例高于此值时，判定画面发生视角变化（0-1）。
+max_horizontal_shift_ratio = 0.08
+# 垂直位移比例高于此值时，判定画面发生视角变化（0-1）。
+max_vertical_shift_ratio = 0.08
+# roll 旋转角绝对值高于此值时，判定画面发生扭转（度）。
+roll_angle_deg = 8.0
+# 缩放相对变化绝对值高于此值时，判定画面发生视角变化（0-1）。
+max_scale_change_ratio = 0.12
+# 透视变化指标高于此值时，判定画面发生视角变化（0-1）。
+max_perspective_change = 0.15

@@ -1,3 +1,4 @@
+import asyncio
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -44,7 +45,7 @@ async def proxy_sms(path: str, request: FastAPIRequest):
     )
 
     try:
-        upstream = urlopen(upstream_request, timeout=20)
+        upstream = await asyncio.to_thread(urlopen, upstream_request, timeout=20)
     except HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="ignore")
         raise HTTPException(exc.code, detail or exc.reason)
@@ -59,18 +60,20 @@ async def proxy_sms(path: str, request: FastAPIRequest):
             response_headers[key] = value
 
     if path.endswith(".m3u8") or path.endswith(".json") or path.endswith(".js") or path.endswith(".html"):
-        data = upstream.read()
-        upstream.close()
+        try:
+            data = await asyncio.to_thread(upstream.read)
+        finally:
+            await asyncio.to_thread(upstream.close)
         return Response(content=data, status_code=upstream.status, media_type=media_type, headers=response_headers)
 
-    def _iter():
+    async def _iter():
         try:
             while True:
-                chunk = upstream.read(64 * 1024)
+                chunk = await asyncio.to_thread(upstream.read, 64 * 1024)
                 if not chunk:
                     break
                 yield chunk
         finally:
-            upstream.close()
+            await asyncio.to_thread(upstream.close)
 
     return StreamingResponse(_iter(), status_code=upstream.status, media_type=media_type, headers=response_headers)

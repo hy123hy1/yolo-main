@@ -46,6 +46,7 @@ class UpdateEventRequest(BaseModel):
     conf: Optional[float] = None
     snapshot_path: Optional[str] = None
     video_path: Optional[str] = None
+    handling_status: Optional[int] = None
     remark: Optional[str] = None
     status: Optional[str] = None
 
@@ -53,12 +54,16 @@ class UpdateEventRequest(BaseModel):
 @router.get("")
 async def list_events(
     channel_id: Optional[str] = Query(None),
+    task_id: Optional[str] = Query(None),
+    algorithm_id: Optional[str] = Query(None),
     class_name: Optional[str] = Query(None),
     page: int = Query(1, ge=1),
     page_size: int = Query(10, ge=1, le=100),
 ):
     return await event_service.list_events(
         channel_id=channel_id,
+        task_id=task_id,
+        algorithm_id=algorithm_id,
         class_name=class_name,
         page=page,
         page_size=page_size,
@@ -84,6 +89,14 @@ async def update_event(event_id: str, request: UpdateEventRequest):
 @router.delete("/{event_id}")
 async def delete_event(event_id: str):
     result = await event_service.delete_event(event_id)
+    if not result:
+        raise HTTPException(404, "Event not found")
+    return result
+
+
+@router.delete("/{event_id}/media")
+async def delete_event_media(event_id: str):
+    result = await event_service.delete_event_media(event_id)
     if not result:
         raise HTTPException(404, "Event not found")
     return result

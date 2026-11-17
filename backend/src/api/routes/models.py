@@ -10,8 +10,8 @@ model_service = ModelService()
 
 class UpdateModelRequest(BaseModel):
     name: Optional[str] = None
-    description: Optional[str] = None
-    tags: Optional[list[str]] = None
+    confidence: Optional[float] = None
+    alert_interval: Optional[int] = None
 
 class UploadModelRequest(BaseModel):
     name: Optional[str] = None

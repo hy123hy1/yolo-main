@@ -14,7 +14,7 @@ from `config.toml`.
 If `METADATA_DATABASE_URL` is empty, the backend uses local SQLite:
 
 ```text
-/app/data/metadata.db
+/app/data/metadata_v2.db
 ```
 
 This is the default development mode.

@@ -9,8 +9,20 @@ recording_service = RecordingService()
 
 
 @router.get("")
-async def list_recordings(channel_id: Optional[str] = Query(None)):
-    return await recording_service.list_recordings(channel_id=channel_id)
+async def list_recordings(
+    channel_id: Optional[str] = Query(None),
+    task_id: Optional[str] = Query(None),
+    algorithm_id: Optional[str] = Query(None),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(10, ge=1, le=100),
+):
+    return await recording_service.list_recordings(
+        channel_id=channel_id,
+        task_id=task_id,
+        algorithm_id=algorithm_id,
+        page=page,
+        page_size=page_size,
+    )
 
 
 @router.get("/timeline")

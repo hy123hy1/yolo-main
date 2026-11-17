@@ -4,3 +4,13 @@ __pycache__
 data/
 models/
 *.log
+migrations/*
+!migrations/20260810_electronic_seal_channels.sql
+!migrations/20260811_channel_gb_id.sql
+!migrations/20260812_electronic_seal_event_severity.sql
+tests/
+!tests/
+tests/*
+!tests/test_electronic_seal_severity.py
+!tests/test_electronic_seal_severity_migration.py
+!tests/test_task_playback_decoupling.py

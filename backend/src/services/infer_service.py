@@ -16,6 +16,7 @@ import cv2
 import numpy as np
 from datetime import datetime
 from src.core.settings import settings
+from src.services.analysis_service import analysis_service
 
 class InferService:
     def __init__(self):
@@ -23,6 +24,9 @@ class InferService:
         self.jobs_dir = settings.JOBS_DIR
         self.inference_results_dir = settings.INFERENCE_RESULTS_DIR
         self._model_cache: Dict[str, Any] = {}  # 模型缓存
+
+    def _resolve_inference_device(self) -> str:
+        return analysis_service._resolve_inference_device()
     
     def _get_model(self, model_id: str):
         """获取模型（带缓存）"""
@@ -133,7 +137,7 @@ class InferService:
             with Image.open(tmp_path) as img:
                 image_width, image_height = img.size
             
-            results = model(tmp_path, verbose=False)
+            results = model(tmp_path, verbose=False, device=self._resolve_inference_device())
             
             # 解析结果
             detections = self._parse_results(results, model_meta)
@@ -199,7 +203,7 @@ class InferService:
                 # 对每张图片进行推理
                 for img_info in image_infos:
                     try:
-                        infer_results = model(img_info["path"], verbose=False)
+                        infer_results = model(img_info["path"], verbose=False, device=self._resolve_inference_device())
                         detections = self._parse_results(infer_results, model_meta)
                         
                         model_results["images"].append({
@@ -313,7 +317,7 @@ class InferService:
                 frame_count += 1
                 
                 # 使用YOLO进行推理
-                results = model(frame, verbose=False, conf=conf_threshold)
+                results = model(frame, verbose=False, conf=conf_threshold, device=self._resolve_inference_device())
                 
                 # 绘制检测框
                 frame_detections = []
@@ -428,7 +432,7 @@ class InferService:
                 frame_count += 1
                 
                 # 使用YOLO进行推理
-                results = model(frame, verbose=False, conf=conf_threshold)
+                results = model(frame, verbose=False, conf=conf_threshold, device=self._resolve_inference_device())
                 
                 # 解析检测结果
                 frame_detections = []
@@ -528,7 +532,7 @@ class InferService:
                     img_array = np.array(img)
                 
                 # 执行推理
-                infer_results = model(tmp_path, verbose=False)
+                infer_results = model(tmp_path, verbose=False, device=self._resolve_inference_device())
                 detections = self._parse_results(infer_results, model_meta)
                 
                 # 生成UUID

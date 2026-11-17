@@ -1,12 +1,18 @@
-from fastapi import APIRouter, HTTPException, Query
+import asyncio
+import logging
+import time
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Query
 from pydantic import BaseModel
 from typing import Optional
 import traceback
 
 from src.services.channel_service import ChannelService
+from src.services.wvp_service import WVPService
 
 router = APIRouter(prefix="/channels", tags=["channels"])
 channel_service = ChannelService()
+wvp_service = WVPService()
+logger = logging.getLogger("uvicorn.error")
 
 
 class ChannelRequest(BaseModel):
@@ -45,15 +51,11 @@ class UpdateZoneRequest(BaseModel):
     coordinates: Optional[list[list[float]]] = None
 
 
-class AIConfigRequest(BaseModel):
-    enabled: Optional[bool] = None
-    model_id: Optional[str] = None
-    labels: Optional[list[str]] = None
-    conf: Optional[float] = None
-    frame_interval: Optional[int] = None
-    zone_ids: Optional[list[str]] = None
-    save_snapshot: Optional[bool] = None
-    models: Optional[list[dict]] = None
+class StartZonePreviewRequest(BaseModel):
+    task_id: Optional[str] = None
+    owner_task_id: Optional[str] = None
+    zone_source: Optional[str] = None
+    zones: Optional[list[dict]] = None
 
 
 @router.get("")
@@ -63,6 +65,49 @@ async def list_channels(
     key: Optional[str] = Query(None),
 ):
     return await channel_service.list_channels(device_id=device_id, type_filter=type, key=key)
+
+
+@router.get("/available-for-task")
+async def list_available_for_task_channels():
+    return await channel_service.list_available_for_task_channels()
+
+
+@router.post("/sync-wvp")
+async def sync_wvp_channels(
+    background_tasks: BackgroundTasks,
+    page: int = Query(1, ge=1),
+    count: int = Query(100, ge=1, le=500),
+    query: Optional[str] = Query(None),
+):
+    try:
+        result = await asyncio.to_thread(wvp_service.sync_channels, page, count, query)
+        play_info_refresh_requests = list(
+            result.pop("_play_info_refresh_requests", []) or []
+        )
+        for item in list(result.get("items") or []):
+            sync_owner = item.pop("_sync_owner", "video_ai")
+            channel_id = str(item.get("id") or "").strip()
+            if not channel_id:
+                continue
+            if sync_owner == "electronic_seal":
+                continue
+            try:
+                channel_service.schedule_channel_snapshot(channel_id)
+            except Exception:
+                logger.exception("[ChannelAutoSnapshot] schedule failed after WVP sync channel_id=%s", channel_id)
+        if play_info_refresh_requests:
+            background_tasks.add_task(
+                wvp_service.refresh_play_info_requests,
+                play_info_refresh_requests,
+            )
+        result["play_info_refresh"] = {
+            "mode": "background",
+            "queued": len(play_info_refresh_requests),
+        }
+        return result
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(500, f"Failed to sync WVP channels: {str(e)}")
 
 
 @router.post("")
@@ -120,8 +165,8 @@ async def stop_channel(channel_id: str):
 
 
 @router.get("/{channel_id}/play-url")
-async def get_channel_play_url(channel_id: str):
-    result = await channel_service.play_urls(channel_id)
+async def get_channel_play_url(channel_id: str, mode: str = "auto", compact: bool = False):
+    result = await channel_service.play_urls(channel_id, mode=mode, compact=compact)
     if not result:
         raise HTTPException(404, "Channel not found")
     return result
@@ -141,7 +186,7 @@ async def inspect_channel_stream(channel_id: str):
 @router.post("/{channel_id}/snapshot")
 async def snapshot_channel(channel_id: str):
     try:
-        result = await channel_service.snapshot(channel_id)
+        result = await channel_service.request_snapshot_refresh(channel_id)
         if not result:
             raise HTTPException(404, "Channel not found")
         return result
@@ -189,66 +234,78 @@ async def delete_channel_zone(channel_id: str, zone_id: str):
     return result
 
 
-@router.get("/{channel_id}/ai-config")
-async def get_channel_ai_config(channel_id: str):
-    result = await channel_service.get_ai_config(channel_id)
-    if result is None:
-        raise HTTPException(404, "Channel not found")
-    return result
-
-
-@router.put("/{channel_id}/ai-config")
-async def update_channel_ai_config(channel_id: str, request: AIConfigRequest):
-    result = await channel_service.update_ai_config(channel_id, request)
-    if result is None:
-        raise HTTPException(404, "Channel not found")
-    return result
-
-
-@router.post("/{channel_id}/ai/start")
-async def start_channel_ai(channel_id: str):
-    result = await channel_service.start_ai(channel_id)
-    if result is None:
-        raise HTTPException(404, "Channel not found")
-    return result
-
-
-@router.post("/{channel_id}/ai/apply")
-async def apply_channel_ai(channel_id: str):
-    try:
-        result = await channel_service.apply_ai(channel_id)
-    except RuntimeError as exc:
-        raise HTTPException(409, str(exc))
-    if result is None:
-        raise HTTPException(404, "Channel not found")
-    return result
-
-
-@router.post("/{channel_id}/ai/stop")
-async def stop_channel_ai(channel_id: str):
-    result = await channel_service.stop_ai(channel_id)
-    if result is None:
-        raise HTTPException(404, "Channel not found")
-    return result
-
-
-@router.get("/{channel_id}/ai-status")
-async def get_channel_ai_status(channel_id: str):
-    result = await channel_service.get_ai_status(channel_id)
-    if result is None:
-        raise HTTPException(404, "Channel not found")
-    return result
-
-
 @router.post("/{channel_id}/zone-preview/start")
-async def start_channel_zone_preview(channel_id: str):
+async def start_channel_zone_preview(channel_id: str, request: Optional[StartZonePreviewRequest] = None):
+    started_at = time.perf_counter()
+    has_explicit_request = bool(
+        request and (request.zones or request.zone_source or request.owner_task_id or request.task_id)
+    )
+    mode = "explicit" if has_explicit_request else "task-auto"
+    zone_count = len(request.zones) if request and request.zones else 0
+    owner_task_id = (request.owner_task_id or request.task_id) if request else None
     try:
-        result = await channel_service.start_zone_preview(channel_id)
+        if has_explicit_request:
+            result = await channel_service.start_zone_preview(
+                channel_id,
+                zones=request.zones if request else None,
+                zone_source=request.zone_source if request else None,
+                owner_task_id=owner_task_id,
+            )
+        else:
+            result = await channel_service.start_task_zone_preview(channel_id)
         if result is None:
             raise HTTPException(404, "Channel not found")
+        elapsed_ms = round((time.perf_counter() - started_at) * 1000, 2)
+        logger.info(
+            "[ZonePreviewAPI] start success channel_id=%s mode=%s owner_task_id=%s zone_source=%s zone_count=%s status=%s elapsed_ms=%s",
+            channel_id,
+            mode,
+            owner_task_id,
+            request.zone_source if request else None,
+            zone_count,
+            result.get("status"),
+            elapsed_ms,
+        )
         return result
+    except HTTPException as exc:
+        elapsed_ms = round((time.perf_counter() - started_at) * 1000, 2)
+        logger.warning(
+            "[ZonePreviewAPI] start failed channel_id=%s mode=%s owner_task_id=%s zone_source=%s zone_count=%s http_status=%s detail=%s elapsed_ms=%s",
+            channel_id,
+            mode,
+            owner_task_id,
+            request.zone_source if request else None,
+            zone_count,
+            exc.status_code,
+            exc.detail,
+            elapsed_ms,
+        )
+        raise
     except ValueError as e:
+        elapsed_ms = round((time.perf_counter() - started_at) * 1000, 2)
+        logger.warning(
+            "[ZonePreviewAPI] start failed channel_id=%s mode=%s owner_task_id=%s zone_source=%s zone_count=%s error=%s elapsed_ms=%s",
+            channel_id,
+            mode,
+            owner_task_id,
+            request.zone_source if request else None,
+            zone_count,
+            str(e),
+            elapsed_ms,
+        )
         raise HTTPException(400, str(e))
+    except Exception:
+        elapsed_ms = round((time.perf_counter() - started_at) * 1000, 2)
+        logger.exception(
+            "[ZonePreviewAPI] start unexpected_error channel_id=%s mode=%s owner_task_id=%s zone_source=%s zone_count=%s elapsed_ms=%s",
+            channel_id,
+            mode,
+            owner_task_id,
+            request.zone_source if request else None,
+            zone_count,
+            elapsed_ms,
+        )
+        raise
 
 
 @router.post("/{channel_id}/zone-preview/stop")
@@ -267,20 +324,11 @@ async def get_channel_zone_preview_status(channel_id: str):
     return result
 
 
-@router.get("/{channel_id}/zone-preview/play-url")
-async def get_channel_zone_preview_play_url(channel_id: str):
-    result = await channel_service.get_zone_preview_play_urls(channel_id)
+@router.get("/{channel_id}/fence/browser-play-url")
+async def get_channel_fence_browser_play_url(channel_id: str):
+    result = await channel_service.get_zone_preview_browser_play_url(channel_id)
     if result is None:
         raise HTTPException(404, "Channel not found")
     return result
 
 
-@router.post("/{channel_id}/ai/debug-once")
-async def debug_channel_ai_once(channel_id: str):
-    try:
-        result = await channel_service.debug_ai_once(channel_id)
-        if result is None:
-            raise HTTPException(404, "Channel not found")
-        return result
-    except ValueError as e:
-        raise HTTPException(400, str(e))

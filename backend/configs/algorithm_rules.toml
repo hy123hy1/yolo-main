@@ -1,0 +1,23 @@
+# 离岗
+[absence]
+absence_seconds = 600
+
+# 聚集
+[gathering]
+count_threshold = 3
+hold_seconds = 1
+
+# 拥堵
+[congestion]
+count_threshold = 5
+hold_seconds = 2
+
+# 滞留
+[loitering]
+linger_seconds = 10
+
+# 倒地
+[fall_like]
+fall_ratio_threshold = 1.2
+hold_seconds = 2
+min_box_height = 40

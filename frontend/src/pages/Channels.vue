@@ -4,7 +4,7 @@
       <div class="panel-header">
         <div>
           <h2>通道</h2>
-          <p>把预览、通道管理、AI 能力和电子围栏拆开，避免所有操作堆在同一屏里。</p>
+          <p>把预览、通道管理、任务管理和电子围栏拆开，避免所有操作堆在同一屏里。</p>
         </div>
         <button class="ghost-btn" @click="load" :disabled="loading">
           {{ loading ? '刷新中...' : '刷新' }}
@@ -99,7 +99,12 @@
           <h3>通道管理</h3>
           <span>新增、编辑和删除通道</span>
         </div>
-        <button class="primary-btn" @click="openCreateModal">创建通道</button>
+        <div class="section-head-actions">
+          <button class="ghost-btn" @click="handleSyncWvpChannels" :disabled="loading">
+            同步 WVP 通道
+          </button>
+          <button class="primary-btn" @click="openCreateModal">创建通道</button>
+        </div>
       </div>
 
       <div v-if="items.length === 0" class="empty-state">暂无通道</div>
@@ -153,296 +158,71 @@
       </div>
     </section>
 
-    <section v-if="activeTab === 'ai'" class="panel">
+    <section v-if="activeTab === 'tasks'" class="panel">
       <div class="section-head">
-        <h3>AI 能力</h3>
-        <span>集中管理模型配置、类别筛选、区域绑定和运行状态</span>
+        <div>
+          <h3>任务管理</h3>
+          <span>围绕通道创建和运行 AI 任务，并统一展示检测状态。</span>
+        </div>
       </div>
 
-      <div v-if="items.length === 0" class="empty-state">暂无通道可配置</div>
-      <div v-else class="ai-list">
-        <article v-for="item in items" :key="item.id" class="ai-card">
-          <div class="ai-card-head">
-            <div>
-              <h4>{{ item.name }}</h4>
-              <p>{{ item.id }}</p>
-            </div>
-            <div class="status-pills">
-              <span class="pill type">{{ String(item.type || '').toUpperCase() }}</span>
-              <span :class="['pill', aiStatuses[item.id]?.is_running ? 'ai-on' : 'muted']">
-                AI {{ aiStatusLabel(item.id) }}
-              </span>
-            </div>
-          </div>
+      <div v-if="items.length === 0" class="empty-state">暂无通道可配置任务</div>
+      <div v-else class="task-management-layout">
+        <div class="task-management-toolbar">
+          <label class="task-channel-switch">
+            <span>当前通道</span>
+            <select v-model="selectedTaskChannelId" @change="handleTaskChannelChange">
+              <option value="">全部通道</option>
+              <option v-for="item in items" :key="item.id" :value="item.id">
+                {{ item.name }}
+              </option>
+            </select>
+          </label>
+        </div>
 
-          <div class="ai-card-summary">
-            <div><strong>当前模型：</strong>{{ currentChannelModelLabel(item) }}</div>
-            <div><strong>区域数：</strong>{{ channelZones(item.id).length }}</div>
-            <div><strong>事件数：</strong>{{ aiStatuses[item.id]?.event_count ?? 0 }}</div>
-            <div><strong>最近分析：</strong>{{ aiStatuses[item.id]?.last_analysis_at || '-' }}</div>
-          </div>
+        <div class="task-management-grid">
+          <TaskListPanel
+            :tasks="filteredTasks"
+            :selected-task-id="selectedTaskId"
+            :loading="taskLoading"
+            :keyword="taskKeyword"
+            :create-disabled="taskCreateDisabled"
+            :create-disabled-reason="taskCreateDisabledReason"
+            @select="selectTask"
+            @create="openTaskCreateModal"
+            @start="startTaskAction"
+            @stop="stopTaskAction"
+            @delete="deleteTaskAction"
+            @search="handleTaskSearch"
+          />
 
-          <div class="ai-setup-banner">
-            <div class="ai-setup-steps">
-              <span class="step-chip">1 选模型</span>
-              <span class="step-chip">2 选类别</span>
-              <span class="step-chip">3 选区域</span>
-              <span class="step-chip">4 保存并启动</span>
-            </div>
-            <div :class="['ai-readiness-pill', channelHasReadyAIConfig(item.id) ? 'ready' : 'pending']">
-              {{ aiReadinessLabel(item.id) }}
-            </div>
-          </div>
-
-          <!--
-          <div
-            v-if="modelRuntimeEntries(item.id).length"
-            class="ai-debug-board"
-          >
-            <div class="section-title">调试状态</div>
-            <div class="ai-debug-help">
-              用来判断事件卡在模型检测、类别过滤、区域过滤还是冷却时间。
-            </div>
-            <div class="ai-debug-list">
-              <div
-                v-for="[modelId, runtime] in modelRuntimeEntries(item.id)"
-                :key="`${item.id}-${modelId}`"
-                class="ai-debug-card"
-              >
-                <div class="ai-debug-head">
-                  <strong>{{ modelRuntimeName(modelId) }}</strong>
-                  <span class="pill type">{{ runtime.debug_reason || '待分析' }}</span>
-                </div>
-                <div class="ai-debug-grid">
-                  <div><strong>原始检测：</strong>{{ runtime.raw_detections ?? 0 }}</div>
-                  <div><strong>类别过滤后：</strong>{{ runtime.label_filtered_detections ?? 0 }}</div>
-                  <div><strong>区域过滤后：</strong>{{ runtime.zone_filtered_detections ?? 0 }}</div>
-                  <div><strong>冷却拦截：</strong>{{ runtime.cooldown_blocked_detections ?? 0 }}</div>
-                  <div><strong>本轮事件：</strong>{{ runtime.event_emitted_detections ?? 0 }}</div>
-                  <div><strong>累计事件：</strong>{{ runtime.total_event_emitted_detections ?? 0 }}</div>
-                  <div><strong>累计冷却拦截：</strong>{{ runtime.total_cooldown_blocked_detections ?? 0 }}</div>
-                  <div><strong>最近模型分析：</strong>{{ runtime.last_analysis_at || '-' }}</div>
-                  <div><strong>最近模型事件：</strong>{{ runtime.last_event_at || '-' }}</div>
-                  <div><strong>已配类别：</strong>{{ joinLabels(runtime.configured_labels) }}</div>
-                  <div><strong>已配区域：</strong>{{ joinLabels(runtime.configured_zone_ids) }}</div>
-                  <div><strong>模型检出类别：</strong>{{ joinLabels(runtime.raw_classes) }}</div>
-                  <div><strong>类别过滤后类别：</strong>{{ joinLabels(runtime.label_filtered_classes) }}</div>
-                  <div><strong>区域过滤后类别：</strong>{{ joinLabels(runtime.zone_filtered_classes) }}</div>
-                </div>
-              </div>
-            </div>
-          </div>
-          -->
-
-          <div class="ai-config-box">
-            <div class="ai-config-top">
-              <div>
-                <div class="section-title">AI 配置</div>
-                <div class="ai-config-help">
-                  先选择模型，再选择要关注的类别和区域，最后保存并启动 AI。
-                </div>
-              </div>
-              <button class="ghost-btn" @click="openZoneEditor(item)">区域配置</button>
-            </div>
-            <div class="ai-config-help">
-              一个通道可同时配置多个模型；每个模型都会独立触发事件，互不影响。
-            </div>
-
-            <div class="ai-config-form ai-config-grid">
-              <div class="config-actions span-2">
-                <button class="ghost-btn" type="button" @click="addModelConfig(item.id)">新增模型配置</button>
-              </div>
-
-              <div
-                v-for="modelConfig in aiConfigs[item.id].models"
-                :key="modelConfig.local_id"
-                class="config-row span-2 multi-model-card"
-              >
-                <div class="multi-model-head">
-                  <div class="multi-model-title">
-                    <strong>{{ getModelById(modelConfig.model_id)?.name || modelConfig.model_id || '未选择模型' }}</strong>
-                    <div class="multi-model-tags">
-                      <span class="mini-pill">
-                        类别 {{ modelConfig.labels.length }} / {{ modelLabelsForChannel(item.id, modelConfig.local_id).length }}
-                      </span>
-                      <span class="mini-pill">
-                        区域 {{ modelConfig.zone_ids.length }} / {{ channelZones(item.id).length }}
-                      </span>
-                    </div>
-                  </div>
-                  <button class="danger-btn mini" type="button" @click="removeModelConfig(item.id, modelConfig.local_id)">
-                    删除
-                  </button>
-                </div>
-
-                <div class="multi-model-grid">
-                  <div class="config-row compact-field">
-                    <div class="config-label">
-                      <strong>模型</strong>
-                      <span>先选择模型，系统会自动带出这个模型可检测的类别。</span>
-                    </div>
-                    <div class="config-control">
-                      <select v-model="modelConfig.model_id" @change="handleModelChange(item.id, modelConfig.local_id)">
-                        <option value="">请选择模型</option>
-                        <option v-for="model in models" :key="model.model_id" :value="model.model_id">
-                          {{ modelDisplayName(model) }}
-                        </option>
-                      </select>
-                    </div>
-                  </div>
-
-                  <div class="config-row compact-field">
-                    <div class="config-label">
-                      <strong>置信度</strong>
-                      <span>低于该阈值的检测结果会被忽略，建议从 0.25 开始调整。</span>
-                    </div>
-                    <div class="config-control">
-                      <input
-                        v-model.number="modelConfig.conf"
-                        type="number"
-                        min="0.05"
-                        max="1"
-                        step="0.05"
-                        placeholder="例如 0.25"
-                      />
-                    </div>
-                  </div>
-
-                  <div class="config-row compact-field">
-                    <div class="config-label">
-                      <strong>分析间隔</strong>
-                      <span>每隔多少帧分析一次，值越小越实时，值越大越省算力。</span>
-                    </div>
-                    <div class="config-control">
-                      <input
-                        v-model.number="modelConfig.frame_interval"
-                        type="number"
-                        min="1"
-                        step="1"
-                        placeholder="例如 10"
-                      />
-                    </div>
-                  </div>
-
-                  <div class="config-row compact-field save-snapshot-row">
-                    <div class="config-control">
-                      <label class="checkbox-item ai-checkbox-item">
-                        <input v-model="modelConfig.save_snapshot" type="checkbox" />
-                        <span>保存抓拍图，事件触发后可直接在事件中心查看图片。</span>
-                      </label>
-                    </div>
-                  </div>
-
-                  <div class="config-row span-2">
-                    <div class="config-label">
-                      <strong>类别</strong>
-                      <span>根据已选模型自动读取可检测类别。</span>
-                    </div>
-                    <div class="config-control">
-                      <div
-                        v-if="modelConfig.model_id && !hasModel(modelConfig.model_id)"
-                        class="inline-warning"
-                      >
-                        当前已保存的模型 ID 无效：{{ modelConfig.model_id }}，请重新选择正确模型。
-                      </div>
-
-                      <div v-else-if="modelLabelsForChannel(item.id, modelConfig.local_id).length" class="compact-select-panel">
-                        <div class="select-toolbar">
-                          <button class="ghost-btn mini" type="button" @click="selectAllChannelLabels(item.id, modelConfig.local_id)">
-                            全选
-                          </button>
-                          <button class="ghost-btn mini" type="button" @click="clearAllChannelLabels(item.id, modelConfig.local_id)">
-                            取消全选
-                          </button>
-                          <span class="select-summary">
-                            已选 {{ modelConfig.labels.length }} / {{ modelLabelsForChannel(item.id, modelConfig.local_id).length }}
-                          </span>
-                        </div>
-
-                        <div class="label-select-box compact-chip-box">
-                          <label
-                            v-for="label in modelLabelsForChannel(item.id, modelConfig.local_id)"
-                            :key="`${item.id}-${modelConfig.local_id}-${label}`"
-                            :class="['label-chip', 'compact-chip', { active: modelConfig.labels.includes(label) }]"
-                          >
-                            <input
-                              :checked="modelConfig.labels.includes(label)"
-                              type="checkbox"
-                              @change="toggleChannelLabel(item.id, modelConfig.local_id, label)"
-                            />
-                            <span>{{ label }}</span>
-                          </label>
-                        </div>
-                      </div>
-
-                      <div v-else class="inline-muted">
-                        当前模型没有可用类别列表，请先确认模型已正确提取 `classes`。
-                      </div>
-                    </div>
-                  </div>
-
-                  <div class="config-row span-2">
-                    <div class="config-label">
-                      <strong>区域</strong>
-                      <span>仅对所选区域内的目标生效，不选则为全画面检测。</span>
-                    </div>
-                    <div class="config-control">
-                      <div v-if="channelZones(item.id).length" class="compact-select-panel">
-                        <div class="select-summary">
-                          已选 {{ modelConfig.zone_ids.length }} / {{ channelZones(item.id).length }}
-                        </div>
-
-                        <div class="zone-select-box compact-chip-box">
-                          <label
-                            v-for="zone in channelZones(item.id)"
-                            :key="`${modelConfig.local_id}-${zone.id}`"
-                            :class="['zone-chip', 'compact-chip', { active: modelConfig.zone_ids.includes(zone.id) }]"
-                          >
-                            <input
-                              type="checkbox"
-                              :checked="modelConfig.zone_ids.includes(zone.id)"
-                              @change="toggleChannelZone(item.id, modelConfig.local_id, zone.id)"
-                            />
-                            <span class="zone-chip-color" :style="{ background: zone.color || '#3b82f6' }"></span>
-                            <span>{{ zone.name }}</span>
-                          </label>
-                        </div>
-                      </div>
-                      <div v-else class="inline-muted">
-                        还没有区域，请先点击右上角“区域配置”创建多边形区域。
-                      </div>
-                    </div>
-                  </div>
-                </div>
-              </div>
-
-              <div class="config-actions span-2 ai-action-bar">
-                <button class="save-ai-btn" @click="saveAIConfig(item.id)">保存配置</button>
-                <button class="ai-btn" @click="saveAndApplyAI(item.id)">保存并应用</button>
-                <button class="ai-stop-btn" @click="stopAI(item.id)">停止 AI</button>
-              </div>
-            </div>
-          </div>
-
-          <div v-if="rtcErrors[item.id]" class="error-text">
-            {{ rtcErrors[item.id] }}
-          </div>
-          <div v-if="debugResults[item.id]" class="debug-text">
-            {{ debugResults[item.id] }}
-          </div>
-        </article>
+          <TaskDetailPanel
+            :task="selectedTask"
+            :status="selectedTaskStatus"
+            :model-options="models"
+            :loading="taskLoading"
+            @save="saveTaskDraft"
+            @start="startTaskDraft"
+            @stop="stopTaskAction"
+            @create-algorithm="openAlgorithmCreateModal"
+            @edit-algorithm="openAlgorithmEditModal"
+            @edit-regions="openTaskRegionEditor"
+            @delete-algorithm="deleteAlgorithmAction"
+          />
+        </div>
       </div>
     </section>
 
     <section v-if="activeTab === 'fence'" class="panel">
       <div class="section-head">
         <h3>电子围栏</h3>
-        <span>生成带区域框的预览流，当前页可看，也可提供给第三方平台取流</span>
+        <span>当前页直接播放通道原始流，并在前端叠加围栏区域；第三方如需带框流，可展开下方地址。</span>
       </div>
 
       <div v-if="items.length === 0" class="empty-state">暂无通道可配置电子围栏</div>
       <div v-else class="ai-list">
         <article v-for="item in items" :key="`fence-${item.id}`" class="ai-card">
+          <div :ref="(el) => setFenceCardRef(item.id, el as HTMLElement | null)"></div>
           <div class="ai-card-head">
             <div>
               <h4>{{ item.name }}</h4>
@@ -450,78 +230,80 @@
             </div>
             <div class="status-pills">
               <span class="pill type">{{ String(item.type || '').toUpperCase() }}</span>
-              <span :class="['pill', zonePreviewStatuses[item.id]?.status === 'running' ? 'ok' : 'muted']">
+              <span :class="['pill', isTaskRunningForChannel(item.id) ? 'ok' : 'muted']">
                 {{ zonePreviewLabel(item.id) }}
               </span>
             </div>
           </div>
 
           <div class="zone-preview-headline">
-            <div><strong>区域数量：</strong>{{ channelZones(item.id).length }}</div>
-            <div><strong>区域流名：</strong>{{ zonePreviewStatuses[item.id]?.stream || `${item.stream}_zone` }}</div>
+            <div><strong>当前区域数：</strong>{{ zonePreviewRegionCount(item.id) }}</div>
+            <div><strong>区域来源：</strong>{{ zonePreviewSourceLabel(item.id) }}</div>
+            <div><strong>绑定任务：</strong>{{ taskForChannel(item.id)?.name || '-' }}</div>
           </div>
 
           <div class="zone-preview-box">
             <div class="zone-preview-head">
               <div>
                 <div class="section-title">区域预览</div>
-                <div class="zone-preview-help">启动后会自动在当前页播放带区域框的画面；只有在对接第三方平台时，才需要展开下方的取流地址。</div>
+                <div class="zone-preview-help">当前页直接播放通道原始流，围栏线框由前端 canvas 叠加显示，不再依赖后台生成区域预览流。</div>
               </div>
             </div>
 
-            <div class="zone-preview-player-shell">
+            <div class="zone-preview-player-shell fence-preview-shell">
               <video
-                :ref="(el) => setZonePreviewVideoRef(item.id, el as HTMLVideoElement | null)"
-                class="zone-preview-player"
+                :ref="(el) => setFenceVideoRef(item.id, el as HTMLVideoElement | null)"
+                class="zone-preview-player fence-preview-player"
                 autoplay
                 muted
                 playsinline
                 controls
+                @loadedmetadata="handleFenceVideoReady(item.id)"
+                @loadeddata="handleFenceVideoReady(item.id)"
+                @play="handleFenceVideoReady(item.id)"
               />
-              <div
-                v-if="zonePreviewStatuses[item.id]?.status !== 'running'"
-                class="player-mask offline-mask"
-              >
-                <span>启动区域流后，这里会自动显示带区域框的预览画面</span>
+              <canvas
+                :ref="(el) => setFenceCanvasRef(item.id, el as HTMLCanvasElement | null)"
+                class="fence-overlay-canvas"
+              />
+              <div v-if="!isPreviewPlaying(item.id)" class="player-mask">
+                <div class="zone-preview-mask-content">
+                  <button
+                    class="play-circle"
+                    :class="{ disabled: !canManualPlayFencePreview(item.id) }"
+                    type="button"
+                    :disabled="!canManualPlayFencePreview(item.id)"
+                    @click="startFencePreview(item.id)"
+                  >
+                    ▶
+                  </button>
+                  <span class="zone-preview-mask-text">{{ fencePreviewMaskText(item.id) }}</span>
+                </div>
               </div>
-              <div
-                v-else-if="!isZonePreviewPlaying(item.id)"
-                class="player-mask"
-              >
-                <button class="play-circle" type="button" @click="startZonePreviewPlayer(item.id)">
-                  ▶
-                </button>
+              <div v-if="!item.is_online" class="player-mask offline-mask">
+                <span>通道离线时不会自动预览</span>
               </div>
+              <div class="source-line">{{ item.source_url }}</div>
             </div>
 
             <div class="zone-preview-actions">
-              <button
-                v-if="zonePreviewStatuses[item.id]?.status !== 'running'"
-                class="ghost-btn"
-                type="button"
-                @click="startZonePreviewFlow(item.id)"
-              >
-                启动区域流
-              </button>
-              <template v-else>
-                <button class="ghost-btn" type="button" @click="openZonePreviewModal(item)">放大预览</button>
-                <button class="ghost-btn" type="button" @click="stopZonePreviewFlow(item.id)">停止区域流</button>
+              <template v-if="canManualPlayFencePreview(item.id)">
+                <button class="ghost-btn" type="button" @click="openExpandedFencePreview(item)">放大预览</button>
+                <button class="ghost-btn" type="button" @click="redrawFenceOverlay(item.id)">重绘围栏</button>
               </template>
-              <button class="ghost-btn" type="button" @click="openZoneEditor(item)">区域配置</button>
             </div>
 
             <details class="zone-preview-advanced" @toggle="handleZonePreviewAdvancedToggle(item.id, $event)">
-              <summary>第三方取流地址</summary>
+              <summary>第三方带框流地址</summary>
               <div class="zone-preview-advanced-body">
+                <div class="zone-preview-help">
+                  只有第三方平台需要直接取后台生成的带框流时，才需要使用这里的地址。
+                </div>
                 <div class="zone-preview-meta">
-                  <div><strong>HLS：</strong>{{ zonePreviewPlayInfos[item.id]?.hls || '-' }}</div>
-                  <div><strong>RTMP：</strong>{{ zonePreviewPlayInfos[item.id]?.rtmp || '-' }}</div>
-                  <div><strong>RTSP：</strong>{{ zonePreviewPlayInfos[item.id]?.rtsp || '-' }}</div>
+                  <div><strong>浏览器播放地址：</strong>{{ zonePreviewPlayInfos[item.id]?.hls || zonePreviewPlayInfos[item.id]?.webrtc_api || '-' }}</div>
                 </div>
                 <div class="zone-preview-actions">
-                  <button class="ghost-btn" type="button" @click="copyZonePreviewUrl(item.id, 'hls')">复制 HLS</button>
-                  <button class="ghost-btn" type="button" @click="copyZonePreviewUrl(item.id, 'rtmp')">复制 RTMP</button>
-                  <button class="ghost-btn" type="button" @click="copyZonePreviewUrl(item.id, 'rtsp')">复制 RTSP</button>
+                  <button class="ghost-btn" type="button" @click="copyZonePreviewUrl(item.id)">复制播放地址</button>
                 </div>
                 <div v-if="zonePreviewStatuses[item.id]?.last_error" class="zone-preview-inline-error">
                   最近错误：{{ zonePreviewStatuses[item.id]?.last_error }}
@@ -530,11 +312,14 @@
             </details>
           </div>
 
+          <div v-if="rtcErrors[item.id]" class="error-text">
+            {{ rtcErrors[item.id] }}
+          </div>
           <div v-if="zonePreviewErrors[item.id]" class="error-text">
             {{ zonePreviewErrors[item.id] }}
           </div>
-          <div v-if="zonePreviewDebug[item.id]" class="debug-text">
-            {{ zonePreviewDebug[item.id] }}
+          <div v-if="debugResults[item.id]" class="debug-text">
+            {{ debugResults[item.id] }}
           </div>
         </article>
       </div>
@@ -545,7 +330,7 @@
         <div class="modal-header">
           <div>
             <h3>创建通道</h3>
-            <p>填写通道名称、源地址和可选的默认模型。</p>
+            <p>填写通道名称、源地址，并可选同步创建首个任务算法。</p>
           </div>
           <button class="ghost-btn modal-close-btn" @click="closeCreateModal" aria-label="关闭">×</button>
         </div>
@@ -626,7 +411,10 @@
           <button class="ghost-btn modal-close-btn" @click="closeExpandedPreview" aria-label="关闭">×</button>
         </div>
 
-        <div class="preview-modal-player-shell">
+        <div
+          class="preview-modal-player-shell"
+          :class="{ 'fence-expanded-player-shell': expandedPreview.mode === 'fence' }"
+        >
           <video
             ref="expandedPreviewVideoRef"
             class="preview-modal-player"
@@ -634,6 +422,14 @@
             muted
             playsinline
             controls
+            @loadedmetadata="handleExpandedPreviewVideoReady"
+            @loadeddata="handleExpandedPreviewVideoReady"
+            @playing="handleExpandedPreviewVideoReady"
+          />
+          <canvas
+            v-if="expandedPreview.mode === 'fence'"
+            ref="expandedFenceCanvasRef"
+            class="expanded-fence-overlay-canvas"
           />
         </div>
 
@@ -652,34 +448,86 @@
       @close="closeZoneEditor"
       @updated="handleZonesUpdated"
     />
+
+    <TaskEditorModal
+      :visible="taskModalVisible"
+      :channel-id="selectedTaskChannelId"
+      :source-url="availableTaskChannels.find((item) => item.id === selectedTaskChannelId)?.source_url || ''"
+      :channel-options="availableTaskChannels"
+      @close="closeTaskCreateModal"
+      @submit="submitTaskCreate"
+    />
+
+    <AlgorithmEditorModal
+      :visible="algorithmModalVisible"
+      :algorithm="editingAlgorithm"
+      :model-options="algorithmModelOptions"
+      :used-model-ids="selectedTaskUsedModelIds"
+      @close="closeAlgorithmModal"
+      @submit="submitAlgorithm"
+    />
+
+    <TaskRegionEditorModal
+      :visible="taskRegionEditor.visible"
+      :task-id="taskRegionEditor.taskId"
+      :task-name="taskRegionEditor.taskName"
+      :channel-id="taskRegionEditor.channelId"
+      :algorithm-id="taskRegionEditor.algorithmId"
+      :algorithm-name="taskRegionEditor.algorithmName"
+      @close="closeTaskRegionEditor"
+      @updated="handleTaskRegionsUpdated"
+    />
   </div>
 </template>
 
 <script setup lang="ts">
-import { nextTick, onActivated, onBeforeUnmount, onDeactivated, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onActivated, onBeforeUnmount, onDeactivated, onMounted, ref, watch } from 'vue'
 import ZoneEditorModal from '@/components/channels/ZoneEditorModal.vue'
+import TaskListPanel from '@/components/channels/TaskListPanel.vue'
+import TaskDetailPanel from '@/components/channels/TaskDetailPanel.vue'
+import TaskEditorModal from '@/components/channels/TaskEditorModal.vue'
+import AlgorithmEditorModal from '@/components/channels/AlgorithmEditorModal.vue'
+import TaskRegionEditorModal from '@/components/channels/TaskRegionEditorModal.vue'
 import {
-  applyChannelAI,
   createChannel,
   deleteChannel,
-  getChannelAIStatus,
+  getChannelFenceBrowserPlayUrl,
   getChannelPlayUrl,
-  getChannelZonePreviewPlayUrl,
   getChannelZonePreviewStatus,
+  listAvailableTaskChannels,
   listChannels,
   listChannelZones,
-  startChannelPlay,
   startChannelZonePreview,
-  stopChannelAI,
+  startChannelPlay,
   stopChannelPlay,
-  stopChannelZonePreview,
+  syncWvpChannels,
   updateChannel,
-  updateChannelAIConfig,
 } from '@/api/channels'
+import {
+  addTaskAlgorithm,
+  createTask,
+  deleteTask,
+  deleteTaskAlgorithm,
+  getTask,
+  getTaskStatus,
+  listTaskAvailableModels,
+  listTaskAlgorithms,
+  listTasks,
+  startTask,
+  stopTask,
+  updateTask,
+  updateTaskAlgorithm,
+} from '@/api/tasks'
 import { listMediaNodes } from '@/api/mediaNodes'
 import { listModels } from '@/api/models'
+import { createSingleIntervalController, shouldPollTaskStatus } from '@/utils/single-interval-controller.js'
 
 type PlayUrlMap = Record<string, string>
+
+type FenceBrowserPlayInfo = {
+  webrtc_api?: string
+  hls?: string
+}
 
 type ZoneItem = {
   id: string
@@ -689,29 +537,9 @@ type ZoneItem = {
   coordinates: number[][]
 }
 
-type ChannelAIConfigState = {
-  enabled: boolean
-  model_id: string
-  labels: string[]
-  conf: number
-  frame_interval: number
-  zone_ids: string[]
-  save_snapshot: boolean
-  models: ChannelAIModelConfig[]
-}
-
-type ChannelAIModelConfig = {
-  local_id: string
-  model_id: string
-  enabled: boolean
-  labels: string[]
-  conf: number
-  frame_interval: number
-  zone_ids: string[]
-  save_snapshot: boolean
-}
-
 type AIStatus = {
+  task_id?: string
+  task_name?: string
   status?: string
   is_running?: boolean
   last_error?: string | null
@@ -732,6 +560,55 @@ type ZonePreviewStatus = {
   urls?: PlayUrlMap
   last_error?: string | null
   process_alive?: boolean
+  zone_count?: number
+  zone_source?: string
+  owner_task_id?: string | null
+}
+
+type FenceRenderableRegion = {
+  id: string
+  name: string
+  color: string
+  coordinates: number[][]
+  source: 'task' | 'channel'
+  algorithmName?: string
+}
+
+type RealtimeDetection = {
+  label: string
+  confidence: number
+  bbox: [number, number, number, number]
+  zone_id?: string | null
+}
+
+type RealtimeDetectionAlgorithm = {
+  algorithm_id: string
+  label: string
+  color: string
+  detections: RealtimeDetection[]
+}
+
+type RealtimeDetectionPayload = {
+  type: 'task_detection'
+  task_id: string
+  channel_id: string
+  seq: number
+  timestamp: number
+  source_width: number
+  source_height: number
+  timing?: {
+    capture_sequence: number | null
+    dropped_frames: number
+    captured_at: number
+    inference_started_at: number
+    inference_finished_at: number
+    published_at: number
+    capture_to_inference_ms: number
+    inference_ms: number
+    inference_to_publish_ms: number
+    end_to_end_ms: number
+  }
+  algorithms: RealtimeDetectionAlgorithm[]
 }
 
 type ChannelEditState = {
@@ -746,7 +623,7 @@ type ChannelEditState = {
 const tabs = [
   { key: 'preview', label: '预览' },
   { key: 'manage', label: '通道管理' },
-  { key: 'ai', label: 'AI 能力' },
+  { key: 'tasks', label: '任务管理' },
   { key: 'fence', label: '电子围栏' },
 ] as const
 
@@ -761,19 +638,39 @@ const models = ref<any[]>([])
 const playInfos = ref<Record<string, PlayUrlMap>>({})
 const browserPlayInfos = ref<Record<string, PlayUrlMap>>({})
 const previewPlaybackState = ref<Record<string, boolean>>({})
-const zonePreviewPlayInfos = ref<Record<string, PlayUrlMap>>({})
+const zonePreviewPlayInfos = ref<Record<string, FenceBrowserPlayInfo>>({})
 const zonePreviewPlaybackState = ref<Record<string, boolean>>({})
 const aiStatuses = ref<AIStatusMap>({})
 const zonePreviewStatuses = ref<Record<string, ZonePreviewStatus>>({})
-const aiConfigs = ref<Record<string, ChannelAIConfigState>>({})
 const zonesMap = ref<Record<string, ZoneItem[]>>({})
+const tasks = ref<any[]>([])
+const availableTaskChannels = ref<any[]>([])
+const taskStatuses = ref<Record<string, any>>({})
+const taskLoading = ref(false)
+const selectedTaskChannelId = ref('')
+const selectedTaskId = ref('')
+const taskKeyword = ref('')
 const debugResults = ref<Record<string, string>>({})
 const rtcErrors = ref<Record<string, string>>({})
 const zonePreviewDebug = ref<Record<string, string>>({})
 const zonePreviewErrors = ref<Record<string, string>>({})
+const realtimeDetectionPayloads = ref<Record<string, RealtimeDetectionPayload>>({})
+const realtimeDetectionLastMessageAt = ref<Record<string, number>>({})
 const message = ref('')
 const messageType = ref<'success' | 'error'>('success')
 const editingChannel = ref<any | null>(null)
+const taskModalVisible = ref(false)
+const algorithmModalVisible = ref(false)
+const editingAlgorithm = ref<any | null>(null)
+const algorithmModelOptions = ref<any[]>([])
+const taskRegionEditor = ref({
+  visible: false,
+  taskId: '',
+  taskName: '',
+  channelId: '',
+  algorithmId: '',
+  algorithmName: '',
+})
 
 const zoneEditor = ref({
   visible: false,
@@ -801,24 +698,111 @@ const editForm = ref<ChannelEditState>({
 })
 
 const videoRefs = new Map<string, HTMLVideoElement>()
+const fenceVideoRefs = new Map<string, HTMLVideoElement>()
+const fenceCanvasRefs = new Map<string, HTMLCanvasElement>()
+const fenceOverlayFrameIds = new Map<string, number>()
 const peerConnections = new Map<string, RTCPeerConnection>()
 const playAttemptIds = new Map<string, number>()
+const pendingBrowserPlayChannels = new Set<string>()
 const zonePreviewVideoRefs = new Map<string, HTMLVideoElement>()
 const zonePreviewPeerConnections = new Map<string, RTCPeerConnection>()
 const zonePreviewAttemptIds = new Map<string, number>()
 const previewCardRefs = new Map<string, HTMLElement>()
-const expandedPreview = ref<{ channelId: string; name: string; sourceUrl: string; mode?: 'channel' | 'zone' } | null>(null)
+const fenceCardRefs = new Map<string, HTMLElement>()
+const realtimeDetectionSockets = new Map<string, WebSocket>()
+const realtimeDetectionTaskIds = new Map<string, string>()
+const realtimeDetectionReconnectTimers = new Map<string, number>()
+const realtimeDetectionReconnectAttempts = new Map<string, number>()
+const realtimeDetectionExpiryTimers = new Map<string, number>()
+const expandedPreview = ref<{
+  channelId: string
+  name: string
+  sourceUrl: string
+  mode?: 'channel' | 'zone' | 'fence'
+} | null>(null)
 const expandedPreviewVideoRef = ref<HTMLVideoElement | null>(null)
+const expandedFenceCanvasRef = ref<HTMLCanvasElement | null>(null)
 const expandedPreviewPlaying = ref(false)
+let expandedFenceOverlayFrameId = 0
 const expandedPreviewError = ref('')
-let aiStatusPollTimer: number | null = null
+const taskStatusPollController = createSingleIntervalController({
+  schedule(callback: TimerHandler, intervalMs: number) {
+    return window.setInterval(callback, intervalMs)
+  },
+  clear(timer: number) {
+    window.clearInterval(timer)
+  },
+})
 let pageDeactivated = false
 let expandedPreviewPeerConnection: RTCPeerConnection | null = null
 let expandedPreviewAttemptId = 0
+const REALTIME_DETECTION_TTL_MS = 2000
+const REALTIME_DETECTION_MAX_RECONNECT_DELAY_MS = 5000
 
 const showMessage = (type: 'success' | 'error', text: string) => {
   messageType.value = type
   message.value = text
+}
+
+const channelNameById = (channelId?: string) => {
+  if (!channelId) return ''
+  return items.value.find((item) => item.id === channelId)?.name || ''
+}
+
+const filteredTasks = computed(() => {
+  const keyword = taskKeyword.value.trim().toLowerCase()
+  return tasks.value.filter((task) => {
+    if (selectedTaskChannelId.value && task.channel_id !== selectedTaskChannelId.value) {
+      return false
+    }
+    if (!keyword) return true
+    const taskName = String(task.name || '').toLowerCase()
+    const channelName = channelNameById(task.channel_id).toLowerCase()
+    const channelId = String(task.channel_id || '').toLowerCase()
+    return (
+      taskName.includes(keyword)
+      || channelName.includes(keyword)
+      || channelId.includes(keyword)
+    )
+  })
+})
+
+const selectedTask = computed(() => {
+  return filteredTasks.value.find((task) => task.id === selectedTaskId.value) || null
+})
+
+const selectedTaskStatus = computed(() => {
+  return selectedTaskId.value ? taskStatuses.value[selectedTaskId.value] || null : null
+})
+
+const selectedTaskUsedModelIds = computed(() => {
+  return (selectedTask.value?.algorithms || [])
+    .map((item: any) => item?.model_id)
+    .filter(Boolean)
+})
+
+const selectedTaskChannelTasks = computed(() => {
+  if (!selectedTaskChannelId.value) return []
+  return tasks.value.filter((task) => task.channel_id === selectedTaskChannelId.value)
+})
+
+const taskCreateDisabled = computed(() => {
+  return Boolean(selectedTaskChannelId.value && selectedTaskChannelTasks.value.length > 0)
+})
+
+const taskCreateDisabledReason = computed(() => {
+  if (!selectedTaskChannelId.value) {
+    return ''
+  }
+  if (selectedTaskChannelTasks.value.length > 0) {
+    return '当前通道已经绑定任务，请直接编辑现有任务。'
+  }
+  return '当前通道还没有任务，可以直接新建。'
+})
+
+const loadAvailableTaskChannels = async () => {
+  const result = await listAvailableTaskChannels()
+  availableTaskChannels.value = result.items || []
 }
 
 const resetCreateForm = () => {
@@ -829,6 +813,435 @@ const resetCreateForm = () => {
     model_id: '',
     media_node_id: '',
     record_mode: 'none',
+  }
+}
+
+const buildInitialAlgorithmPayload = (modelOption: any) => ({
+  model_id: String(modelOption?.model_id || modelOption?.id || ''),
+  algorithm_type: String(modelOption?.algorithm_type || modelOption?.task || 'detection'),
+  scene_key: modelOption?.scene_key || undefined,
+  scene_name: modelOption?.scene_name || undefined,
+  rule_type: modelOption?.rule_type || modelOption?.algorithm_type || modelOption?.task || 'detection',
+  enabled: modelOption?.enabled !== false,
+  labels: Array.isArray(modelOption?.recommended_labels)
+    ? [...modelOption.recommended_labels]
+    : Array.isArray(modelOption?.classes)
+      ? [...modelOption.classes]
+      : [],
+  detect_all_classes: Boolean(modelOption?.detect_all_classes),
+  label_source: modelOption?.label_source || (modelOption?.detect_all_classes ? 'all' : 'manual'),
+  confidence: Number(modelOption?.confidence ?? 0.25),
+  alert_interval: Number(modelOption?.alert_interval ?? 60),
+  need_snapshot: Boolean(modelOption?.need_snapshot ?? true),
+  need_video_clip: Boolean(modelOption?.need_video_clip ?? true),
+  video_before_seconds: Number(modelOption?.video_before_seconds ?? 10),
+  video_after_seconds: Number(modelOption?.video_after_seconds ?? 10),
+  overlay_color: String(modelOption?.overlay_color || '#ff4d4f'),
+  postprocess_config: modelOption?.postprocess_config || {},
+  regions: [],
+})
+
+const syncSelectedTask = () => {
+  const available = filteredTasks.value
+  if (!available.length) {
+    selectedTaskId.value = ''
+    return
+  }
+  if (!available.some((item) => item.id === selectedTaskId.value)) {
+    selectedTaskId.value = available[0].id
+  }
+}
+
+const syncAIStatusesFromTasks = () => {
+  const nextMap: AIStatusMap = {}
+
+  for (const item of items.value) {
+    nextMap[item.id] = {
+      status: 'stopped',
+      is_running: false,
+      frame_count: 0,
+      event_count: 0,
+      models: {},
+    }
+  }
+
+  for (const task of tasks.value) {
+    const channelId = String(task?.channel_id || '')
+    if (!channelId) continue
+
+    const status = taskStatuses.value[task.id]
+    const runtime = status?.runtime || task?.runtime || {}
+    const normalizedStatus = String(status?.status || runtime?.status || task?.status || 'stopped').toLowerCase()
+    const isRunning = Boolean(runtime?.is_running) || ['running', 'starting', 'restarting'].includes(normalizedStatus)
+    const current = nextMap[channelId]
+
+    if (current?.is_running && !isRunning) {
+      continue
+    }
+    if (current?.task_id && !current?.is_running && !isRunning) {
+      continue
+    }
+
+    nextMap[channelId] = {
+      task_id: task.id,
+      task_name: task.name,
+      status: normalizedStatus,
+      is_running: isRunning,
+      last_error: runtime?.last_error ?? null,
+      last_analysis_at: runtime?.last_analysis_at ?? null,
+      last_event_at: runtime?.last_event_at ?? null,
+      frame_count: Number(runtime?.frame_count ?? 0),
+      event_count: Number(runtime?.event_count ?? 0),
+      models: runtime?.models || {},
+    }
+  }
+
+  aiStatuses.value = nextMap
+}
+
+const loadTaskStatuses = async (taskIds: string[]) => {
+  const statusEntries = await Promise.all(
+    taskIds.map(async (taskId) => {
+      try {
+        const status = await getTaskStatus(taskId)
+        return [taskId, status]
+      } catch {
+        return [taskId, null]
+      }
+    })
+  )
+  taskStatuses.value = Object.fromEntries(statusEntries.filter(([_, value]) => value))
+  syncAIStatusesFromTasks()
+  syncAllRealtimeDetectionSockets()
+}
+
+const loadTasksForCurrentChannel = async (silent = false) => {
+  if (!silent) {
+    taskLoading.value = true
+  }
+  try {
+    const result = await listTasks()
+    tasks.value = result.items || []
+    await loadTaskStatuses(tasks.value.map((task) => task.id))
+    if (activeTab.value === 'fence') {
+      await hydrateFenceTasks()
+      await nextTick()
+      redrawAllFenceOverlays()
+    }
+    syncSelectedTask()
+  } catch (error: any) {
+    showMessage('error', error?.response?.data?.detail || error?.message || '加载任务失败')
+  } finally {
+    if (!silent) {
+      taskLoading.value = false
+    }
+  }
+}
+
+const handleTaskChannelChange = async () => {
+  taskKeyword.value = ''
+  syncSelectedTask()
+}
+
+const handleTaskSearch = (value: string) => {
+  taskKeyword.value = value
+  syncSelectedTask()
+}
+
+const loadTaskDetail = async (taskId: string) => {
+  const [task, algorithmResult] = await Promise.all([getTask(taskId), listTaskAlgorithms(taskId)])
+  return {
+    ...task,
+    algorithms: algorithmResult?.items || [],
+  }
+}
+
+const selectTask = async (taskId: string) => {
+  selectedTaskId.value = taskId
+  try {
+    const [task, status] = await Promise.all([loadTaskDetail(taskId), getTaskStatus(taskId)])
+    tasks.value = tasks.value.map((item) => (item.id === taskId ? task : item))
+    taskStatuses.value = {
+      ...taskStatuses.value,
+      [taskId]: status,
+    }
+    if (activeTab.value === 'fence') {
+      await nextTick()
+      redrawAllFenceOverlays()
+    }
+  } catch (error: any) {
+    showMessage('error', error?.response?.data?.detail || error?.message || '加载任务详情失败')
+  }
+}
+
+const openTaskCreateModal = async () => {
+  if (taskCreateDisabled.value) {
+    showMessage('error', taskCreateDisabledReason.value || '当前通道已经存在任务')
+    return
+  }
+  try {
+    await loadAvailableTaskChannels()
+    taskModalVisible.value = true
+    if (!availableTaskChannels.value.length) {
+      showMessage('error', '当前没有可用于新建任务的通道')
+    }
+  } catch (error: any) {
+    showMessage('error', error?.response?.data?.detail || error?.message || '加载可用通道失败')
+  }
+}
+
+const closeTaskCreateModal = () => {
+  taskModalVisible.value = false
+}
+
+const refreshModels = async () => {
+  const modelResult = await listModels()
+  models.value = modelResult.models || modelResult.items || []
+  return models.value
+}
+
+const handleSyncWvpChannels = async () => {
+  try {
+    const result = await syncWvpChannels({ page: 1, count: 200 })
+    await load()
+    showMessage('success', `WVP 通道同步完成，新增或更新 ${result?.synced || 0} 路`)
+  } catch (error: any) {
+    showMessage('error', error?.response?.data?.detail || error?.message || '同步 WVP 通道失败')
+  }
+}
+
+const openAlgorithmCreateModal = async () => {
+  if (!selectedTaskId.value) {
+    showMessage('error', '请先选择任务')
+    return
+  }
+  try {
+    await refreshModels()
+    const result = await listTaskAvailableModels(selectedTaskId.value)
+    algorithmModelOptions.value = result.items || []
+    if (!algorithmModelOptions.value.length) {
+      showMessage('error', '当前任务下已没有可新增的模型')
+      return
+    }
+  } catch (error: any) {
+    showMessage('error', error?.response?.data?.detail || error?.message || '加载可选模型失败')
+    return
+  }
+  editingAlgorithm.value = null
+  algorithmModalVisible.value = true
+}
+
+const openAlgorithmEditModal = async (algorithm: any) => {
+  algorithmModelOptions.value = await refreshModels()
+  editingAlgorithm.value = algorithm
+  algorithmModalVisible.value = true
+}
+
+const closeAlgorithmModal = () => {
+  algorithmModelOptions.value = []
+  editingAlgorithm.value = null
+  algorithmModalVisible.value = false
+}
+
+const openTaskRegionEditor = (algorithm: any) => {
+  if (!selectedTask.value || !algorithm?.id) {
+    showMessage('error', '请先选择任务和算法')
+    return
+  }
+  taskRegionEditor.value = {
+    visible: true,
+    taskId: selectedTask.value.id,
+    taskName: selectedTask.value.name || '',
+    channelId: selectedTask.value.channel_id || selectedTaskChannelId.value,
+    algorithmId: algorithm.id,
+    algorithmName: algorithm.model_name || models.value.find((item) => item.model_id === algorithm.model_id)?.name || algorithm.model_id || '',
+  }
+}
+
+const closeTaskRegionEditor = () => {
+  taskRegionEditor.value.visible = false
+}
+
+const handleTaskRegionsUpdated = async (payload?: { channelId?: string; zones?: any[] }) => {
+  if (!selectedTaskId.value) return
+  await loadTasksForCurrentChannel()
+  await selectTask(selectedTaskId.value)
+  const channelId = payload?.channelId || selectedTask.value?.channel_id || taskRegionEditor.value.channelId
+  if (channelId) {
+    await loadZonePreviewStatus(channelId)
+    await ensureZonePreviewPlayInfo(channelId, true).catch(() => undefined)
+    if (activeTab.value === 'fence') {
+      await nextTick()
+      redrawFenceOverlay(channelId)
+    }
+  }
+}
+
+const submitTaskCreate = async (payload: any) => {
+  try {
+    if (!payload.name || !payload.channel_id) {
+      showMessage('error', '任务名称和通道不能为空')
+      return
+    }
+    const created = await createTask({
+      ...payload,
+      channel_id: payload.channel_id,
+    })
+    selectedTaskChannelId.value = payload.channel_id
+    taskModalVisible.value = false
+    await loadTasksForCurrentChannel()
+    selectedTaskId.value = created.id
+    await selectTask(created.id)
+    showMessage('success', '任务创建成功，请继续新增算法')
+  } catch (error: any) {
+    showMessage('error', error?.response?.data?.detail || error?.message || '创建任务失败')
+  }
+}
+
+const createTaskWithInitialAlgorithm = async (channel: any, modelId: string) => {
+  const createdTask = await createTask({
+    name: `${channel.name}任务`,
+    channel_id: channel.id,
+    source_url: channel.source_url,
+    source_type: String(channel.type || '').toLowerCase().startsWith('rtmp') ? 'rtmp' : 'rtsp',
+    frame_interval: 10,
+  })
+
+  try {
+    const availableModels = await listTaskAvailableModels(createdTask.id)
+    const modelOption = (availableModels?.items || []).find(
+      (item: any) => String(item?.model_id || item?.id || '') === modelId
+    ) || models.value.find((item) => String(item?.model_id || item?.id || '') === modelId)
+
+    if (!modelOption) {
+      throw new Error('未找到可用于初始化任务的模型配置')
+    }
+
+    await addTaskAlgorithm(createdTask.id, buildInitialAlgorithmPayload(modelOption))
+    return createdTask
+  } catch (error) {
+    await deleteTask(createdTask.id).catch(() => undefined)
+    throw error
+  }
+}
+
+const saveTaskDraft = async (payload: any) => {
+  try {
+    await updateTask(payload.id, {
+      name: payload.name,
+      source_url: payload.source_url,
+      frame_interval: payload.frame_interval,
+    })
+    await loadTasksForCurrentChannel()
+    if (payload.id) {
+      await selectTask(payload.id)
+    }
+    showMessage('success', '任务配置已保存')
+  } catch (error: any) {
+    showMessage('error', error?.response?.data?.detail || error?.message || '保存任务失败')
+  }
+}
+
+const hasRunnableTaskAlgorithm = (task: any) =>
+  Array.isArray(task?.algorithms)
+  && task.algorithms.some((algorithm: any) => algorithm?.enabled !== false && algorithm?.model_id)
+
+const startTaskDraft = async (payload: any) => {
+  try {
+    if (!hasRunnableTaskAlgorithm(payload)) {
+      showMessage('error', '请先为任务新增至少一个已启用的算法，并选择模型后再启动任务')
+      return
+    }
+    await updateTask(payload.id, {
+      name: payload.name,
+      source_url: payload.source_url,
+      frame_interval: payload.frame_interval,
+    })
+    await startTask(payload.id)
+    await loadTasksForCurrentChannel()
+    await selectTask(payload.id)
+    showMessage('success', '任务已启动')
+  } catch (error: any) {
+    showMessage('error', error?.response?.data?.detail || error?.message || '启动任务失败')
+  }
+}
+
+const startTaskAction = async (taskId: string) => {
+  try {
+    const task = tasks.value.find((item) => item.id === taskId)
+    if (!hasRunnableTaskAlgorithm(task)) {
+      showMessage('error', '请先新增算法并选择模型，再启动任务')
+      return
+    }
+    await startTask(taskId)
+    await loadTasksForCurrentChannel()
+    await selectTask(taskId)
+    showMessage('success', '任务已启动')
+  } catch (error: any) {
+    showMessage('error', error?.response?.data?.detail || error?.message || '启动任务失败')
+  }
+}
+
+const stopTaskAction = async (taskId: string) => {
+  try {
+    await stopTask(taskId)
+    await loadTasksForCurrentChannel()
+    await selectTask(taskId)
+    showMessage('success', '任务已停止')
+  } catch (error: any) {
+    showMessage('error', error?.response?.data?.detail || error?.message || '停止任务失败')
+  }
+}
+
+const deleteTaskAction = async (taskId: string) => {
+  if (!confirm('确认删除该任务吗？')) return
+  try {
+    await deleteTask(taskId)
+    if (selectedTaskId.value === taskId) {
+      selectedTaskId.value = ''
+    }
+    await loadTasksForCurrentChannel()
+    showMessage('success', '任务已删除')
+  } catch (error: any) {
+    showMessage('error', error?.response?.data?.detail || error?.message || '删除任务失败')
+  }
+}
+
+const submitAlgorithm = async (payload: any) => {
+  if (!selectedTaskId.value) {
+    showMessage('error', '请先选择任务')
+    return
+  }
+  if (!payload.model_id) {
+    showMessage('error', '请选择模型')
+    return
+  }
+  try {
+    if (payload.id) {
+      await updateTaskAlgorithm(selectedTaskId.value, payload.id, payload)
+    } else {
+      await addTaskAlgorithm(selectedTaskId.value, payload)
+    }
+    closeAlgorithmModal()
+    await refreshModels()
+    await loadTasksForCurrentChannel()
+    await selectTask(selectedTaskId.value)
+    showMessage('success', `${payload.id ? '算法已更新' : '算法已新增'}，可在算法卡片中继续进行区域配置`)
+  } catch (error: any) {
+    showMessage('error', error?.response?.data?.detail || error?.message || '保存算法失败')
+  }
+}
+
+const deleteAlgorithmAction = async (algorithm: any) => {
+  if (!selectedTaskId.value || !algorithm?.id) return
+  if (!confirm('确认删除该算法吗？')) return
+  try {
+    await deleteTaskAlgorithm(selectedTaskId.value, algorithm.id)
+    await loadTasksForCurrentChannel()
+    await selectTask(selectedTaskId.value)
+    showMessage('success', '算法已删除')
+  } catch (error: any) {
+    showMessage('error', error?.response?.data?.detail || error?.message || '删除算法失败')
   }
 }
 
@@ -843,18 +1256,6 @@ const closeCreateModal = () => {
 
 const isPreviewPlaying = (channelId: string) => Boolean(previewPlaybackState.value[channelId])
 const isZonePreviewPlaying = (channelId: string) => Boolean(zonePreviewPlaybackState.value[channelId])
-const makeLocalModelId = () => `local_${Date.now()}_${Math.random().toString(16).slice(2, 8)}`
-
-const createEmptyModelConfig = (): ChannelAIModelConfig => ({
-  local_id: makeLocalModelId(),
-  model_id: '',
-  enabled: true,
-  labels: [],
-  conf: 0.25,
-  frame_interval: 10,
-  zone_ids: [],
-  save_snapshot: true,
-})
 
 const modelDisplayName = (model: any) => {
   const labelCount = Array.isArray(model?.classes) ? model.classes.length : 0
@@ -863,153 +1264,7 @@ const modelDisplayName = (model: any) => {
   return `${primary}${secondary}${labelCount > 0 ? ` (${labelCount} 类)` : ''}`
 }
 
-const currentChannelModelLabel = (item: any) => {
-  const configs = normalizeChannelModelConfigs(item?.ext?.ai_config || {})
-  if (!configs.length) return '-'
-  return configs
-    .map((config) => {
-      const model = getModelById(config.model_id)
-      return model ? modelDisplayName(model) : config.model_id
-    })
-    .join(' / ')
-}
-
-// const modelRuntimeEntries = (channelId: string) =>
-//   Object.entries(aiStatuses.value[channelId]?.models || {})
-//
-// const modelRuntimeName = (modelId: string) => {
-//   const model = getModelById(modelId)
-//   return model ? modelDisplayName(model) : modelId
-// }
-//
-// const joinLabels = (values?: string[]) => (values && values.length ? values.join('、') : '-')
-
-const hasModel = (modelId: string | undefined) => {
-  if (!modelId) return false
-  return models.value.some((model) => model.model_id === modelId)
-}
-
-const getModelById = (modelId: string | undefined) => {
-  if (!modelId) return null
-  return models.value.find((model) => model.model_id === modelId) || null
-}
-
-const normalizeChannelModelConfigs = (config: any): ChannelAIModelConfig[] => {
-  if (Array.isArray(config?.models) && config.models.length) {
-    return config.models
-      .filter((item: any) => item && item.model_id)
-      .map((item: any) => ({
-        local_id: item.local_id || makeLocalModelId(),
-        model_id: item.model_id || '',
-        enabled: item.enabled !== false,
-        labels: Array.isArray(item.labels) ? item.labels : [],
-        conf: Number(item.conf ?? config.conf ?? 0.25),
-        frame_interval: Number(item.frame_interval ?? config.frame_interval ?? 10),
-        zone_ids: Array.isArray(item.zone_ids) ? item.zone_ids : [],
-        save_snapshot: Boolean(item.save_snapshot ?? config.save_snapshot ?? true),
-      }))
-  }
-
-  if (config?.model_id) {
-    return [{
-      local_id: makeLocalModelId(),
-      model_id: config.model_id || '',
-      enabled: Boolean(config.enabled),
-      labels: Array.isArray(config.labels) ? config.labels : [],
-      conf: Number(config.conf ?? 0.25),
-      frame_interval: Number(config.frame_interval ?? 10),
-      zone_ids: Array.isArray(config.zone_ids) ? config.zone_ids : [],
-      save_snapshot: Boolean(config.save_snapshot ?? true),
-    }]
-  }
-
-  return [createEmptyModelConfig()]
-}
-
-const getChannelModelConfig = (channelId: string, localId: string) => {
-  const config = aiConfigs.value[channelId]
-  return config?.models.find((item) => item.local_id === localId)
-}
-
-const modelLabelsForChannel = (channelId: string, localId: string) => {
-  const config = getChannelModelConfig(channelId, localId)
-  const model = getModelById(config?.model_id)
-  return Array.isArray(model?.classes) ? model.classes : []
-}
-
 const channelZones = (channelId: string) => zonesMap.value[channelId] || []
-const channelModelCount = (channelId: string) =>
-  (aiConfigs.value[channelId]?.models || []).filter((item) => item.model_id).length
-const channelHasReadyAIConfig = (channelId: string) =>
-  (aiConfigs.value[channelId]?.models || []).some((item) => item.model_id && item.labels.length > 0)
-
-const aiReadinessLabel = (channelId: string) => {
-  const modelCount = channelModelCount(channelId)
-  if (!modelCount) return '待选择模型'
-  if (!channelHasReadyAIConfig(channelId)) return '待选择类别'
-  return '可直接保存并启动'
-}
-
-const syncLabelsWithModel = (channelId: string, localId: string) => {
-  const config = getChannelModelConfig(channelId, localId)
-  if (!config) return
-  const allowed = new Set(modelLabelsForChannel(channelId, localId))
-  config.labels = config.labels.filter((label) => allowed.has(label))
-}
-
-const handleModelChange = (channelId: string, localId: string) => {
-  const config = getChannelModelConfig(channelId, localId)
-  if (!config) return
-  config.labels = [...modelLabelsForChannel(channelId, localId)]
-}
-
-const selectAllChannelLabels = (channelId: string, localId: string) => {
-  const config = getChannelModelConfig(channelId, localId)
-  if (!config) return
-  config.labels = [...modelLabelsForChannel(channelId, localId)]
-}
-
-const clearAllChannelLabels = (channelId: string, localId: string) => {
-  const config = getChannelModelConfig(channelId, localId)
-  if (!config) return
-  config.labels = []
-}
-
-const toggleChannelLabel = (channelId: string, localId: string, label: string) => {
-  const config = getChannelModelConfig(channelId, localId)
-  if (!config) return
-  if (config.labels.includes(label)) {
-    config.labels = config.labels.filter((item) => item !== label)
-    return
-  }
-  config.labels = [...config.labels, label]
-}
-
-const toggleChannelZone = (channelId: string, localId: string, zoneId: string) => {
-  const config = getChannelModelConfig(channelId, localId)
-  if (!config) return
-  if (config.zone_ids.includes(zoneId)) {
-    config.zone_ids = config.zone_ids.filter((item) => item !== zoneId)
-    return
-  }
-  config.zone_ids = [...config.zone_ids, zoneId]
-}
-
-const addModelConfig = (channelId: string) => {
-  const config = aiConfigs.value[channelId]
-  if (!config) return
-  config.models = [...config.models, createEmptyModelConfig()]
-}
-
-const removeModelConfig = (channelId: string, localId: string) => {
-  const config = aiConfigs.value[channelId]
-  if (!config) return
-  config.models = config.models.filter((item) => item.local_id !== localId)
-  if (!config.models.length) {
-    config.models = [createEmptyModelConfig()]
-  }
-}
-
 const loadChannelZones = async (channelId: string) => {
   try {
     const result = await listChannelZones(channelId)
@@ -1017,31 +1272,370 @@ const loadChannelZones = async (channelId: string) => {
       ...zonesMap.value,
       [channelId]: result.items || [],
     }
-    const config = aiConfigs.value[channelId]
-    if (config) {
-      const validZoneIds = new Set((result.items || []).map((zone: any) => zone.id))
-      config.zone_ids = config.zone_ids.filter((zoneId) => validZoneIds.has(zoneId))
-    }
   } catch {
     zonesMap.value = {
       ...zonesMap.value,
       [channelId]: [],
     }
-    const config = aiConfigs.value[channelId]
-    if (config) {
-      config.zone_ids = []
+  } finally {
+    if (activeTab.value === 'fence') {
+      redrawFenceOverlay(channelId)
     }
   }
 }
 
-const zonePreviewLabel = (channelId: string) => {
-  const status = zonePreviewStatuses.value[channelId]
-  if (!status) return '未启动'
-  if (status.status === 'running') return '运行中'
-  if (status.status === 'starting') return '启动中'
-  if (status.status === 'error') return '异常'
-  return '未启动'
+const fencePalette = ['#2563eb', '#ef4444', '#f59e0b', '#10b981', '#8b5cf6', '#ec4899']
+
+const withAlpha = (color: string, alpha: number) => {
+  const normalized = String(color || '#2563eb').trim()
+  if (normalized.startsWith('rgba(') || normalized.startsWith('rgb(')) {
+    return normalized.replace(/^rgba?\((.+)\)$/i, (_, content) => {
+      const parts = String(content).split(',').map((item) => item.trim())
+      const [r = '37', g = '99', b = '235'] = parts
+      return `rgba(${r}, ${g}, ${b}, ${alpha})`
+    })
+  }
+  const hex = normalized.replace('#', '')
+  const full = hex.length === 3 ? hex.split('').map((item) => `${item}${item}`).join('') : hex
+  const numeric = Number.parseInt(full, 16)
+  const r = (numeric >> 16) & 255
+  const g = (numeric >> 8) & 255
+  const b = numeric & 255
+  return `rgba(${r}, ${g}, ${b}, ${alpha})`
 }
+
+const normalizeCoordinates = (coordinates: any): number[][] =>
+  Array.isArray(coordinates)
+    ? coordinates
+      .map((point: any) => [Number(point?.[0]), Number(point?.[1])])
+      .filter((point: number[]) => Number.isFinite(point[0]) && Number.isFinite(point[1]))
+    : []
+
+const taskAlgorithmDisplayName = (algorithm: any) =>
+  String(
+    algorithm?.model_name
+    || models.value.find((item) => item.model_id === algorithm?.model_id)?.name
+    || algorithm?.scene_name
+    || algorithm?.model_id
+    || '算法区域'
+  )
+
+const needsFenceTaskHydration = (task: any) =>
+  !Array.isArray(task?.algorithms)
+  || task.algorithms.some((algorithm: any) => algorithm?.regions === undefined)
+
+const hydrateFenceTasks = async () => {
+  const targetTasks = tasks.value.filter((task) => task?.channel_id && needsFenceTaskHydration(task))
+  if (!targetTasks.length) return
+
+  const detailEntries = await Promise.all(
+    targetTasks.map(async (task) => {
+      try {
+        return [task.id, await loadTaskDetail(task.id)] as const
+      } catch {
+        return [task.id, null] as const
+      }
+    })
+  )
+
+  const detailMap = new Map(
+    detailEntries.filter((entry): entry is readonly [string, any] => Boolean(entry[1]))
+  )
+  if (!detailMap.size) return
+
+  tasks.value = tasks.value.map((task) => detailMap.get(task.id) || task)
+}
+
+const buildTaskFenceRegions = (channelId: string): FenceRenderableRegion[] => {
+  const task = taskForChannel(channelId)
+  if (!task || !Array.isArray(task.algorithms)) {
+    return []
+  }
+
+  const regions: FenceRenderableRegion[] = []
+  task.algorithms.forEach((algorithm: any, algorithmIndex: number) => {
+    const sourceRegions = Array.isArray(algorithm?.regions) ? algorithm.regions : []
+    const algorithmColor = String(algorithm?.overlay_color || fencePalette[algorithmIndex % fencePalette.length])
+    const algorithmName = taskAlgorithmDisplayName(algorithm)
+    sourceRegions.forEach((region: any, regionIndex: number) => {
+      const coordinates = normalizeCoordinates(region?.coordinates)
+      if (coordinates.length < 2) {
+        return
+      }
+      regions.push({
+        id: String(region?.id || `${algorithm?.id || algorithmIndex}-${regionIndex}`),
+        name: String(region?.name || `${algorithmName}-${regionIndex + 1}`),
+        color: String(region?.color || algorithmColor),
+        coordinates,
+        source: 'task',
+        algorithmName,
+      })
+    })
+  })
+
+  const unique = new Map<string, FenceRenderableRegion>()
+  regions.forEach((region) => {
+    const key = region.id || `${region.name}:${JSON.stringify(region.coordinates)}`
+    if (!unique.has(key)) {
+      unique.set(key, region)
+    }
+  })
+  return Array.from(unique.values())
+}
+
+const buildChannelFenceRegions = (channelId: string): FenceRenderableRegion[] =>
+  channelZones(channelId).map((zone, index) => ({
+    id: String(zone.id || `channel-zone-${index}`),
+    name: String(zone.name || `区域${index + 1}`),
+    color: String(zone.color || fencePalette[index % fencePalette.length]),
+    coordinates: normalizeCoordinates(zone.coordinates),
+    source: 'channel' as const,
+  })).filter((zone) => zone.coordinates.length >= 2)
+
+const fenceRegionsForChannel = (channelId: string): FenceRenderableRegion[] => {
+  const taskRegions = buildTaskFenceRegions(channelId)
+  if (taskRegions.length) {
+    return taskRegions
+  }
+  return buildChannelFenceRegions(channelId)
+}
+
+const zonePreviewLabel = (channelId: string) => {
+  const task = taskForChannel(channelId)
+  if (!task) return '未绑定任务'
+  const status = zonePreviewStatuses.value[channelId]
+  if (isTaskRunningForChannel(channelId)) return '任务运行中'
+  if (status?.status === 'error') return '区域流异常'
+  return '任务未启动'
+}
+
+const zonePreviewRegionCount = (channelId: string) => {
+  const regions = fenceRegionsForChannel(channelId)
+  if (regions.length) {
+    return regions.length
+  }
+  const status = zonePreviewStatuses.value[channelId] || {}
+  if (typeof status.zone_count === 'number') {
+    return status.zone_count
+  }
+  return 0
+}
+
+const zonePreviewSourceLabel = (channelId: string) => {
+  const taskRegions = buildTaskFenceRegions(channelId)
+  if (taskRegions.length) {
+    return '任务算法区域'
+  }
+  if (channelZones(channelId).length) {
+    return '通道区域'
+  }
+  return '未配置'
+}
+
+const taskForChannel = (channelId: string) =>
+  tasks.value.find((task) => task.channel_id === channelId) || null
+
+const isTaskRunningForChannel = (channelId: string) => {
+  const task = taskForChannel(channelId)
+  if (!task?.id) return false
+  const status = taskStatuses.value[task.id]
+  const runtime = status?.runtime || task?.runtime || {}
+  const normalized = String(status?.status || runtime?.status || task?.status || '').toLowerCase()
+  return Boolean(runtime?.is_running) || ['running', 'starting', 'restarting'].includes(normalized)
+}
+
+const clearRealtimeDetectionState = (channelId: string) => {
+  const expiryTimer = realtimeDetectionExpiryTimers.get(channelId)
+  if (expiryTimer !== undefined) {
+    window.clearTimeout(expiryTimer)
+    realtimeDetectionExpiryTimers.delete(channelId)
+  }
+  const nextPayloads = { ...realtimeDetectionPayloads.value }
+  const nextTimestamps = { ...realtimeDetectionLastMessageAt.value }
+  delete nextPayloads[channelId]
+  delete nextTimestamps[channelId]
+  realtimeDetectionPayloads.value = nextPayloads
+  realtimeDetectionLastMessageAt.value = nextTimestamps
+}
+
+const getRealtimeDetectionWebSocketUrl = (taskId: string) => {
+  const configuredBase = String(import.meta.env.VITE_API_BASE || '/dev-api').replace(/\/+$/, '')
+  const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
+  const baseUrl = new URL(configuredBase || '/', window.location.origin)
+  const basePath = baseUrl.pathname.replace(/\/+$/, '')
+  return `${protocol}//${baseUrl.host}${basePath}/tasks/${encodeURIComponent(taskId)}/detections/ws`
+}
+
+const realtimeDetectionSocketIsActive = (channelId: string, taskId: string) => {
+  const task = taskForChannel(channelId)
+  const expandedFencePlaying =
+    expandedPreview.value?.mode === 'fence'
+    && expandedPreview.value.channelId === channelId
+    && expandedPreviewPlaying.value
+  return (
+    activeTab.value === 'fence'
+    && (isPreviewPlaying(channelId) || expandedFencePlaying)
+    && isTaskRunningForChannel(channelId)
+    && String(task?.id || '') === taskId
+  )
+}
+
+const closeRealtimeDetectionSocket = (channelId: string, clearState = true) => {
+  const timer = realtimeDetectionReconnectTimers.get(channelId)
+  if (timer !== undefined) {
+    window.clearTimeout(timer)
+    realtimeDetectionReconnectTimers.delete(channelId)
+  }
+
+  const socket = realtimeDetectionSockets.get(channelId)
+  realtimeDetectionSockets.delete(channelId)
+  realtimeDetectionTaskIds.delete(channelId)
+  realtimeDetectionReconnectAttempts.delete(channelId)
+  if (socket) {
+    socket.onopen = null
+    socket.onmessage = null
+    socket.onerror = null
+    socket.onclose = null
+    socket.close()
+  }
+  if (clearState) {
+    clearRealtimeDetectionState(channelId)
+    redrawFenceOverlay(channelId)
+  }
+}
+
+const scheduleRealtimeDetectionReconnect = (channelId: string, taskId: string) => {
+  if (!realtimeDetectionSocketIsActive(channelId, taskId)) return
+  if (realtimeDetectionReconnectTimers.has(channelId)) return
+
+  const attempt = (realtimeDetectionReconnectAttempts.get(channelId) || 0) + 1
+  realtimeDetectionReconnectAttempts.set(channelId, attempt)
+  const delay = Math.min(500 * (2 ** Math.min(attempt - 1, 3)), REALTIME_DETECTION_MAX_RECONNECT_DELAY_MS)
+  const timer = window.setTimeout(() => {
+    realtimeDetectionReconnectTimers.delete(channelId)
+    if (realtimeDetectionSocketIsActive(channelId, taskId)) {
+      openRealtimeDetectionSocket(channelId, taskId)
+    } else {
+      closeRealtimeDetectionSocket(channelId)
+    }
+  }, delay)
+  realtimeDetectionReconnectTimers.set(channelId, timer)
+}
+
+const openRealtimeDetectionSocket = (channelId: string, taskId: string) => {
+  if (!realtimeDetectionSocketIsActive(channelId, taskId)) return
+  const currentSocket = realtimeDetectionSockets.get(channelId)
+  if (currentSocket && realtimeDetectionTaskIds.get(channelId) === taskId) {
+    return
+  }
+  if (currentSocket) {
+    closeRealtimeDetectionSocket(channelId, false)
+  }
+
+  let socket: WebSocket
+  try {
+    socket = new WebSocket(getRealtimeDetectionWebSocketUrl(taskId))
+  } catch {
+    scheduleRealtimeDetectionReconnect(channelId, taskId)
+    return
+  }
+
+  realtimeDetectionSockets.set(channelId, socket)
+  realtimeDetectionTaskIds.set(channelId, taskId)
+  socket.onopen = () => {
+    if (realtimeDetectionSockets.get(channelId) !== socket) return
+    realtimeDetectionReconnectAttempts.delete(channelId)
+  }
+  socket.onmessage = (event) => {
+    if (realtimeDetectionSockets.get(channelId) !== socket) return
+    try {
+      const payload = JSON.parse(String(event.data || '')) as Partial<RealtimeDetectionPayload>
+      if (payload.type !== 'task_detection' || payload.task_id !== taskId) return
+      const current = realtimeDetectionPayloads.value[channelId]
+      if (current && Number(payload.seq || 0) < current.seq) return
+      realtimeDetectionPayloads.value = {
+        ...realtimeDetectionPayloads.value,
+        [channelId]: payload as RealtimeDetectionPayload,
+      }
+      realtimeDetectionLastMessageAt.value = {
+        ...realtimeDetectionLastMessageAt.value,
+        [channelId]: Date.now(),
+      }
+      const expiryTimer = realtimeDetectionExpiryTimers.get(channelId)
+      if (expiryTimer !== undefined) {
+        window.clearTimeout(expiryTimer)
+      }
+      const receivedAt = realtimeDetectionLastMessageAt.value[channelId]
+      realtimeDetectionExpiryTimers.set(channelId, window.setTimeout(() => {
+        if (realtimeDetectionLastMessageAt.value[channelId] !== receivedAt) return
+        clearRealtimeDetectionState(channelId)
+        redrawFenceOverlay(channelId)
+      }, REALTIME_DETECTION_TTL_MS))
+      redrawFenceOverlay(channelId)
+    } catch {
+      // Ignore malformed messages without affecting the video connection.
+    }
+  }
+  socket.onerror = () => {
+    if (realtimeDetectionSockets.get(channelId) === socket) {
+      socket.close()
+    }
+  }
+  socket.onclose = () => {
+    if (realtimeDetectionSockets.get(channelId) !== socket) return
+    realtimeDetectionSockets.delete(channelId)
+    realtimeDetectionTaskIds.delete(channelId)
+    clearRealtimeDetectionState(channelId)
+    redrawFenceOverlay(channelId)
+    scheduleRealtimeDetectionReconnect(channelId, taskId)
+  }
+}
+
+const syncRealtimeDetectionSocket = (channelId: string) => {
+  const task = taskForChannel(channelId)
+  if (!task?.id || !realtimeDetectionSocketIsActive(channelId, String(task.id))) {
+    closeRealtimeDetectionSocket(channelId)
+    return
+  }
+  openRealtimeDetectionSocket(channelId, String(task.id))
+}
+
+const syncAllRealtimeDetectionSockets = () => {
+  items.value.forEach((item) => syncRealtimeDetectionSocket(item.id))
+}
+
+const closeAllRealtimeDetectionSockets = () => {
+  const channelIds = new Set<string>([
+    ...realtimeDetectionSockets.keys(),
+    ...Object.keys(realtimeDetectionPayloads.value),
+  ])
+  channelIds.forEach((channelId) => closeRealtimeDetectionSocket(channelId))
+}
+
+const canManualPlayFencePreview = (channelId: string) => {
+  const channel = items.value.find((item) => item.id === channelId)
+  return Boolean(channel?.is_online)
+}
+
+const fencePreviewMaskText = (channelId: string) => {
+  const channel = items.value.find((item) => item.id === channelId)
+  if (!channel?.is_online) {
+    return '通道离线，暂时无法预览'
+  }
+  if (!taskForChannel(channelId)) {
+    return '当前通道还没有绑定任务，可先查看原始流'
+  }
+  if (!zonePreviewRegionCount(channelId)) {
+    return '当前通道还没有配置围栏区域，可先查看原始流'
+  }
+  if (!isTaskRunningForChannel(channelId)) {
+    return '任务未启动，也可以先查看原始流'
+  }
+  return '点击播放查看原始流上的围栏叠加效果'
+}
+
+const canManualPlayZonePreview = (channelId: string) => canManualPlayFencePreview(channelId)
+const zonePreviewMaskText = (channelId: string) => fencePreviewMaskText(channelId)
 
 const loadZonePreviewStatus = async (channelId: string) => {
   try {
@@ -1066,106 +1660,28 @@ const loadAllZones = async () => {
   await Promise.all(items.value.map((item) => loadChannelZones(item.id)))
 }
 
-const loadAIStatuses = async () => {
-  const entries = await Promise.all(
-    items.value.map(async (item) => {
-      try {
-        const status = await getChannelAIStatus(item.id)
-        return [item.id, status] as const
-      } catch {
-        return [item.id, null] as const
-      }
-    })
-  )
-
-  const nextMap: AIStatusMap = {}
-  for (const [channelId, status] of entries) {
-    if (status) nextMap[channelId] = status
-  }
-  aiStatuses.value = nextMap
-}
-
-const syncAIConfigsFromItems = () => {
-  const nextConfigs: Record<string, ChannelAIConfigState> = {}
-  for (const item of items.value) {
-    const config = item?.ext?.ai_config || {}
-    const models = normalizeChannelModelConfigs(config)
-    nextConfigs[item.id] = {
-      enabled: Boolean(config.enabled),
-      model_id: config.model_id || '',
-      labels: Array.isArray(config.labels) ? config.labels : [],
-      conf: Number(config.conf ?? 0.25),
-      frame_interval: Number(config.frame_interval ?? 10),
-      zone_ids: Array.isArray(config.zone_ids) ? config.zone_ids : [],
-      save_snapshot: Boolean(config.save_snapshot ?? true),
-      models,
-    }
-  }
-  aiConfigs.value = nextConfigs
-}
-
-const startZonePreviewFlow = async (channelId: string) => {
-  try {
-    const channel = items.value.find((entry) => entry.id === channelId)
-    const zoneCount = channelZones(channelId).length
-    if (!zoneCount) {
-      throw new Error('请先完成区域配置，再启动区域流')
-    }
-    const result = await startChannelZonePreview(channelId)
-    zonePreviewStatuses.value = {
-      ...zonePreviewStatuses.value,
-      [channelId]: result || {},
-    }
-    showMessage('success', `${channel?.name || channelId} 已启动区域流`)
-    debugResults.value[channelId] = `区域流：${result?.stream || `${channel?.stream || channelId}_zone`}`
-    await nextTick()
-    await startZonePreviewPlayer(channelId)
-  } catch (error: any) {
-    showMessage('error', error?.response?.data?.detail || error?.message || '启动区域流失败')
-  }
-}
-
-const stopZonePreviewFlow = async (channelId: string) => {
-  try {
-    const channel = items.value.find((entry) => entry.id === channelId)
-    const result = await stopChannelZonePreview(channelId)
-    await stopZonePreviewPlayer(channelId)
-    zonePreviewStatuses.value = {
-      ...zonePreviewStatuses.value,
-      [channelId]: result || {},
-    }
-    showMessage('success', `${channel?.name || channelId} 已停止区域流`)
-  } catch (error: any) {
-    showMessage('error', error?.response?.data?.detail || error?.message || '停止区域流失败')
-  }
-}
-
-const restoreZonePreviewPlaybackForFenceTab = async () => {
-  if (activeTab.value !== 'fence') return
-  await nextTick()
-  const runningItems = items.value.filter((item) => zonePreviewStatuses.value[item.id]?.status === 'running')
-  for (const item of runningItems) {
-    try {
-      await startZonePreviewPlayer(item.id)
-    } catch (error: any) {
-      zonePreviewDebug.value[item.id] = error?.message || '恢复区域预览失败'
-    }
-  }
+const refreshTaskBackedAiStatuses = async () => {
+  await loadTasksForCurrentChannel(true)
 }
 
 const handleZonePreviewAdvancedToggle = async (channelId: string, event: Event) => {
   const target = event.target as HTMLDetailsElement | null
   if (!target?.open) return
   try {
-    await ensureZonePreviewPlayInfo(channelId)
+    await ensureZonePreviewPlayInfo(channelId, true)
   } catch (error: any) {
     showMessage('error', error?.response?.data?.detail || error?.message || '加载区域流地址失败')
   }
 }
 
-const copyZonePreviewUrl = async (channelId: string, kind: keyof PlayUrlMap = 'hls') => {
+const copyZonePreviewUrl = async (channelId: string) => {
   try {
-    const result = await getChannelZonePreviewPlayUrl(channelId)
+    const result = await getChannelFenceBrowserPlayUrl(channelId)
+    const playUrls = result?.play_url || {}
+    zonePreviewPlayInfos.value = {
+      ...zonePreviewPlayInfos.value,
+      [channelId]: playUrls,
+    }
     zonePreviewStatuses.value = {
       ...zonePreviewStatuses.value,
       [channelId]: {
@@ -1173,14 +1689,14 @@ const copyZonePreviewUrl = async (channelId: string, kind: keyof PlayUrlMap = 'h
         ...(result || {}),
       },
     }
-    const url = result?.urls?.[kind]
+    const url = playUrls?.hls || playUrls?.webrtc_api
     if (!url) {
-      throw new Error('当前没有可复制的区域流地址')
+      throw new Error('当前没有可复制的电子围栏浏览器播放地址')
     }
     await navigator.clipboard.writeText(url)
-    showMessage('success', `已复制区域流${kind.toUpperCase()}地址`)
+    showMessage('success', '已复制电子围栏浏览器播放地址')
   } catch (error: any) {
-    showMessage('error', error?.response?.data?.detail || error?.message || '复制区域流地址失败')
+    showMessage('error', error?.response?.data?.detail || error?.message || '复制电子围栏浏览器播放地址失败')
   }
 }
 
@@ -1189,8 +1705,8 @@ const ensureZonePreviewPlayInfo = async (channelId: string, forceRefresh = false
     return zonePreviewPlayInfos.value[channelId] || {}
   }
 
-  const result = await getChannelZonePreviewPlayUrl(channelId)
-  const urls = result?.urls || {}
+  const result = await getChannelFenceBrowserPlayUrl(channelId)
+  const urls = result?.play_url || {}
   zonePreviewPlayInfos.value = {
     ...zonePreviewPlayInfos.value,
     [channelId]: urls,
@@ -1231,7 +1747,20 @@ const stopZonePreviewPlayer = async (channelId: string, clearAttempt = true) => 
   }
 }
 
+const resetAllZonePreviewPlayers = async () => {
+  const channelIds = new Set<string>([
+    ...Object.keys(zonePreviewPlaybackState.value || {}),
+    ...Array.from(zonePreviewPeerConnections.keys()),
+  ])
+  await Promise.all(Array.from(channelIds).map((channelId) => stopZonePreviewPlayer(channelId)))
+  zonePreviewPlaybackState.value = {}
+}
+
 const startZonePreviewPlayer = async (channelId: string) => {
+  if (!canManualPlayZonePreview(channelId)) {
+    zonePreviewErrors.value[channelId] = zonePreviewMaskText(channelId)
+    return
+  }
   const attemptId = nextZonePreviewAttempt(channelId)
   let video: HTMLVideoElement | null = null
 
@@ -1239,9 +1768,15 @@ const startZonePreviewPlayer = async (channelId: string) => {
     zonePreviewErrors.value[channelId] = ''
     await stopZonePreviewPlayer(channelId, false)
     await nextTick()
+    await loadZonePreviewStatus(channelId)
+
+    if (zonePreviewStatuses.value[channelId]?.status !== 'running') {
+      await startChannelZonePreview(channelId)
+      await loadZonePreviewStatus(channelId)
+    }
 
     const urls = await ensureZonePreviewPlayInfo(channelId, true)
-    const apiUrl = urls.browser_webrtc_api
+    const apiUrl = urls.webrtc_api
     if (!apiUrl) {
       throw new Error('没有可用的区域流 WebRTC 地址')
     }
@@ -1260,11 +1795,7 @@ const startZonePreviewPlayer = async (channelId: string) => {
 
     pc.ontrack = (event) => {
       if (!isActiveZonePreviewAttempt(channelId, attemptId)) return
-      if (event.streams?.length) {
-        event.streams[0].getTracks().forEach((track) => remoteStream.addTrack(track))
-      } else {
-        remoteStream.addTrack(event.track)
-      }
+      attachRemoteStreamToVideo(video, remoteStream, event)
     }
 
     pc.onconnectionstatechange = () => {
@@ -1301,6 +1832,7 @@ const startZonePreviewPlayer = async (channelId: string) => {
     })
 
     await safePlayWithCheck(video, channelId, attemptId, isActiveZonePreviewAttempt)
+    await waitForVideoFrame(video)
     if (isActiveZonePreviewAttempt(channelId, attemptId)) {
       zonePreviewPlaybackState.value = {
         ...zonePreviewPlaybackState.value,
@@ -1317,7 +1849,7 @@ const startZonePreviewPlayer = async (channelId: string) => {
     try {
       const urls = await ensureZonePreviewPlayInfo(channelId, true)
       const videoEl = video || (await getZonePreviewVideoEl(channelId))
-      const hlsUrl = urls.browser_hls || urls.hls
+      const hlsUrl = urls.hls
       if (!hlsUrl) {
         throw new Error('没有可用的区域流 HLS 地址')
       }
@@ -1325,6 +1857,7 @@ const startZonePreviewPlayer = async (channelId: string) => {
       videoEl.src = hlsUrl
       videoEl.load()
       await safePlayWithCheck(videoEl, channelId, attemptId, isActiveZonePreviewAttempt)
+      await waitForVideoFrame(videoEl)
       if (isActiveZonePreviewAttempt(channelId, attemptId)) {
         zonePreviewPlaybackState.value = {
           ...zonePreviewPlaybackState.value,
@@ -1345,10 +1878,10 @@ const startZonePreviewPlayer = async (channelId: string) => {
 const load = async () => {
   loading.value = true
   try {
-    const [channelResult, mediaNodeResult, modelResult] = await Promise.all([
+    const [channelResult, mediaNodeResult] = await Promise.all([
       listChannels(),
       listMediaNodes(),
-      listModels(),
+      refreshModels(),
     ])
     items.value = channelResult.items || []
     const validIds = new Set(items.value.map((item) => item.id))
@@ -1356,21 +1889,37 @@ const load = async () => {
       Object.entries(previewPlaybackState.value).filter(([channelId]) => validIds.has(channelId))
     )
     mediaNodes.value = mediaNodeResult.items || []
-    models.value = modelResult.models || modelResult.items || []
-    syncAIConfigsFromItems()
-    await Promise.all([loadAllZones(), loadAIStatuses(), loadAllZonePreviewStatuses()])
+    if (
+      selectedTaskChannelId.value
+      && !items.value.some((item) => item.id === selectedTaskChannelId.value)
+    ) {
+      selectedTaskChannelId.value = ''
+    }
+    await Promise.all([loadAllZones(), loadTasksForCurrentChannel(), loadAllZonePreviewStatuses()])
     if (activeTab.value === 'preview') {
       await nextTick()
       await restoreBrowserPlaybackForActiveChannels()
-    } else if (activeTab.value === 'fence') {
+    }
+    if (activeTab.value === 'fence') {
       await nextTick()
-      await restoreZonePreviewPlaybackForFenceTab()
+      await restoreFencePlaybackForActiveChannels()
     }
   } catch (error: any) {
     showMessage('error', error?.response?.data?.detail || error?.message || '加载通道失败')
   } finally {
     loading.value = false
   }
+}
+
+const resetAllBrowserPlayers = async () => {
+  const channelIds = new Set<string>([
+    ...Object.keys(previewPlaybackState.value || {}),
+    ...Array.from(peerConnections.keys()),
+    ...Array.from(videoRefs.keys()),
+    ...Array.from(fenceVideoRefs.keys()),
+  ])
+  await Promise.all(Array.from(channelIds).map((channelId) => stopBrowserPlay(channelId)))
+  previewPlaybackState.value = {}
 }
 
 const restoreBrowserPlaybackForActiveChannels = async () => {
@@ -1384,6 +1933,9 @@ const restoreBrowserPlaybackForActiveChannels = async () => {
     return rect.bottom >= -120 && rect.top <= window.innerHeight + 120
   })
   for (const item of onlineItems) {
+    if (pendingBrowserPlayChannels.has(item.id) || isPreviewPlaying(item.id)) {
+      continue
+    }
     try {
       await startBrowserPlay(item.id)
     } catch (error: any) {
@@ -1392,10 +1944,54 @@ const restoreBrowserPlaybackForActiveChannels = async () => {
   }
 }
 
+const restoreFencePlaybackForActiveChannels = async () => {
+  if (activeTab.value !== 'fence') return
+  await hydrateFenceTasks()
+  await nextTick()
+  const onlineItems = items.value.filter((item) => {
+    if (!item.is_online) return false
+    const card = fenceCardRefs.get(item.id)
+    if (!card) return true
+    const rect = card.getBoundingClientRect()
+    return rect.bottom >= -120 && rect.top <= window.innerHeight + 120
+  })
+  for (const item of onlineItems) {
+    if (pendingBrowserPlayChannels.has(item.id) || isPreviewPlaying(item.id)) {
+      redrawFenceOverlay(item.id)
+      continue
+    }
+    try {
+      await startBrowserPlay(item.id)
+      redrawFenceOverlay(item.id)
+    } catch (error: any) {
+      debugResults.value[item.id] = error?.message || '恢复电子围栏预览失败'
+    }
+  }
+}
+
 const initializePage = async () => {
   await load()
-  await restoreBrowserPlaybackForActiveChannels()
-  await restoreZonePreviewPlaybackForFenceTab()
+  if (activeTab.value === 'preview') {
+    await restoreBrowserPlaybackForActiveChannels()
+  }
+  if (activeTab.value === 'fence') {
+    await restoreFencePlaybackForActiveChannels()
+  }
+}
+
+const startTaskStatusPolling = () => {
+  if (!shouldPollTaskStatus(activeTab.value)) {
+    return
+  }
+  taskStatusPollController.start(() => {
+    if (shouldPollTaskStatus(activeTab.value) && items.value.length > 0) {
+      void refreshTaskBackedAiStatuses()
+    }
+  }, 5000)
+}
+
+const stopTaskStatusPolling = () => {
+  taskStatusPollController.stop()
 }
 
 const aiStatusLabel = (channelId: string) => {
@@ -1442,6 +2038,267 @@ const setPreviewCardRef = (channelId: string, el: HTMLElement | null) => {
   }
 }
 
+const setFenceCardRef = (channelId: string, el: HTMLElement | null) => {
+  if (el) {
+    fenceCardRefs.set(channelId, el)
+  } else {
+    fenceCardRefs.delete(channelId)
+  }
+}
+
+const setFenceVideoRef = (channelId: string, el: HTMLVideoElement | null) => {
+  if (el) {
+    fenceVideoRefs.set(channelId, el)
+  } else {
+    fenceVideoRefs.delete(channelId)
+  }
+}
+
+const setFenceCanvasRef = (channelId: string, el: HTMLCanvasElement | null) => {
+  if (el) {
+    fenceCanvasRefs.set(channelId, el)
+    window.requestAnimationFrame(() => {
+      redrawFenceOverlay(channelId)
+    })
+  } else {
+    fenceCanvasRefs.delete(channelId)
+    const frameId = fenceOverlayFrameIds.get(channelId)
+    if (frameId) {
+      window.cancelAnimationFrame(frameId)
+      fenceOverlayFrameIds.delete(channelId)
+    }
+  }
+}
+
+const resizeFenceCanvas = (canvas: HTMLCanvasElement) => {
+  const rect = canvas.getBoundingClientRect()
+  const width = Math.max(Math.round(rect.width), 1)
+  const height = Math.max(Math.round(rect.height), 1)
+  const dpr = Math.max(window.devicePixelRatio || 1, 1)
+
+  if (canvas.width !== Math.round(width * dpr) || canvas.height !== Math.round(height * dpr)) {
+    canvas.width = Math.round(width * dpr)
+    canvas.height = Math.round(height * dpr)
+  }
+  canvas.style.width = `${width}px`
+  canvas.style.height = `${height}px`
+
+  const ctx = canvas.getContext('2d')
+  if (ctx) {
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
+  }
+  return { width, height }
+}
+
+const drawFenceLabel = (
+  ctx: CanvasRenderingContext2D,
+  text: string,
+  color: string,
+  x: number,
+  y: number,
+  maxWidth: number
+) => {
+  const content = text.trim()
+  if (!content) return
+
+  ctx.font = '12px sans-serif'
+  const paddingX = 8
+  const measured = ctx.measureText(content)
+  const labelWidth = Math.min(Math.ceil(measured.width) + paddingX * 2, Math.max(maxWidth - x - 8, 96))
+  const labelX = Math.max(8, Math.min(x, Math.max(maxWidth - labelWidth - 8, 8)))
+  const labelY = Math.max(8, y - 28)
+
+  ctx.fillStyle = withAlpha(color, 0.92)
+  ctx.fillRect(labelX, labelY, labelWidth, 22)
+  ctx.fillStyle = '#ffffff'
+  ctx.textBaseline = 'middle'
+  ctx.fillText(content, labelX + paddingX, labelY + 11, labelWidth - paddingX * 2)
+}
+
+const freshRealtimeDetectionPayload = (channelId: string) => {
+  const payload = realtimeDetectionPayloads.value[channelId]
+  const receivedAt = realtimeDetectionLastMessageAt.value[channelId]
+  if (!payload || !receivedAt || Date.now() - receivedAt > REALTIME_DETECTION_TTL_MS) {
+    if (payload || receivedAt) {
+      clearRealtimeDetectionState(channelId)
+    }
+    return null
+  }
+  return payload
+}
+
+const drawRealtimeDetections = (
+  ctx: CanvasRenderingContext2D,
+  payload: RealtimeDetectionPayload | null,
+  sourceWidth: number,
+  sourceHeight: number,
+  width: number,
+  height: number,
+) => {
+  if (!payload) return
+  const scaleX = width / sourceWidth
+  const scaleY = height / sourceHeight
+
+  payload.algorithms.forEach((algorithm) => {
+    const color = algorithm.color || '#ff4d4f'
+    algorithm.detections.forEach((detection) => {
+      if (!Array.isArray(detection.bbox) || detection.bbox.length < 4) return
+      const [x1, y1, x2, y2] = detection.bbox.map(Number)
+      if (![x1, y1, x2, y2].every(Number.isFinite)) return
+
+      const left = x1 * scaleX
+      const top = y1 * scaleY
+      const boxWidth = Math.max((x2 - x1) * scaleX, 1)
+      const boxHeight = Math.max((y2 - y1) * scaleY, 1)
+      ctx.strokeStyle = color
+      ctx.lineWidth = 2
+      ctx.strokeRect(left, top, boxWidth, boxHeight)
+
+      const confidence = Number(detection.confidence)
+      const confidenceText = Number.isFinite(confidence) ? ` ${confidence.toFixed(2)}` : ''
+      drawFenceLabel(
+        ctx,
+        `${detection.label || 'unknown'}${confidenceText}`,
+        color,
+        left,
+        top,
+        width,
+      )
+    })
+  })
+}
+
+const renderFenceOverlayOnCanvas = (
+  channelId: string,
+  canvas: HTMLCanvasElement | null | undefined,
+  video: HTMLVideoElement | null | undefined,
+) => {
+  if (!canvas) return
+
+  const ctx = canvas.getContext('2d')
+  if (!ctx) return
+
+  const { width, height } = resizeFenceCanvas(canvas)
+  ctx.clearRect(0, 0, width, height)
+
+  const regions = fenceRegionsForChannel(channelId)
+  const realtimePayload = freshRealtimeDetectionPayload(channelId)
+  const maxCoordinateX = Math.max(...regions.flatMap((region) => region.coordinates.map((point) => point[0])), width)
+  const maxCoordinateY = Math.max(...regions.flatMap((region) => region.coordinates.map((point) => point[1])), height)
+  const sourceWidth = Math.max(
+    Number(realtimePayload?.source_width || video?.videoWidth || 0),
+    maxCoordinateX,
+    1,
+  )
+  const sourceHeight = Math.max(
+    Number(realtimePayload?.source_height || video?.videoHeight || 0),
+    maxCoordinateY,
+    1,
+  )
+  const scaleX = width / sourceWidth
+  const scaleY = height / sourceHeight
+
+  ctx.lineJoin = 'round'
+  ctx.lineCap = 'round'
+
+  regions.forEach((region) => {
+    const coordinates = region.coordinates
+      .map((point) => [point[0] * scaleX, point[1] * scaleY] as const)
+      .filter((point) => Number.isFinite(point[0]) && Number.isFinite(point[1]))
+
+    if (coordinates.length < 2) {
+      return
+    }
+
+    ctx.beginPath()
+    ctx.moveTo(coordinates[0][0], coordinates[0][1])
+    coordinates.slice(1).forEach((point) => {
+      ctx.lineTo(point[0], point[1])
+    })
+    ctx.closePath()
+
+    ctx.fillStyle = withAlpha(region.color, 0.12)
+    ctx.strokeStyle = region.color
+    ctx.lineWidth = 2
+    ctx.fill()
+    ctx.stroke()
+
+    const anchor = coordinates.reduce(
+      (current, point) => ({
+        x: Math.min(current.x, point[0]),
+        y: Math.min(current.y, point[1]),
+      }),
+      { x: coordinates[0][0], y: coordinates[0][1] }
+    )
+    drawFenceLabel(ctx, region.name, region.color, anchor.x, anchor.y, width)
+  })
+
+  drawRealtimeDetections(ctx, realtimePayload, sourceWidth, sourceHeight, width, height)
+}
+
+const renderFenceOverlay = (channelId: string) => {
+  renderFenceOverlayOnCanvas(channelId, fenceCanvasRefs.get(channelId), fenceVideoRefs.get(channelId))
+}
+
+const redrawFenceOverlay = (channelId: string) => {
+  const previous = fenceOverlayFrameIds.get(channelId)
+  if (previous) {
+    window.cancelAnimationFrame(previous)
+  }
+  const frameId = window.requestAnimationFrame(() => {
+    fenceOverlayFrameIds.delete(channelId)
+    renderFenceOverlay(channelId)
+    if (expandedPreview.value?.mode === 'fence' && expandedPreview.value.channelId === channelId) {
+      redrawExpandedFenceOverlay()
+    }
+  })
+  fenceOverlayFrameIds.set(channelId, frameId)
+}
+
+const redrawExpandedFenceOverlay = () => {
+  if (expandedFenceOverlayFrameId) {
+    window.cancelAnimationFrame(expandedFenceOverlayFrameId)
+  }
+  expandedFenceOverlayFrameId = window.requestAnimationFrame(() => {
+    expandedFenceOverlayFrameId = 0
+    if (expandedPreview.value?.mode !== 'fence') return
+    renderFenceOverlayOnCanvas(
+      expandedPreview.value.channelId,
+      expandedFenceCanvasRef.value,
+      expandedPreviewVideoRef.value,
+    )
+  })
+}
+
+const redrawAllFenceOverlays = () => {
+  if (activeTab.value !== 'fence') return
+  items.value.forEach((item) => {
+    redrawFenceOverlay(item.id)
+  })
+}
+
+const handleFenceVideoReady = (channelId: string) => {
+  if (activeTab.value !== 'fence') return
+  redrawFenceOverlay(channelId)
+}
+
+const handleExpandedPreviewVideoReady = () => {
+  if (expandedPreview.value?.mode === 'fence') {
+    redrawExpandedFenceOverlay()
+  }
+}
+
+const startFencePreview = async (channelId: string) => {
+  if (!canManualPlayFencePreview(channelId)) {
+    rtcErrors.value[channelId] = fencePreviewMaskText(channelId)
+    return
+  }
+  rtcErrors.value[channelId] = ''
+  await hydrateFenceTasks()
+  await startBrowserPlay(channelId)
+  redrawFenceOverlay(channelId)
+}
+
 const nextPlayAttempt = (channelId: string) => {
   const nextId = (playAttemptIds.get(channelId) || 0) + 1
   playAttemptIds.set(channelId, nextId)
@@ -1474,19 +2331,6 @@ const waitIceComplete = (pc: RTCPeerConnection) => {
   })
 }
 
-const fetchAiConfigUpdate = async (channelId: string, modelId: string) => {
-  const model = getModelById(modelId)
-  await updateChannelAIConfig(channelId, {
-    enabled: true,
-    model_id: modelId,
-    labels: Array.isArray(model?.classes) ? model.classes : [],
-    conf: 0.25,
-    frame_interval: 10,
-    zone_ids: [],
-    save_snapshot: true,
-  })
-}
-
 const submit = async () => {
   if (!form.value.name || !form.value.source_url) {
     showMessage('error', '通道名称和源地址不能为空')
@@ -1504,15 +2348,22 @@ const submit = async () => {
       record_mode: form.value.record_mode,
     })
 
+    let createdTaskId = ''
     if (form.value.model_id) {
-      await fetchAiConfigUpdate(created.id, form.value.model_id)
+      const createdTask = await createTaskWithInitialAlgorithm(created, form.value.model_id)
+      createdTaskId = createdTask.id
+      selectedTaskChannelId.value = created.id
     }
 
     resetCreateForm()
 
     await load()
+    if (createdTaskId) {
+      selectedTaskId.value = createdTaskId
+      await selectTask(createdTaskId)
+    }
     closeCreateModal()
-    showMessage('success', '通道创建成功')
+    showMessage('success', createdTaskId ? '通道和默认任务算法已创建' : '通道创建成功')
   } catch (error: any) {
     showMessage('error', error?.response?.data?.detail || error?.message || '创建通道失败')
   } finally {
@@ -1571,18 +2422,54 @@ const ensurePlayInfo = async (channelId: string, forceRefresh = false) => {
     }
   }
 
-  const result = await getChannelPlayUrl(channelId)
-  playInfos.value[channelId] = result.urls || {}
-  browserPlayInfos.value[channelId] = result.browser_urls || {}
+  const result = await getChannelPlayUrl(channelId, 'channel')
+  playInfos.value[channelId] = result.play_urls || result.urls || {}
+  browserPlayInfos.value[channelId] = result.browser_play_urls || result.browser_urls || {}
   return {
     urls: playInfos.value[channelId] || {},
     browser_urls: browserPlayInfos.value[channelId] || {},
   }
 }
 
+const hasUsableBrowserUrls = (urls?: PlayUrlMap | null) => !!urls && Object.keys(urls).length > 0
+
+const ensureBrowserPlaybackUrls = async (channelId: string) => {
+  let playInfo = await ensurePlayInfo(channelId)
+  if (hasUsableBrowserUrls(playInfo.browser_urls)) {
+    return playInfo.browser_urls
+  }
+
+  const channel = items.value.find((item) => item.id === channelId)
+  if (!channel?.is_online) {
+    return null
+  }
+
+  const result = await startChannelPlay(channelId)
+  playInfos.value[channelId] = result.play_urls || result.urls || {}
+  browserPlayInfos.value[channelId] = result.browser_play_urls || result.browser_urls || {}
+  playInfo = {
+    urls: playInfos.value[channelId] || {},
+    browser_urls: browserPlayInfos.value[channelId] || {},
+  }
+
+  if (hasUsableBrowserUrls(playInfo.browser_urls)) {
+    return playInfo.browser_urls
+  }
+
+  for (let i = 0; i < 6; i += 1) {
+    await sleep(500)
+    playInfo = await ensurePlayInfo(channelId, true)
+    if (hasUsableBrowserUrls(playInfo.browser_urls)) {
+      return playInfo.browser_urls
+    }
+  }
+
+  return null
+}
+
 const getVideoEl = async (channelId: string) => {
   for (let i = 0; i < 6; i += 1) {
-    const video = videoRefs.get(channelId)
+    const video = (activeTab.value === 'fence' ? fenceVideoRefs : videoRefs).get(channelId)
     if (video) return video
     await nextTick()
     if (i < 5) {
@@ -1602,6 +2489,54 @@ const getZonePreviewVideoEl = async (channelId: string) => {
     }
   }
   throw new Error('区域预览播放器尚未初始化')
+}
+
+const attachRemoteStreamToVideo = (
+  video: HTMLVideoElement | null,
+  remoteStream: MediaStream,
+  event: RTCTrackEvent,
+) => {
+  if (!video) return
+  const stream = event.streams?.[0]
+  if (stream) {
+    video.srcObject = stream
+  } else if (!remoteStream.getTracks().some((track) => track.id === event.track.id)) {
+    remoteStream.addTrack(event.track)
+  }
+  void video.play().catch(() => undefined)
+}
+
+const waitForVideoFrame = (video: HTMLVideoElement, timeoutMs = 5000) => {
+  if (video.readyState >= 2 && video.videoWidth > 0 && video.videoHeight > 0) {
+    return Promise.resolve()
+  }
+
+  return new Promise<void>((resolve, reject) => {
+    let timer = 0
+    const cleanup = () => {
+      video.removeEventListener('loadeddata', handleReady)
+      video.removeEventListener('playing', handleReady)
+      video.removeEventListener('error', handleError)
+      window.clearTimeout(timer)
+    }
+    const handleReady = () => {
+      if (video.readyState < 2 || video.videoWidth <= 0 || video.videoHeight <= 0) return
+      cleanup()
+      resolve()
+    }
+    const handleError = () => {
+      cleanup()
+      reject(new Error('视频流未收到首帧'))
+    }
+
+    video.addEventListener('loadeddata', handleReady)
+    video.addEventListener('playing', handleReady)
+    video.addEventListener('error', handleError, { once: true })
+    timer = window.setTimeout(() => {
+      cleanup()
+      reject(new Error('视频流未收到首帧'))
+    }, timeoutMs)
+  })
 }
 
 const safePlayWithCheck = async (
@@ -1643,11 +2578,13 @@ const tryHlsFallback = async (
   targetVideo.src = hlsUrl
   targetVideo.load()
   await safePlay(targetVideo, channelId, attemptId)
+  await waitForVideoFrame(targetVideo)
   if (isActiveAttempt(channelId, attemptId)) {
     previewPlaybackState.value = {
       ...previewPlaybackState.value,
       [channelId]: true,
     }
+    syncRealtimeDetectionSocket(channelId)
     debugResults.value[channelId] = 'WebRTC 播放失败，已切换到 HLS-fMP4 回退播放'
   }
 }
@@ -1673,6 +2610,11 @@ const getExpandedPreviewVideoEl = async () => {
 const stopExpandedPreviewPlayback = async (clearAttempt = true) => {
   if (clearAttempt) {
     nextExpandedPreviewAttempt()
+  }
+
+  if (expandedFenceOverlayFrameId) {
+    window.cancelAnimationFrame(expandedFenceOverlayFrameId)
+    expandedFenceOverlayFrameId = 0
   }
 
   if (expandedPreviewPeerConnection) {
@@ -1702,38 +2644,14 @@ const startExpandedPreviewPlayback = async (channelId: string) => {
     await stopExpandedPreviewPlayback(false)
     await nextTick()
 
-    const basePlayInfo = previewMode === 'channel' ? await ensurePlayInfo(channelId) : null
     const selectedUrls =
       previewMode === 'zone'
         ? await ensureZonePreviewPlayInfo(channelId, true)
-        : (() => {
-            const playInfo = basePlayInfo?.urls || {}
-            const browserInfo = basePlayInfo?.browser_urls || {}
-            return Object.keys(browserInfo).length > 0
-              ? browserInfo
-              : Object.keys(playInfo).length > 0
-                ? playInfo
-                : null
-          })()
-    const fallbackSeed =
-      previewMode === 'zone'
-        ? selectedUrls || {}
-        : basePlayInfo || {}
-    const browserUrls =
-      previewMode === 'zone'
-        ? (selectedUrls || {})
-        : (fallbackSeed.browser_urls || {})
-    const normalUrls =
-      previewMode === 'zone'
-        ? (selectedUrls || {})
-        : (fallbackSeed.urls || {})
-    const playUrls =
-      previewMode === 'zone'
-        ? (selectedUrls || {})
-        : (Object.keys(browserUrls).length > 0 ? browserUrls : normalUrls)
+        : await ensureBrowserPlaybackUrls(channelId)
+    const playUrls = selectedUrls || {}
     const apiUrl = playUrls?.browser_webrtc_api
 
-    if (!apiUrl) throw new Error('没有可用的 WebRTC API 地址')
+    if (!apiUrl) throw new Error(previewMode === 'zone' ? '没有可用的 WebRTC API 地址' : '浏览器转码流尚未就绪')
 
     const video = await getExpandedPreviewVideoEl()
     if (!isActiveExpandedPreviewAttempt(attemptId)) return
@@ -1749,11 +2667,7 @@ const startExpandedPreviewPlayback = async (channelId: string) => {
 
     pc.ontrack = (event) => {
       if (!isActiveExpandedPreviewAttempt(attemptId)) return
-      if (event.streams?.length) {
-        event.streams[0].getTracks().forEach((track) => remoteStream.addTrack(track))
-      } else {
-        remoteStream.addTrack(event.track)
-      }
+      attachRemoteStreamToVideo(video, remoteStream, event)
     }
 
     pc.onconnectionstatechange = () => {
@@ -1791,6 +2705,7 @@ const startExpandedPreviewPlayback = async (channelId: string) => {
 
     try {
       await video.play()
+      await waitForVideoFrame(video)
     } catch (error: any) {
       const text = String(error?.message || '')
       if (
@@ -1806,6 +2721,10 @@ const startExpandedPreviewPlayback = async (channelId: string) => {
 
     if (isActiveExpandedPreviewAttempt(attemptId)) {
       expandedPreviewPlaying.value = true
+      if (previewMode === 'fence') {
+        syncRealtimeDetectionSocket(channelId)
+        redrawExpandedFenceOverlay()
+      }
     }
   } catch (error: any) {
     if (!isActiveExpandedPreviewAttempt(attemptId)) return
@@ -1813,17 +2732,13 @@ const startExpandedPreviewPlayback = async (channelId: string) => {
     const fallbackUrls =
       previewMode === 'zone'
         ? await ensureZonePreviewPlayInfo(channelId, true)
-        : (() => {
-            const playInfo = playInfos.value[channelId] || {}
-            const browserInfo = browserPlayInfos.value[channelId] || {}
-            return Object.keys(browserInfo).length > 0 ? browserInfo : playInfo
-          })()
+        : (browserPlayInfos.value[channelId] || {})
 
-    if (!autoStartedProxy && previewMode === 'channel' && currentMessage.includes('stream not found')) {
+    if (!autoStartedProxy && previewMode !== 'zone' && currentMessage.includes('stream not found')) {
       try {
         const result = await startChannelPlay(channelId)
-        playInfos.value[channelId] = result.urls || {}
-        browserPlayInfos.value[channelId] = result.browser_urls || {}
+        playInfos.value[channelId] = result.play_urls || result.urls || {}
+        browserPlayInfos.value[channelId] = result.browser_play_urls || result.browser_urls || {}
         autoStartedProxy = true
         await sleep(800)
       } catch {
@@ -1831,18 +2746,13 @@ const startExpandedPreviewPlayback = async (channelId: string) => {
       }
     }
 
-    if (
-      previewMode === 'channel' &&
-      Object.keys(browserPlayInfos.value[channelId] || {}).length > 0 &&
-      currentMessage.includes('stream not found')
-    ) {
+    if (previewMode !== 'zone' && Object.keys(browserPlayInfos.value[channelId] || {}).length > 0 && currentMessage.includes('stream not found')) {
       for (let i = 0; i < 6; i += 1) {
         if (!isActiveExpandedPreviewAttempt(attemptId)) return
         await sleep(500)
         try {
           const refreshed = await ensurePlayInfo(channelId, true)
-          const retryUrls =
-            Object.keys(refreshed.browser_urls || {}).length > 0 ? refreshed.browser_urls || {} : refreshed.urls || {}
+          const retryUrls = refreshed.browser_urls || {}
           const retryApiUrl = retryUrls.browser_webrtc_api
           if (!retryApiUrl) continue
 
@@ -1858,11 +2768,7 @@ const startExpandedPreviewPlayback = async (channelId: string) => {
 
           retryPc.ontrack = (event) => {
             if (!isActiveExpandedPreviewAttempt(attemptId)) return
-            if (event.streams?.length) {
-              event.streams[0].getTracks().forEach((track) => remoteStream.addTrack(track))
-            } else {
-              remoteStream.addTrack(event.track)
-            }
+            attachRemoteStreamToVideo(retryVideo, remoteStream, event)
           }
 
           const offer = await retryPc.createOffer()
@@ -1887,9 +2793,14 @@ const startExpandedPreviewPlayback = async (channelId: string) => {
           })
 
           await retryVideo.play()
+          await waitForVideoFrame(retryVideo)
           if (isActiveExpandedPreviewAttempt(attemptId)) {
             expandedPreviewPlaying.value = true
             expandedPreviewError.value = ''
+            if (previewMode === 'fence') {
+              syncRealtimeDetectionSocket(channelId)
+              redrawExpandedFenceOverlay()
+            }
           }
           return
         } catch {
@@ -1906,9 +2817,14 @@ const startExpandedPreviewPlayback = async (channelId: string) => {
       video.src = hlsUrl
       video.load()
       await video.play()
+      await waitForVideoFrame(video)
       if (isActiveExpandedPreviewAttempt(attemptId)) {
         expandedPreviewPlaying.value = true
         expandedPreviewError.value = `WebRTC 播放失败：${currentMessage}；已切换到 HLS-fMP4`
+        if (previewMode === 'fence') {
+          syncRealtimeDetectionSocket(channelId)
+          redrawExpandedFenceOverlay()
+        }
       }
     } catch (fallbackError: any) {
       if (isActiveExpandedPreviewAttempt(attemptId)) {
@@ -1931,22 +2847,30 @@ const stopBrowserPlay = async (channelId: string, clearAttempt = true) => {
     peerConnections.delete(channelId)
   }
 
-  const video = videoRefs.get(channelId)
-  if (video) {
+  const videos = [videoRefs.get(channelId), fenceVideoRefs.get(channelId)].filter(
+    (video): video is HTMLVideoElement => Boolean(video),
+  )
+  videos.forEach((video) => {
     video.pause()
     video.srcObject = null
     video.removeAttribute('src')
     video.load()
-  }
+  })
 
   previewPlaybackState.value = {
     ...previewPlaybackState.value,
     [channelId]: false,
   }
+  closeRealtimeDetectionSocket(channelId)
   rtcErrors.value[channelId] = ''
 }
 
 const startBrowserPlay = async (channelId: string) => {
+  if (pendingBrowserPlayChannels.has(channelId)) {
+    return
+  }
+
+  pendingBrowserPlayChannels.add(channelId)
   const attemptId = nextPlayAttempt(channelId)
   let video: HTMLVideoElement | null = null
   let autoStartedProxy = false
@@ -1956,13 +2880,10 @@ const startBrowserPlay = async (channelId: string) => {
     await stopBrowserPlay(channelId, false)
     await nextTick()
 
-    const playInfo = await ensurePlayInfo(channelId)
-    const browserUrls = playInfo.browser_urls || {}
-    const normalUrls = playInfo.urls || {}
-    const selectedUrls = Object.keys(browserUrls).length > 0 ? browserUrls : normalUrls
-    const apiUrl = selectedUrls.browser_webrtc_api
+    const browserUrls = (await ensureBrowserPlaybackUrls(channelId)) || {}
+    const apiUrl = browserUrls.browser_webrtc_api
 
-    if (!apiUrl) throw new Error('没有可用的 WebRTC API 地址')
+    if (!apiUrl) throw new Error('浏览器转码流尚未就绪')
 
     video = await getVideoEl(channelId)
     if (!isActiveAttempt(channelId, attemptId)) return
@@ -1978,11 +2899,7 @@ const startBrowserPlay = async (channelId: string) => {
 
     pc.ontrack = (event) => {
       if (!isActiveAttempt(channelId, attemptId)) return
-      if (event.streams?.length) {
-        event.streams[0].getTracks().forEach((track) => remoteStream.addTrack(track))
-      } else {
-        remoteStream.addTrack(event.track)
-      }
+      attachRemoteStreamToVideo(video, remoteStream, event)
     }
 
     pc.onconnectionstatechange = () => {
@@ -2019,29 +2936,27 @@ const startBrowserPlay = async (channelId: string) => {
     })
 
     await safePlay(video, channelId, attemptId)
+    await waitForVideoFrame(video)
     if (isActiveAttempt(channelId, attemptId)) {
       previewPlaybackState.value = {
         ...previewPlaybackState.value,
         [channelId]: true,
       }
-      debugResults.value[channelId] =
-        Object.keys(browserUrls).length > 0
-          ? '浏览器专用转码流已通过 WebRTC 播放'
-          : '原始流已通过 WebRTC 播放'
+      syncRealtimeDetectionSocket(channelId)
+      debugResults.value[channelId] = '浏览器专用转码流已通过 WebRTC 播放'
     }
   } catch (error: any) {
     if (!isActiveAttempt(channelId, attemptId)) return
     const currentMessage = error?.message || '浏览器播放失败'
     const playInfo = await ensurePlayInfo(channelId, true)
     const browserUrls = playInfo.browser_urls || {}
-    const normalUrls = playInfo.urls || {}
-    const fallbackUrls = Object.keys(browserUrls).length > 0 ? browserUrls : normalUrls
+    const fallbackUrls = browserUrls
 
     if (!autoStartedProxy && currentMessage.includes('stream not found')) {
       try {
         const result = await startChannelPlay(channelId)
-        playInfos.value[channelId] = result.urls || {}
-        browserPlayInfos.value[channelId] = result.browser_urls || {}
+        playInfos.value[channelId] = result.play_urls || result.urls || {}
+        browserPlayInfos.value[channelId] = result.browser_play_urls || result.browser_urls || {}
         autoStartedProxy = true
         await sleep(800)
       } catch {
@@ -2049,14 +2964,13 @@ const startBrowserPlay = async (channelId: string) => {
       }
     }
 
-    if (Object.keys(browserUrls).length > 0 && currentMessage.includes('stream not found')) {
+    if (currentMessage.includes('stream not found')) {
       for (let i = 0; i < 6; i += 1) {
         if (!isActiveAttempt(channelId, attemptId)) return
         await sleep(500)
         try {
           const refreshed = await ensurePlayInfo(channelId, true)
-          const retryUrls =
-            Object.keys(refreshed.browser_urls || {}).length > 0 ? refreshed.browser_urls || {} : refreshed.urls || {}
+          const retryUrls = refreshed.browser_urls || {}
           const retryApiUrl = retryUrls.browser_webrtc_api
           if (!retryApiUrl) continue
 
@@ -2072,11 +2986,7 @@ const startBrowserPlay = async (channelId: string) => {
 
           retryPc.ontrack = (event) => {
             if (!isActiveAttempt(channelId, attemptId)) return
-            if (event.streams?.length) {
-              event.streams[0].getTracks().forEach((track) => remoteStream.addTrack(track))
-            } else {
-              remoteStream.addTrack(event.track)
-            }
+            attachRemoteStreamToVideo(retryVideo, remoteStream, event)
           }
 
           const offer = await retryPc.createOffer()
@@ -2101,7 +3011,13 @@ const startBrowserPlay = async (channelId: string) => {
           })
 
           await safePlay(retryVideo, channelId, attemptId)
+          await waitForVideoFrame(retryVideo)
           if (isActiveAttempt(channelId, attemptId)) {
+            previewPlaybackState.value = {
+              ...previewPlaybackState.value,
+              [channelId]: true,
+            }
+            syncRealtimeDetectionSocket(channelId)
             debugResults.value[channelId] = '浏览器专用转码流已通过 WebRTC 播放'
             rtcErrors.value[channelId] = ''
           }
@@ -2125,14 +3041,16 @@ const startBrowserPlay = async (channelId: string) => {
           `WebRTC 自动播放失败：${currentMessage}；HLS-fMP4 回退也失败：${fallbackError?.message || fallbackError}`
       }
     }
+  } finally {
+    pendingBrowserPlayChannels.delete(channelId)
   }
 }
 
 const startPlay = async (channelId: string) => {
   try {
     const result = await startChannelPlay(channelId)
-    playInfos.value[channelId] = result.urls || {}
-    browserPlayInfos.value[channelId] = result.browser_urls || {}
+    playInfos.value[channelId] = result.play_urls || result.urls || {}
+    browserPlayInfos.value[channelId] = result.browser_play_urls || result.browser_urls || {}
     debugResults.value[channelId] = '通道已推流到 ZLMediaKit'
     await load()
     await nextTick()
@@ -2150,89 +3068,6 @@ const stopPlay = async (channelId: string) => {
     await load()
   } catch (error: any) {
     debugResults.value[channelId] = error?.response?.data?.detail || error?.message || '停止播放失败'
-  }
-}
-
-const saveAIConfig = async (channelId: string) => {
-  try {
-    const config = aiConfigs.value[channelId]
-    const activeModels = (config?.models || []).filter((item) => item.model_id)
-    if (!activeModels.length) {
-      throw new Error('请至少选择一个 AI 模型')
-    }
-    for (const modelConfig of activeModels) {
-      if (!hasModel(modelConfig.model_id)) {
-        throw new Error(`模型不存在：${modelConfig.model_id}`)
-      }
-      syncLabelsWithModel(channelId, modelConfig.local_id)
-    }
-    await updateChannelAIConfig(channelId, {
-      enabled: config.enabled,
-      model_id: activeModels[0]?.model_id,
-      labels: activeModels[0]?.labels || [],
-      conf: activeModels[0]?.conf,
-      frame_interval: activeModels[0]?.frame_interval,
-      zone_ids: activeModels[0]?.zone_ids || [],
-      save_snapshot: activeModels[0]?.save_snapshot,
-      models: activeModels.map(({ local_id, ...rest }) => rest),
-    })
-    await load()
-    debugResults.value[channelId] = 'AI 配置已保存'
-  } catch (error: any) {
-    debugResults.value[channelId] = error?.response?.data?.detail || error?.message || '保存 AI 配置失败'
-  }
-}
-
-const saveAndApplyAI = async (channelId: string) => {
-  try {
-    await saveAIConfig(channelId)
-    const channel = items.value.find((entry) => entry.id === channelId)
-    const modelConfigs = normalizeChannelModelConfigs(channel?.ext?.ai_config || {}).filter((item) => item.model_id)
-    if (!modelConfigs.length) {
-      throw new Error('请先为该通道配置至少一个 AI 模型')
-    }
-    const invalidModel = modelConfigs.find((item) => !hasModel(item.model_id))
-    if (invalidModel) {
-      throw new Error(`模型不存在：${invalidModel.model_id}，请重新保存正确模型`)
-    }
-    const result = await applyChannelAI(channelId)
-    aiConfigs.value[channelId].enabled = true
-    debugResults.value[channelId] = `AI 状态：${result.status || 'starting'}，新配置已应用`
-    showMessage('success', `${channel?.name || channelId} 已保存并应用 AI 配置`)
-    await loadAIStatuses()
-  } catch (error: any) {
-    debugResults.value[channelId] = error?.response?.data?.detail || error?.message || '保存并应用 AI 失败'
-  }
-}
-
-const stopAI = async (channelId: string) => {
-  try {
-    const channel = items.value.find((entry) => entry.id === channelId)
-    const result = await stopChannelAI(channelId)
-    if (aiConfigs.value[channelId]) {
-      aiConfigs.value[channelId].enabled = false
-    }
-    debugResults.value[channelId] = `AI 状态：${result.status || 'stopping'}`
-    showMessage('success', `${channel?.name || channelId} 已停止 AI 能力`)
-    await loadAIStatuses()
-  } catch (error: any) {
-    debugResults.value[channelId] = error?.response?.data?.detail || error?.message || '停止 AI 失败'
-  }
-}
-
-const openZoneEditor = (item: any) => {
-  const mergedLabels = Array.from(
-    new Set(
-      (aiConfigs.value[item.id]?.models || [])
-        .flatMap((config) => modelLabelsForChannel(item.id, config.local_id))
-        .filter(Boolean)
-    )
-  )
-  zoneEditor.value = {
-    visible: true,
-    channelId: item.id,
-    channelName: item.name,
-    modelLabels: mergedLabels,
   }
 }
 
@@ -2264,6 +3099,19 @@ const openExpandedPreview = async (item: any) => {
   await startExpandedPreviewPlayback(item.id)
 }
 
+const openExpandedFencePreview = async (item: any) => {
+  expandedPreview.value = {
+    channelId: item.id,
+    name: `${item.name} - 电子围栏预览`,
+    sourceUrl: item.source_url || '-',
+    mode: 'fence',
+  }
+  expandedPreviewError.value = ''
+  await nextTick()
+  await startExpandedPreviewPlayback(item.id)
+  redrawExpandedFenceOverlay()
+}
+
 const openZonePreviewModal = async (item: any) => {
   const zoneUrls = await ensureZonePreviewPlayInfo(item.id, true)
   expandedPreview.value = {
@@ -2277,10 +3125,20 @@ const openZonePreviewModal = async (item: any) => {
   await startExpandedPreviewPlayback(item.id)
 }
 
+// 保留后台区域流相关调试入口，当前电子围栏页内预览已改为原始流 + 前端叠加。
+void isZonePreviewPlaying
+void setZonePreviewVideoRef
+void startZonePreviewPlayer
+void openZonePreviewModal
+
 const closeExpandedPreview = async () => {
+  const channelId = expandedPreview.value?.channelId
   await stopExpandedPreviewPlayback()
   expandedPreview.value = null
   expandedPreviewError.value = ''
+  if (channelId) {
+    syncRealtimeDetectionSocket(channelId)
+  }
 }
 
 const handleZonesUpdated = async () => {
@@ -2292,47 +3150,62 @@ const handleZonesUpdated = async () => {
 
 onMounted(() => {
   void initializePage()
+  startTaskStatusPolling()
+  window.addEventListener('resize', redrawAllFenceOverlays)
 })
 
 onActivated(() => {
   pageDeactivated = false
-  if (aiStatusPollTimer === null) {
-    aiStatusPollTimer = window.setInterval(() => {
-      if (items.value.length > 0) {
-        void loadAIStatuses()
-      }
-    }, 5000)
-  }
+  startTaskStatusPolling()
   if (items.value.length > 0) {
-    void restoreBrowserPlaybackForActiveChannels()
+    if (activeTab.value === 'preview') {
+      void restoreBrowserPlaybackForActiveChannels()
+    }
+    if (activeTab.value === 'fence') {
+      void restoreFencePlaybackForActiveChannels()
+    }
   }
 })
 
 onDeactivated(() => {
   pageDeactivated = true
-  if (aiStatusPollTimer !== null) {
-    window.clearInterval(aiStatusPollTimer)
-    aiStatusPollTimer = null
-  }
+  stopTaskStatusPolling()
+  closeAllRealtimeDetectionSockets()
+  void resetAllBrowserPlayers()
+  void resetAllZonePreviewPlayers()
 })
 
 watch(activeTab, async (tab) => {
+  if (shouldPollTaskStatus(tab)) {
+    void refreshTaskBackedAiStatuses()
+    startTaskStatusPolling()
+  } else {
+    stopTaskStatusPolling()
+  }
   if (tab === 'preview') {
+    await resetAllBrowserPlayers()
     await restoreBrowserPlaybackForActiveChannels()
   }
   if (tab === 'fence') {
-    await restoreZonePreviewPlaybackForFenceTab()
+    await resetAllBrowserPlayers()
+    await loadAllZonePreviewStatuses()
+    await restoreFencePlaybackForActiveChannels()
+  } else {
+    closeAllRealtimeDetectionSockets()
+    await resetAllZonePreviewPlayers()
+  }
+  if (tab !== 'preview' && tab !== 'fence') {
+    await resetAllBrowserPlayers()
   }
 })
 
 onBeforeUnmount(() => {
+  window.removeEventListener('resize', redrawAllFenceOverlays)
   if (pageDeactivated) {
     return
   }
-  if (aiStatusPollTimer !== null) {
-    window.clearInterval(aiStatusPollTimer)
-    aiStatusPollTimer = null
-  }
+  stopTaskStatusPolling()
+  closeAllRealtimeDetectionSockets()
   Array.from(peerConnections.keys()).forEach((channelId) => {
     void stopBrowserPlay(channelId)
   })
@@ -2343,12 +3216,6 @@ onBeforeUnmount(() => {
   previewPlaybackState.value = {}
   zonePreviewPlaybackState.value = {}
 })
-
-aiStatusPollTimer = window.setInterval(() => {
-  if (items.value.length > 0) {
-    void loadAIStatuses()
-  }
-}, 5000)
 </script>
 
 <style scoped>
@@ -2390,6 +3257,13 @@ aiStatusPollTimer = window.setInterval(() => {
 .ai-card-head h4,
 .modal-header h3 {
   margin: 0;
+}
+
+.section-head-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  flex-wrap: wrap;
 }
 
 .panel-header p,
@@ -2671,15 +3545,6 @@ aiStatusPollTimer = window.setInterval(() => {
   color: #92400e;
 }
 
-.ai-config-box {
-  display: grid;
-  gap: 0.75rem;
-  padding: 0.95rem;
-  background: #f8fafc;
-  border: 1px solid #dbe4ee;
-  border-radius: 14px;
-}
-
 .zone-preview-box {
   display: grid;
   gap: 0.8rem;
@@ -2774,11 +3639,29 @@ aiStatusPollTimer = window.setInterval(() => {
   border: 1px solid #dbe4ee;
 }
 
+.fence-preview-shell {
+  isolation: isolate;
+}
+
 .zone-preview-player {
   width: 100%;
   aspect-ratio: 16 / 9;
   display: block;
   background: #000;
+}
+
+.fence-preview-player {
+  position: relative;
+  z-index: 1;
+}
+
+.fence-overlay-canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  z-index: 2;
 }
 
 /* .ai-debug-board {
@@ -2829,80 +3712,8 @@ aiStatusPollTimer = window.setInterval(() => {
   color: #0f172a;
 }
 
-.ai-config-top {
-  display: flex;
-  justify-content: space-between;
-  gap: 0.9rem;
-  align-items: start;
-  flex-wrap: wrap;
-}
-
-.ai-config-help {
-  color: #64748b;
-  line-height: 1.6;
-}
-
-.ai-config-form {
-  display: grid;
-  gap: 0.9rem;
-}
-
-.ai-config-grid {
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  align-items: start;
-}
-
-.config-row {
-  display: grid;
-  grid-template-columns: 140px minmax(0, 1fr);
-  gap: 0.75rem;
-  align-items: start;
-  padding: 0.8rem 0.9rem;
-  border-radius: 12px;
-  background: #fff;
-  border: 1px solid #e2e8f0;
-  min-width: 0;
-}
-
-.compact-field {
-  min-height: 100%;
-}
-
 .span-2 {
   grid-column: 1 / -1;
-}
-
-.save-snapshot-row {
-  grid-template-columns: 1fr;
-  align-items: center;
-}
-
-.config-label {
-  display: grid;
-  gap: 0.35rem;
-  color: #334155;
-}
-
-.config-label span {
-  color: #64748b;
-  line-height: 1.45;
-  font-size: 0.88rem;
-}
-
-.config-control {
-  display: grid;
-  gap: 0.45rem;
-  min-width: 0;
-}
-
-.config-control select,
-.config-control input {
-  min-height: 38px;
-  padding: 0.55rem 0.75rem;
-  border-radius: 10px;
-  border: 1px solid #cbd5e1;
-  width: 100%;
-  box-sizing: border-box;
 }
 
 .check-line {
@@ -3222,10 +4033,15 @@ aiStatusPollTimer = window.setInterval(() => {
 }
 
 .preview-modal-player-shell {
+  position: relative;
   border-radius: 18px;
   overflow: hidden;
   background: #020617;
   border: 1px solid #1e293b;
+}
+
+.fence-expanded-player-shell {
+  isolation: isolate;
 }
 
 .preview-modal-player {
@@ -3234,6 +4050,15 @@ aiStatusPollTimer = window.setInterval(() => {
   aspect-ratio: 16 / 9;
   display: block;
   background: #000;
+}
+
+.expanded-fence-overlay-canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  z-index: 2;
 }
 
 .modal-grid .span-2 {
@@ -3247,15 +4072,6 @@ aiStatusPollTimer = window.setInterval(() => {
 
   .ai-capability-grid {
     grid-template-columns: 1fr;
-  }
-
-  .ai-config-grid {
-    grid-template-columns: 1fr;
-  }
-
-  .config-row {
-    grid-template-columns: 1fr;
-    align-items: start;
   }
 
   .span-2 {

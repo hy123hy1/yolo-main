@@ -863,19 +863,11 @@ const heatmapChartOption = computed(() => {
 const editModel = async (model: any) => {
   const name = prompt('请输入模型名称（可选）:', model.name || model.model_id)
   if (name === null) return
-  
-  const description = prompt('请输入模型描述（可选）:', model.description || '')
-  if (description === null) return
-  
-  const tagsInput = prompt('请输入标签（逗号分隔，可选）:', model.tags ? model.tags.join(',') : '')
-  const tags = tagsInput ? tagsInput.split(',').map((t: string) => t.trim()).filter((t: string) => t) : undefined
-  
+
   editingModel.value = model.model_id
   try {
     await updateModel(model.model_id, {
-      name: name || undefined,
-      description: description || undefined,
-      tags: tags
+      name: name || undefined
     })
     alert('更新成功!')
     loadModels()
